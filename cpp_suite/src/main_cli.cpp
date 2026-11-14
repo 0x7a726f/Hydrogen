@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <iostream>
 #include <iomanip>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -83,6 +84,7 @@ static void print_help(const char* prog) {
               << "  -n, --fft-size <bins>    FFT channel size (2048, 4096, 8192, 16384). Default: 8192\n"
               << "  -t, --duration <sec>     Max duration in seconds to process (default: entire file)\n"
               << "  --baseline <method>      Baseline model: 'ripple_filter', 'als', 'poly'\n"
+              << "  --line-method <method>   Line analysis: 'gaussian_ls', 'double_gaussian', 'voigt', 'gauss_hermite', 'moments'\n"
               << "  --tsys <Kelvin>          Assumed system noise temperature (default: 100.0 K)\n"
               << "  -o, --output-dir <dir>   Output directory for PNG plots and CSV (default: 'output')\n"
               << "\n"
@@ -185,6 +187,11 @@ int run_record(int argc, char* argv[], int start_idx) {
     std::string actual_file = writer.start_recording(
         sample_rate_hz, center_freq_hz, sdr.get_device_name(), gain_db, bias_tee, output_path, duration_s
     );
+    if (actual_file.empty()) {
+        std::cerr << "Error: Failed to open output CS16 file for recording!\n";
+        sdr.shutdown();
+        return 1;
+    }
 
     std::cout << "Recording started: " << actual_file << "\n";
     sdr.start_streaming();
@@ -224,6 +231,7 @@ int run_analyze(int argc, char* argv[], int start_idx) {
     std::string fc_str;
     std::string fs_str;
     std::string baseline_str;
+    std::string line_method_str;
     std::string out_dir = "output";
     int fft_size = 8192;
     double duration_s = 0.0;
@@ -276,6 +284,13 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 std::cerr << "Error: Missing value for " << arg << "\n";
                 return 1;
             }
+        } else if (arg == "--line-method" || arg == "--fit") {
+            if (i + 1 < argc) {
+                line_method_str = argv[++i];
+            } else {
+                std::cerr << "Error: Missing value for " << arg << "\n";
+                return 1;
+            }
         } else if (arg == "--tsys") {
             if (i + 1 < argc) {
                 tsys = std::stod(argv[++i]);
@@ -316,7 +331,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
         if (!discovered.empty()) {
             std::cout << "\nDiscovered CS16 files in workspace:\n";
             for (size_t i = 0; i < std::min<size_t>(discovered.size(), 5); ++i) {
-                uint64_t sz = std::filesystem::file_size(discovered[i]);
+                std::error_code ec;
+                uint64_t sz = std::filesystem::file_size(discovered[i], ec);
                 std::cout << "  [" << (i + 1) << "] " << discovered[i]
                           << " (" << std::fixed << std::setprecision(1) << sz / (1024.0 * 1024.0) << " MB)\n";
             }
@@ -328,9 +344,12 @@ int run_analyze(int argc, char* argv[], int start_idx) {
         }
     }
 
-    if (!std::filesystem::exists(filepath)) {
-        std::cerr << "Error: Specified file does not exist: " << filepath << "\n";
-        return 1;
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(filepath, ec)) {
+            std::cerr << "Error: Specified file does not exist: " << filepath << "\n";
+            return 1;
+        }
     }
 
     AstroConfig config;
@@ -341,6 +360,9 @@ int run_analyze(int argc, char* argv[], int start_idx) {
 
     if (!baseline_str.empty()) {
         config.baseline_method = parse_baseline_method(baseline_str);
+    }
+    if (!line_method_str.empty()) {
+        config.line_method = parse_line_analysis_method(line_method_str);
     }
 
     // Auto-detect and parse sidecar
@@ -496,9 +518,10 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        std::error_code cli_ec;
         if (has_record_flag && !is_cs16_file && !has_analyze_flag) {
             return run_record(argc, argv, 1);
-        } else if (is_cs16_file || has_analyze_flag || std::filesystem::exists(argv[1])) {
+        } else if (is_cs16_file || has_analyze_flag || std::filesystem::exists(argv[1], cli_ec)) {
             return run_analyze(argc, argv, 1);
         } else if (cmd.rfind("--fc", 0) == 0 || cmd.rfind("-d", 0) == 0 || cmd.rfind("-t", 0) == 0) {
             return run_record(argc, argv, 1);

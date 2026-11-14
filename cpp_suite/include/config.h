@@ -20,6 +20,14 @@ enum class BaselineMethod {
     RippleFilter  // Ripple-tuned smoothed background
 };
 
+enum class LineAnalysisMethod {
+    GaussianLS,      // 1-Component Levenberg-Marquardt Gaussian fit
+    DoubleGaussian,  // 2-Component Levenberg-Marquardt Gaussian decomposition (multi-arm kinematics)
+    VoigtProfile,    // Pseudo-Voigt Levenberg-Marquardt profile (Gaussian thermal/turbulent core + Lorentzian damping wings)
+    GaussHermite,    // Gauss-Hermite h3 (skewness) & h4 (kurtosis) asymmetric line profile
+    SpectralMoments  // Non-parametric Moment 0 / Moment 1 / Moment 2 + Savitzky-Golay smoothed envelope
+};
+
 struct AstroConfig {
     // SDR & Hardware Settings
     double center_freq_hz = 1420.5e6;      // SDR LO Tuned Frequency (e.g. 1420.5 MHz)
@@ -39,6 +47,7 @@ struct AstroConfig {
 
     // Baseline Estimation Settings
     BaselineMethod baseline_method = BaselineMethod::RippleFilter;
+    LineAnalysisMethod line_method = LineAnalysisMethod::GaussianLS;
     double passband_edge_fraction = 0.065; // Outer skirts fraction (6.5%)
     double hi_protection_half_width_khz = 90.0; // Protection zone (+/- 90 kHz)
     double filter_smoothing_sigma_khz = 35.0;   // Gaussian filter sigma in kHz
@@ -84,6 +93,41 @@ inline std::string baseline_method_to_string(BaselineMethod m) {
         case BaselineMethod::ALS: return "als";
         case BaselineMethod::Poly: return "poly";
         default: return "ripple_filter";
+    }
+}
+
+// String to LineAnalysisMethod helper
+inline LineAnalysisMethod parse_line_analysis_method(const std::string& str) {
+    std::string s = str;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (s == "double_gaussian" || s == "double" || s == "2gauss" || s == "two_gaussian")
+        return LineAnalysisMethod::DoubleGaussian;
+    if (s == "voigt" || s == "voigt_profile" || s == "pseudovoigt")
+        return LineAnalysisMethod::VoigtProfile;
+    if (s == "gauss_hermite" || s == "hermite" || s == "gh" || s == "h3h4")
+        return LineAnalysisMethod::GaussHermite;
+    if (s == "moments" || s == "spectral_moments" || s == "nonparametric")
+        return LineAnalysisMethod::SpectralMoments;
+    return LineAnalysisMethod::GaussianLS;
+}
+
+inline std::string line_analysis_method_to_string(LineAnalysisMethod m) {
+    switch (m) {
+        case LineAnalysisMethod::DoubleGaussian:  return "double_gaussian";
+        case LineAnalysisMethod::VoigtProfile:    return "voigt_profile";
+        case LineAnalysisMethod::GaussHermite:    return "gauss_hermite";
+        case LineAnalysisMethod::SpectralMoments: return "spectral_moments";
+        default:                                  return "gaussian_ls";
+    }
+}
+
+inline std::string line_analysis_method_display_name(LineAnalysisMethod m) {
+    switch (m) {
+        case LineAnalysisMethod::DoubleGaussian:  return "Double Gaussian (2-Component)";
+        case LineAnalysisMethod::VoigtProfile:    return "Pseudo-Voigt (Core + Wings)";
+        case LineAnalysisMethod::GaussHermite:    return "Gauss-Hermite (h3/h4 Asym)";
+        case LineAnalysisMethod::SpectralMoments: return "Spectral Moments (M0/M1/M2)";
+        default:                                  return "Single Gaussian (L-M)";
     }
 }
 

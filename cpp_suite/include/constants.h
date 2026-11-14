@@ -23,8 +23,8 @@ constexpr int DEFAULT_PPM = 0;
 
 // Default DSP & Display parameters
 constexpr int DEFAULT_FFT_SIZE = 4096;
-constexpr float DEFAULT_FFT_MIN_DB = -105.0f;
-constexpr float DEFAULT_FFT_MAX_DB = -50.0f;
+constexpr float DEFAULT_FFT_MIN_DB = -95.0f;
+constexpr float DEFAULT_FFT_MAX_DB = -15.0f;
 constexpr float DEFAULT_AVG_FACTOR = 0.65f;
 constexpr int DEFAULT_WATERFALL_WIDTH = 800;
 constexpr int DEFAULT_WATERFALL_HEIGHT = 260;
@@ -105,12 +105,12 @@ constexpr double GAUSSIAN_SIGMA_TO_FWHM = 2.3548200450309493;
 
 // Observatory Slate Scientific UI Theme Palette (Hex RGBA & Floats)
 namespace theme {
-    // Primary deep background: #0D1117
+    // Primary deep workspace canvas: #0D1117
     constexpr float BG_R = 0.051f, BG_G = 0.067f, BG_B = 0.090f, BG_A = 1.000f;
-    // Card / Child surface: #131820
-    constexpr float FRAME_R = 0.075f, FRAME_G = 0.094f, FRAME_B = 0.125f, FRAME_A = 1.000f;
-    // Surface border: #2D3644
-    constexpr float BORDER_R = 0.176f, BORDER_G = 0.212f, BORDER_B = 0.267f, BORDER_A = 1.000f;
+    // Elevated card / child surface: #141A23
+    constexpr float FRAME_R = 0.078f, FRAME_G = 0.102f, FRAME_B = 0.137f, FRAME_A = 1.000f;
+    // Surface border: #2B3749
+    constexpr float BORDER_R = 0.169f, BORDER_G = 0.216f, BORDER_B = 0.286f, BORDER_A = 1.000f;
     // Primary CTA Accent: #2F81F7
     constexpr float ACCENT_R = 0.184f, ACCENT_G = 0.506f, ACCENT_B = 0.969f, ACCENT_A = 1.000f;
     // Cyan Live/HI Spectrum Trace: #38BDF8

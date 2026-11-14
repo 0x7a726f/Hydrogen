@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <atomic>
-#include <vector>
 #include <algorithm>
 #include <cstring>
 #include "simd_dsp.h"
@@ -54,9 +53,11 @@ public:
         if (!src || count == 0) return 0;
 
         const size_t current_write = write_idx_.load(std::memory_order_relaxed);
-        const size_t current_read = read_idx_.load(std::memory_order_acquire);
-
-        const size_t free_slots = capacity_ - (current_write - current_read);
+        size_t free_slots = capacity_ - (current_write - read_idx_cache_);
+        if (free_slots < count) {
+            read_idx_cache_ = read_idx_.load(std::memory_order_acquire);
+            free_slots = capacity_ - (current_write - read_idx_cache_);
+        }
         const size_t to_write = std::min(count, free_slots);
 
         if (to_write == 0) {
@@ -91,9 +92,11 @@ public:
         if (!dst || count == 0) return 0;
 
         const size_t current_read = read_idx_.load(std::memory_order_relaxed);
-        const size_t current_write = write_idx_.load(std::memory_order_acquire);
-
-        const size_t available = current_write - current_read;
+        size_t available = write_idx_cache_ - current_read;
+        if (available < count) {
+            write_idx_cache_ = write_idx_.load(std::memory_order_acquire);
+            available = write_idx_cache_ - current_read;
+        }
         const size_t to_read = std::min(count, available);
 
         if (to_read == 0) return 0;
@@ -117,9 +120,7 @@ public:
         if (!dst || count == 0) return 0;
 
         const size_t current_read = read_idx_.load(std::memory_order_relaxed);
-        const size_t current_write = write_idx_.load(std::memory_order_acquire);
-
-        const size_t available = current_write - current_read;
+        const size_t available = write_idx_.load(std::memory_order_acquire) - current_read;
         const size_t to_read = std::min(count, available);
 
         if (to_read == 0) return 0;
@@ -138,9 +139,13 @@ public:
 
     // Skip / discard count elements
     void discard(size_t count) {
+        if (count == 0) return;
         const size_t current_read = read_idx_.load(std::memory_order_relaxed);
-        const size_t current_write = write_idx_.load(std::memory_order_acquire);
-        const size_t available = current_write - current_read;
+        size_t available = write_idx_cache_ - current_read;
+        if (available < count) {
+            write_idx_cache_ = write_idx_.load(std::memory_order_acquire);
+            available = write_idx_cache_ - current_read;
+        }
         const size_t to_discard = std::min(count, available);
         read_idx_.store(current_read + to_discard, std::memory_order_release);
     }
@@ -148,7 +153,7 @@ public:
     size_t available_read() const {
         const size_t current_read = read_idx_.load(std::memory_order_acquire);
         const size_t current_write = write_idx_.load(std::memory_order_acquire);
-        return (current_write >= current_read) ? (current_write - current_read) : 0;
+        return current_write - current_read;
     }
 
     size_t available_write() const {
@@ -159,7 +164,7 @@ public:
     size_t capacity() const { return capacity_; }
 
     float fill_percentage() const {
-        size_t avail = available_read();
+        const size_t avail = std::min(available_read(), capacity_);
         return (static_cast<float>(avail) / static_cast<float>(capacity_)) * 100.0f;
     }
 
@@ -170,6 +175,8 @@ public:
     void reset() {
         read_idx_.store(0, std::memory_order_relaxed);
         write_idx_.store(0, std::memory_order_relaxed);
+        read_idx_cache_ = 0;
+        write_idx_cache_ = 0;
         dropped_count_.store(0, std::memory_order_relaxed);
     }
 
@@ -179,8 +186,10 @@ private:
     T* buffer_ = nullptr;
     bool is_custom_aligned_ = false;
 
-    // Cache-line separation (64 bytes) to prevent false sharing between threads
+    // Cache-line separation (64 bytes) to prevent false sharing between producer & consumer
     alignas(64) std::atomic<size_t> write_idx_{0};
+    alignas(64) size_t read_idx_cache_{0};
     alignas(64) std::atomic<size_t> read_idx_{0};
+    alignas(64) size_t write_idx_cache_{0};
     alignas(64) std::atomic<uint64_t> dropped_count_{0};
 };

@@ -6,7 +6,6 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
-#include <memory>
 #include <cmath>
 
 class DspPipeline {
@@ -31,6 +30,13 @@ public:
     bool get_power_spectrum(std::vector<float>& out_power, float& out_peak_freq, float& out_peak_db,
                             uint64_t center_freq_hz, uint32_t sample_rate_hz);
 
+    // Instantaneous un-averaged FFT accessors (updated on each FFT pass, GUI thread only)
+    const std::vector<float>& get_instant_fft_db() const { return power_raw_; }
+    const std::vector<float>& get_instant_fft_mag() const { return fft_mag_linear_; }
+    float get_instant_fft_peak_db() const { return fft_peak_db_; }
+    float get_instant_fft_peak_mag() const { return fft_peak_mag_; }
+    float get_instant_fft_peak_freq() const { return fft_peak_freq_; }
+
     // Live Telemetry Accessors
     float get_noise_floor_db() const { return noise_floor_db_.load(std::memory_order_relaxed); }
     float get_snr_db() const { return snr_db_.load(std::memory_order_relaxed); }
@@ -53,9 +59,14 @@ private:
     kiss_fft_cfg fft_cfg_ = nullptr;
 
     std::vector<float> power_raw_;
+    std::vector<float> fft_mag_linear_;
     std::vector<float> power_smooth_;
     std::vector<float> telemetry_scratch_;
     bool has_smooth_ = false;
+    double coh_gain_sum_ = 1.0;
+    float fft_peak_db_ = -110.0f;
+    float fft_peak_mag_ = 0.0f;
+    float fft_peak_freq_ = 0.0f;
 
     // Telemetry state
     std::atomic<float> noise_floor_db_{-110.0f};

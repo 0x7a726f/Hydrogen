@@ -37,17 +37,18 @@ std::vector<double> DCExcision::excise(const std::vector<double>& power, const A
     std::vector<double> left_guard(power.begin() + left_start, power.begin() + start_dc);
     std::vector<double> right_guard(power.begin() + end_dc + 1, power.begin() + right_end);
 
-    std::vector<double> all_guards;
-    all_guards.reserve(left_guard.size() + right_guard.size());
-    all_guards.insert(all_guards.end(), left_guard.begin(), left_guard.end());
-    all_guards.insert(all_guards.end(), right_guard.begin(), right_guard.end());
-
     double replacement_median = 0.0;
-    if (all_guards.empty()) {
-        std::vector<double> tmp = power;
-        replacement_median = calculate_median_inplace(tmp);
-    } else {
-        replacement_median = calculate_median_inplace(all_guards);
+    if (left_guard.empty() || right_guard.empty()) {
+        std::vector<double> all_guards;
+        all_guards.reserve(left_guard.size() + right_guard.size());
+        all_guards.insert(all_guards.end(), left_guard.begin(), left_guard.end());
+        all_guards.insert(all_guards.end(), right_guard.begin(), right_guard.end());
+        if (all_guards.empty()) {
+            std::vector<double> tmp = power;
+            replacement_median = calculate_median_inplace(tmp);
+        } else {
+            replacement_median = calculate_median_inplace(all_guards);
+        }
     }
     double left_val = left_guard.empty() ? replacement_median : calculate_median_inplace(left_guard);
     double right_val = right_guard.empty() ? replacement_median : calculate_median_inplace(right_guard);

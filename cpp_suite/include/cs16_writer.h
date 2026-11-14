@@ -1,13 +1,13 @@
 #pragma once
 
 #include "constants.h"
+#include "lockfree_ringbuffer.h"
 #include <string>
 #include <vector>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
-#include <deque>
+#include <memory>
 #include <atomic>
 #include <chrono>
 
@@ -60,25 +60,28 @@ public:
 
 private:
     void writer_worker();
+    void finalize_sidecars(double duration_s);
     void write_accompanied_txt(const std::string& txt_path, double duration_s);
     void write_sidecar_json(const std::string& json_path, double duration_s);
 
     std::string output_dir_;
     std::atomic<bool> is_recording_{false};
+    std::atomic<bool> accepting_samples_{false};
     std::atomic<bool> stop_worker_{false};
+    std::atomic<int> active_feeders_{0};
     mutable std::mutex path_mutex_;
     std::string current_filepath_;
     std::string last_recorded_filepath_;
     std::string iso_start_timestamp_;
 
-    uint32_t sample_rate_hz_ = 2400000;
+    std::atomic<uint32_t> sample_rate_hz_{2400000};
     uint64_t center_freq_hz_ = 1420500000;
     std::string device_name_ = "RTL-SDR";
     float gain_db_ = 25.4f;
     bool bias_tee_ = false;
     double max_duration_s_ = 0.0;
 
-    std::chrono::high_resolution_clock::time_point start_time_;
+    std::chrono::steady_clock::time_point start_time_;
     std::atomic<uint64_t> bytes_written_{0};
     std::atomic<uint64_t> samples_written_{0};
     std::atomic<uint64_t> dropped_blocks_{0};
@@ -88,11 +91,10 @@ private:
     HANDLE file_handle_ = INVALID_HANDLE_VALUE;
 #endif
 
-    // Background disk writing queue and reusable block buffer pool
+    // Lock-free lazy SPSC disk ring buffer + worker synchronization
     std::mutex lifecycle_mutex_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
-    std::deque<std::vector<uint8_t>> write_queue_;
-    std::vector<std::vector<uint8_t>> free_pool_;
+    std::unique_ptr<LockFreeSpscRingBuffer<uint8_t>> ring_buffer_;
     std::thread writer_thread_;
 };

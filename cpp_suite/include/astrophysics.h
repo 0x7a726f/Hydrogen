@@ -2,17 +2,46 @@
 
 #include <vector>
 #include <string>
+#include <cstdint>
 #include "config.h"
 
 namespace astro {
 
 struct GaussianFit {
     bool success = false;
+    LineAnalysisMethod method = LineAnalysisMethod::GaussianLS;
+
+    // Primary component / overall profile metrics
     double amplitude_k = 0.0;
     double v_center_kms = 0.0;
     double sigma_kms = 0.0;
     double fwhm_kms = 0.0;
-    std::vector<double> fitted_curve; // Evaluated over entire vel_kms axis
+    double rmse_k = 0.0;              // Residual RMS inside H I window [K]
+
+    // Secondary component (populated for DoubleGaussian)
+    bool has_secondary = false;
+    double amp2_k = 0.0;
+    double v2_center_kms = 0.0;
+    double sigma2_kms = 0.0;
+    double fwhm2_kms = 0.0;
+
+    // Pseudo-Voigt parameters (populated for VoigtProfile)
+    double voigt_eta = 0.0;           // Lorentzian mixing fraction in [0, 1]
+    double lorentz_gamma_kms = 0.0;   // Lorentzian HWHM gamma [km/s]
+
+    // Gauss-Hermite higher-order moments (populated for GaussHermite)
+    double gh_h3 = 0.0;               // Skewness coefficient h3
+    double gh_h4 = 0.0;               // Kurtosis coefficient h4
+
+    // Non-parametric spectral moments (always computed for reference & SpectralMoments)
+    double moment0_k_kms = 0.0;       // Integrated intensity M0 [K * km/s]
+    double moment1_kms = 0.0;         // Intensity-weighted centroid velocity M1 [km/s]
+    double moment2_sigma_kms = 0.0;   // Intensity-weighted dispersion sqrt(M2) [km/s]
+
+    // Curves evaluated over the entire vel_kms axis
+    std::vector<double> fitted_curve;     // Total composite model or smoothed profile
+    std::vector<double> component1_curve; // Component 1 (for DoubleGaussian)
+    std::vector<double> component2_curve; // Component 2 (for DoubleGaussian)
 };
 
 struct AstrophysicalMetrics {
@@ -51,6 +80,14 @@ public:
         const std::vector<double>& vel_kms,
         const std::vector<double>& temp_k,
         const std::vector<uint8_t>& hi_window
+    );
+
+    // Multi-method H I 21-cm line profile analysis dispatcher
+    static GaussianFit fit_line_profile(
+        const std::vector<double>& vel_kms,
+        const std::vector<double>& temp_k,
+        const std::vector<uint8_t>& hi_window,
+        LineAnalysisMethod method
     );
 
     // Compute comprehensive astrophysical metrics

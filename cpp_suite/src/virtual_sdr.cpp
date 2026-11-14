@@ -133,7 +133,7 @@ void VirtualSdrDevice::reset_buffer() {
 
 int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read) {
     if (!is_open_) {
-        *bytes_read = 0;
+        if (bytes_read) *bytes_read = 0;
         return -1;
     }
 
@@ -164,16 +164,30 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
     const float dc_offset_q = 128.0f;
 
     if (std::abs(static_cast<double>(fc) - SdrConstants::HI_REST_FREQ_HZ) < span) {
-        const double hi_offset = SdrConstants::HI_REST_FREQ_HZ - static_cast<double>(fc);
+        // Simulate Doppler-shifted (+7.4 km/s) narrowband thermal 21cm H I emission (~12 km/s FWHM)
+        const double hi_line_freq_hz = SdrConstants::HI_REST_FREQ_HZ - 35000.0;
+        const double hi_offset = hi_line_freq_hz - static_cast<double>(fc);
         Phasor hi_osc, ripple_osc;
         hi_osc.init(hi_phase_, two_pi_dt * hi_offset);
         ripple_osc.init(ripple_phase_, two_pi_dt * 710000.0);
-        const float hi_sigma = noise_sigma * 1.1f;
+
+        // Two cascaded 1-pole IIR filters shape white complex Gaussian excitation into a narrowband spectral peak
+        // |H2(w)|^2 has unity peak gain (|H2(0)|^2 = 1.0) so peak excess power = hi_sigma^2 / noise_sigma^2
+        const float lp_alpha = static_cast<float>(std::clamp(2.0 * M_PI * 42000.0 / (0.6436 * span), 0.02, 0.5));
+        const float lp_decay = 1.0f - lp_alpha;
+        const float hi_sigma = noise_sigma * 0.50f; // +25% excess PSD (~+25 K at T_sys = 100 K)
+        float lp1_i = hi_lp1_i_, lp1_q = hi_lp1_q_;
+        float lp2_i = hi_lp2_i_, lp2_q = hi_lp2_q_;
 
         for (int n = 0; n < chunk_samples; ++n) {
             float ni, nq, h_ni, h_nq;
             next_complex_gaussian(rng_state_, noise_sigma, ni, nq);
             next_complex_gaussian(rng_state_, hi_sigma, h_ni, h_nq);
+
+            lp1_i = lp_decay * lp1_i + lp_alpha * h_ni;
+            lp1_q = lp_decay * lp1_q + lp_alpha * h_nq;
+            lp2_i = lp_decay * lp2_i + lp_alpha * lp1_i;
+            lp2_q = lp_decay * lp2_q + lp_alpha * lp1_q;
 
             hi_osc.step();
             ripple_osc.step();
@@ -182,9 +196,9 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
                 ripple_osc.renorm();
             }
 
-            float sig_i = h_ni * static_cast<float>(hi_osc.re) - h_nq * static_cast<float>(hi_osc.im)
+            float sig_i = lp2_i * static_cast<float>(hi_osc.re) - lp2_q * static_cast<float>(hi_osc.im)
                         + 3.5f * static_cast<float>(ripple_osc.im);
-            float sig_q = h_ni * static_cast<float>(hi_osc.im) + h_nq * static_cast<float>(hi_osc.re)
+            float sig_q = lp2_i * static_cast<float>(hi_osc.im) + lp2_q * static_cast<float>(hi_osc.re)
                         + 3.5f * static_cast<float>(ripple_osc.re);
 
             buffer[2 * n]     = clamp_u8(ni + sig_i + dc_offset_i);
@@ -192,6 +206,8 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
         }
         hi_phase_ = hi_osc.final_phase();
         ripple_phase_ = ripple_osc.final_phase();
+        hi_lp1_i_ = lp1_i; hi_lp1_q_ = lp1_q;
+        hi_lp2_i_ = lp2_i; hi_lp2_q_ = lp2_q;
     } else if (fc >= 80000000ULL && fc <= 115000000ULL) {
         static const double fm_stations[] = {
             88.5e6, 89.2e6, 92.6e6, 96.9e6, 98.6e6, 100.3e6, 103.7e6, 105.8e6

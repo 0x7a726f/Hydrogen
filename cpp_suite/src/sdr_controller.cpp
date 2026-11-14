@@ -3,7 +3,6 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-#include <iostream>
 
 SdrController::SdrController()
     : rx_buffer_(SdrConstants::SDR_CHUNK_BYTES),
@@ -20,6 +19,7 @@ void SdrController::stop_workers_locked() {
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
+    process_pending_commands();
     {
         std::lock_guard<std::mutex> dlk(dispatch_mutex_);
         dispatch_stop_ = true;
@@ -112,115 +112,58 @@ void SdrController::stop_streaming() {
     stop_workers_locked();
 }
 
-std::future<bool> SdrController::request_frequency(uint64_t freq_hz) {
+std::future<bool> SdrController::enqueue_command(SdrCommand cmd) {
     auto prom = std::make_shared<std::promise<bool>>();
     auto fut = prom->get_future();
+    cmd.promise = std::move(prom);
 
+    {
+        std::lock_guard<std::mutex> lock(cmd_mutex_);
+        cmd_queue_.push_back(std::move(cmd));
+    }
+    if (!is_streaming_.load()) {
+        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
+        if (!is_streaming_.load()) {
+            process_pending_commands();
+        }
+    }
+    return fut;
+}
+
+std::future<bool> SdrController::request_frequency(uint64_t freq_hz) {
     SdrCommand cmd;
     cmd.type = SdrCommandType::SetFrequency;
     cmd.uint_param = freq_hz;
-    cmd.promise = prom;
-
-    {
-        std::lock_guard<std::mutex> lock(cmd_mutex_);
-        cmd_queue_.push_back(cmd);
-    }
-    if (!is_streaming_.load()) {
-        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-        if (!is_streaming_.load()) {
-            process_pending_commands();
-        }
-    }
-    return fut;
+    return enqueue_command(std::move(cmd));
 }
 
 std::future<bool> SdrController::request_sample_rate(uint32_t rate_hz) {
-    auto prom = std::make_shared<std::promise<bool>>();
-    auto fut = prom->get_future();
-
     SdrCommand cmd;
     cmd.type = SdrCommandType::SetSampleRate;
     cmd.uint_param = rate_hz;
-    cmd.promise = prom;
-
-    {
-        std::lock_guard<std::mutex> lock(cmd_mutex_);
-        cmd_queue_.push_back(cmd);
-    }
-    if (!is_streaming_.load()) {
-        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-        if (!is_streaming_.load()) {
-            process_pending_commands();
-        }
-    }
-    return fut;
+    return enqueue_command(std::move(cmd));
 }
 
 std::future<bool> SdrController::request_gain(float gain_db, bool auto_gain) {
-    auto prom = std::make_shared<std::promise<bool>>();
-    auto fut = prom->get_future();
-
     SdrCommand cmd;
     cmd.type = SdrCommandType::SetGain;
     cmd.float_param = gain_db;
     cmd.bool_param = auto_gain;
-    cmd.promise = prom;
-
-    {
-        std::lock_guard<std::mutex> lock(cmd_mutex_);
-        cmd_queue_.push_back(cmd);
-    }
-    if (!is_streaming_.load()) {
-        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-        if (!is_streaming_.load()) {
-            process_pending_commands();
-        }
-    }
-    return fut;
+    return enqueue_command(std::move(cmd));
 }
 
 std::future<bool> SdrController::request_bias_tee(bool enabled) {
-    auto prom = std::make_shared<std::promise<bool>>();
-    auto fut = prom->get_future();
-
     SdrCommand cmd;
     cmd.type = SdrCommandType::SetBiasTee;
     cmd.bool_param = enabled;
-    cmd.promise = prom;
-
-    {
-        std::lock_guard<std::mutex> lock(cmd_mutex_);
-        cmd_queue_.push_back(cmd);
-    }
-    if (!is_streaming_.load()) {
-        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-        if (!is_streaming_.load()) {
-            process_pending_commands();
-        }
-    }
-    return fut;
+    return enqueue_command(std::move(cmd));
 }
 
 std::future<bool> SdrController::request_ppm(int ppm) {
-    auto prom = std::make_shared<std::promise<bool>>();
-    auto fut = prom->get_future();
-
     SdrCommand cmd;
     cmd.type = SdrCommandType::SetPpm;
     cmd.int_param = ppm;
-    cmd.promise = prom;
-
-    {
-        std::lock_guard<std::mutex> lock(cmd_mutex_);
-        cmd_queue_.push_back(cmd);
-    }
-    if (!is_streaming_.load()) {
-        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-        if (!is_streaming_.load()) {
-            process_pending_commands();
-        }
-    }
-    return fut;
+    return enqueue_command(std::move(cmd));
 }
 
 std::string SdrController::get_device_name() const {
@@ -378,9 +321,13 @@ void SdrController::stream_worker() {
 
         int bytes_read = 0;
         int ret = device_->read_samples(rx_buffer_.data(), (int)rx_buffer_.size(), &bytes_read);
-        if (ret == 0 && bytes_read > 0) {
+        if (ret == 0 && bytes_read > 1) {
+            const size_t aligned_bytes = static_cast<size_t>(bytes_read) & ~size_t(1);
             // Producer pushes solely to lock-free SPSC ring buffer; dispatch_worker drains and runs callbacks
-            ring_buffer_.write_lossy(rx_buffer_.data(), (size_t)bytes_read);
+            ring_buffer_.write_lossy(rx_buffer_.data(), aligned_bytes);
+            {
+                std::lock_guard<std::mutex> dlk(dispatch_mutex_);
+            }
             dispatch_cv_.notify_one();
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));

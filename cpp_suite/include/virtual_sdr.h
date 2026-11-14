@@ -49,8 +49,10 @@ private:
 
     uint64_t rng_state_ = 0x9E3779B97F4A7C15ULL;
 
-    // Phase accumulators for seamless phase continuity across tuning
+    // Phase accumulators & 21cm thermal H I line filter state
     double hi_phase_ = 0.0;
+    float hi_lp1_i_ = 0.0f, hi_lp1_q_ = 0.0f;
+    float hi_lp2_i_ = 0.0f, hi_lp2_q_ = 0.0f;
     double ripple_phase_ = 0.0;
     double fm_phase_[8] = {0.0};
     double am_phase_ = 0.0;

@@ -3,12 +3,11 @@
 #include "simd_dsp.h"
 #include <fstream>
 #include <iomanip>
-#include <sstream>
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
-#include <iostream>
 #include <future>
-#include <cstdio>
+#include <charconv>
 
 namespace astro {
 
@@ -31,7 +30,9 @@ bool Exporter::export_csv(
     std::ofstream f(output_path, std::ios::binary);
     if (!f.is_open()) return false;
 
-    const size_t n = freqs_hz.size();
+    const size_t n = std::min({freqs_hz.size(), freqs_mhz.size(), vel_kms.size(),
+                               raw_power.size(), baseline_power.size(),
+                               calibrated_k.size(), calibrated_db.size()});
     std::vector<double> raw_db(n), base_db(n);
     SimdDsp::power_to_db_f64(raw_power.data(), raw_db.data(), n, 1e-12);
     SimdDsp::power_to_db_f64(baseline_power.data(), base_db.data(), n, 1e-12);
@@ -40,20 +41,31 @@ bool Exporter::export_csv(
     out_buf.reserve(65536);
     out_buf = "Frequency_Hz,Frequency_MHz,Doppler_Velocity_kms,Raw_Power_dB,Baseline_Power_dB,Calibrated_Power_dB,Antenna_Temperature_K\n";
 
-    char line_buf[256];
+    char line_buf[512];
+    auto append_fixed = [](char*& p, char* end, double val, int prec, char delim) {
+        if (!std::isfinite(val)) val = 0.0;
+        auto r = std::to_chars(p, end, val, std::chars_format::fixed, prec);
+        if (r.ec == std::errc()) {
+            p = r.ptr;
+        } else if (p < end) {
+            *p++ = '0';
+        }
+        *p++ = delim;
+    };
     for (size_t i = 0; i < n; ++i) {
-        int len = std::snprintf(
-            line_buf, sizeof(line_buf),
-            "%.3f,%.6f,%.3f,%.4f,%.4f,%.4f,%.4f\n",
-            freqs_hz[i], freqs_mhz[i], vel_kms[i],
-            raw_db[i], base_db[i], calibrated_db[i], calibrated_k[i]
-        );
-        if (len > 0) {
-            out_buf.append(line_buf, static_cast<size_t>(len));
-            if (out_buf.size() >= 60000) {
-                f.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
-                out_buf.clear();
-            }
+        char* p = line_buf;
+        char* end = line_buf + sizeof(line_buf) - 16;
+        append_fixed(p, end, freqs_hz[i], 3, ',');
+        append_fixed(p, end, freqs_mhz[i], 6, ',');
+        append_fixed(p, end, vel_kms[i], 3, ',');
+        append_fixed(p, end, raw_db[i], 4, ',');
+        append_fixed(p, end, base_db[i], 4, ',');
+        append_fixed(p, end, calibrated_db[i], 4, ',');
+        append_fixed(p, end, calibrated_k[i], 4, '\n');
+        out_buf.append(line_buf, static_cast<size_t>(p - line_buf));
+        if (out_buf.size() >= 60000) {
+            f.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+            out_buf.clear();
         }
     }
     if (!out_buf.empty()) {
@@ -104,6 +116,7 @@ bool Exporter::export_json(
       << "  },\n"
       << "  \"hydrogen_line_detection\": {\n"
       << "    \"target_line\": \"Neutral Hydrogen (H I 21cm, 1S F=1 -> F=0)\",\n"
+      << "    \"line_analysis_method\": \"" << line_analysis_method_to_string(config.line_method) << "\",\n"
       << "    \"rest_frequency_mhz\": " << std::setprecision(6) << HYDROGEN_REST_FREQ_MHZ << ",\n"
       << "    \"observed_peak_frequency_mhz\": " << std::setprecision(6) << metrics.peak_freq_mhz << ",\n"
       << "    \"doppler_recession_velocity_kms\": " << std::setprecision(3) << metrics.peak_vel_kms << ",\n"
@@ -114,6 +127,16 @@ bool Exporter::export_json(
       << "    \"signal_to_noise_ratio_snr\": " << std::setprecision(2) << metrics.snr << ",\n"
       << "    \"line_fwhm_kms\": " << std::setprecision(2) << metrics.fwhm_kms << ",\n"
       << "    \"velocity_dispersion_sigma_kms\": " << std::setprecision(2) << metrics.sigma_kms << ",\n"
+      << "    \"fit_rmse_k\": " << std::setprecision(4) << metrics.gauss_fit.rmse_k << ",\n"
+      << "    \"secondary_component_detected\": " << (metrics.gauss_fit.has_secondary ? "true" : "false") << ",\n"
+      << "    \"secondary_amplitude_k\": " << std::setprecision(3) << metrics.gauss_fit.amp2_k << ",\n"
+      << "    \"secondary_velocity_kms\": " << std::setprecision(3) << metrics.gauss_fit.v2_center_kms << ",\n"
+      << "    \"secondary_fwhm_kms\": " << std::setprecision(2) << metrics.gauss_fit.fwhm2_kms << ",\n"
+      << "    \"voigt_eta\": " << std::setprecision(4) << metrics.gauss_fit.voigt_eta << ",\n"
+      << "    \"gauss_hermite_h3\": " << std::setprecision(4) << metrics.gauss_fit.gh_h3 << ",\n"
+      << "    \"gauss_hermite_h4\": " << std::setprecision(4) << metrics.gauss_fit.gh_h4 << ",\n"
+      << "    \"moment1_centroid_kms\": " << std::setprecision(3) << metrics.gauss_fit.moment1_kms << ",\n"
+      << "    \"moment2_dispersion_kms\": " << std::setprecision(3) << metrics.gauss_fit.moment2_sigma_kms << ",\n"
       << "    \"integrated_flux_k_kms\": " << std::setprecision(2) << metrics.integrated_flux_k_kms << ",\n"
       << "    \"neutral_hydrogen_column_density_cm2\": " << std::scientific << std::setprecision(3) << metrics.column_density_cm2 << ",\n"
       << "    \"lo_dc_offset_khz\": " << std::fixed << std::setprecision(3) << metrics.lo_offset_khz << ",\n"
@@ -121,7 +144,8 @@ bool Exporter::export_json(
       << "  }\n"
       << "}\n";
 
-    return true;
+    f.flush();
+    return f.good();
 }
 
 bool Exporter::export_summary_text(
@@ -170,6 +194,7 @@ bool Exporter::export_summary_text(
       << "Channel Width (Velocity):   " << std::setprecision(3) << bin_res_kms << " km/s\n"
       << "Assumed System Noise Temp:  " << std::setprecision(1) << config.system_temp_k << " K\n"
       << "Baseline Modeling Method:   " << baseline_method_to_string(config.baseline_method) << "\n"
+      << "Line Profile Analysis:      " << line_analysis_method_display_name(config.line_method) << "\n"
       << "DC Spike Excision:          Excised " << std::setprecision(0) << config.dc_clear_hz << " Hz centered at LO "
       << std::setprecision(4) << fc_mhz << " MHz\n\n"
       << "3. DC SPIKE COMBAT & LO OFF-CENTERING VERIFICATION\n"
@@ -213,7 +238,8 @@ bool Exporter::export_summary_text(
       << "Generated by C++ Offline 21cm Hydrogen Line Analysis Pipeline\n"
       << "================================================================================\n";
 
-    return true;
+    f.flush();
+    return f.good();
 }
 
 bool Exporter::export_all_artifacts(
@@ -228,7 +254,8 @@ bool Exporter::export_all_artifacts(
     const std::vector<double>& calibrated_db,
     const AstrophysicalMetrics& metrics
 ) {
-    std::filesystem::create_directories(output_dir);
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
 
     std::filesystem::path out(output_dir);
     std::string p1 = (out / "1_hi_spectrum_calibrated.png").string();
@@ -239,7 +266,10 @@ bool Exporter::export_all_artifacts(
 
     std::vector<double> vel_kms = Astrophysics::compute_doppler_velocity(stream_res.freq_hz);
 
-    // Launch all 5 PNG plot renders + encodings concurrently while writing text/CSV reports
+    // Launch heaviest master dashboard first, followed by remaining 4 PNG plots concurrently with text/CSV reports
+    auto f5 = std::async(std::launch::async, [&]() {
+        return PlotRenderer::render_master_dashboard(stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db, stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols, stream_res.waterfall_times, metrics, config, source_file, p5);
+    });
     auto f1 = std::async(std::launch::async, [&]() {
         return PlotRenderer::render_calibrated_spectrum(stream_res.freq_mhz, vel_kms, calibrated_k, calibrated_db, metrics, config, p1);
     });
@@ -251,9 +281,6 @@ bool Exporter::export_all_artifacts(
     });
     auto f4 = std::async(std::launch::async, [&]() {
         return PlotRenderer::render_waterfall_plot(stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols, stream_res.waterfall_times, stream_res.freq_mhz, baseline_power, config, p4);
-    });
-    auto f5 = std::async(std::launch::async, [&]() {
-        return PlotRenderer::render_master_dashboard(stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db, stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols, stream_res.waterfall_times, metrics, config, source_file, p5);
     });
 
     std::string csv_path = (out / "calibrated_spectrum.csv").string();

@@ -458,7 +458,6 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         uint64_t bytes_consumed = 0;
         bool ready = false;
         bool eof = false;
-        std::string error_msg;
     };
     ReadSlot slots[2];
     slots[0].buf.resize(static_cast<size_t>(chunk_samples) * 2);
@@ -763,8 +762,10 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         }
     }
 
-    // Flush final partial waterfall row if needed
-    if (current_row_blocks > 0) {
+    // Flush final partial waterfall row only if it covers at least 50% of a row interval
+    // (or if no full rows exist yet), avoiding a high-variance sliver at the end.
+    if (current_row_blocks > 0 &&
+        (waterfall_timestamps.empty() || current_row_blocks * 2 >= blocks_per_waterfall_row)) {
         append_shifted_waterfall_row(current_row_blocks, duration_to_process_s_);
     }
 

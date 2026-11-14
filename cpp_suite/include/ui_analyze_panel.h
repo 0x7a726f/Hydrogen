@@ -29,6 +29,7 @@ struct AnalysisSnapshot {
     std::vector<double> rfi_clean_power;
     std::vector<double> baseline_power;
     std::vector<double> baseline_db;
+    std::vector<double> residual_db;
     std::vector<double> calibrated_k;
     std::vector<double> calibrated_db;
     std::vector<double> vel_kms;
@@ -49,6 +50,7 @@ struct AnalyzeParamsSig {
     double sample_rate_msps = 2.4;
     int fft_size_idx = 2;
     int baseline_idx = 0;
+    int line_method_idx = 0;
     float tsys_k = 100.0f;
     float duration_s = 0.0f;
     float dc_clear_khz = 5.0f;
@@ -62,6 +64,7 @@ struct AnalyzeParamsSig {
                std::abs(sample_rate_msps - o.sample_rate_msps) < 1e-6 &&
                fft_size_idx == o.fft_size_idx &&
                baseline_idx == o.baseline_idx &&
+               line_method_idx == o.line_method_idx &&
                std::abs(tsys_k - o.tsys_k) < 1e-3f &&
                std::abs(duration_s - o.duration_s) < 1e-3f &&
                std::abs(dc_clear_khz - o.dc_clear_khz) < 1e-3f &&
@@ -107,16 +110,31 @@ private:
     void set_export_message(const std::string& msg);
 
     void render_top_bar(float width, float height, const std::shared_ptr<const AnalysisSnapshot>& snap);
+    void render_empty_state(float width, float height);
     void render_sidebar_controls(float width, float height, const std::shared_ptr<const AnalysisSnapshot>& snap);
     void render_kpi_strip(float width, const AstrophysicalMetrics& m, const AstroConfig& cfg);
     void render_waterfall_view(ID3D11DeviceContext* ctx, ImVec2 avail,
                                const std::shared_ptr<const AnalysisSnapshot>& snap,
-                               const char* img_id);
+                               const char* img_id,
+                               bool compact = false);
 
     void render_tab_calibrated_spectrum(const std::shared_ptr<const AnalysisSnapshot>& snap);
     void render_tab_raw_and_baseline(const std::shared_ptr<const AnalysisSnapshot>& snap);
     void render_tab_waterfall(ID3D11DeviceContext* ctx, const std::shared_ptr<const AnalysisSnapshot>& snap);
     void render_tab_master_dashboard(ID3D11DeviceContext* ctx, const std::shared_ptr<const AnalysisSnapshot>& snap);
+
+    void render_calibrated_spectrum_plot(const std::shared_ptr<const AnalysisSnapshot>& snap,
+                                         ImVec2 avail, bool compact,
+                                         const char* hit_id, ui_obs::PlotZoomState& zoom);
+    void render_raw_baseline_plot(const std::shared_ptr<const AnalysisSnapshot>& snap,
+                                  ImVec2 avail, bool compact,
+                                  const char* hit_id, ui_obs::PlotZoomState& zoom);
+    void render_q2_calibrated_db_plot(const std::shared_ptr<const AnalysisSnapshot>& snap,
+                                      ImVec2 avail, const char* hit_id, ui_obs::PlotZoomState& zoom);
+    bool begin_sidebar_card(const char* id, const char* title, const ImVec4& accent,
+                            const char* badge_text = nullptr,
+                            const ImVec4& badge_col = ui_obs::palette::TextMuted);
+    void end_sidebar_card();
 
     void update_waterfall_texture(ID3D11DeviceContext* ctx, const std::shared_ptr<const AnalysisSnapshot>& snap);
 
@@ -137,6 +155,8 @@ private:
     std::vector<std::string> discovered_files_;
     int selected_file_idx_ = -1;
     char custom_file_path_[512] = "";
+    char selected_filename_[256] = "";
+    uint64_t selected_file_size_bytes_ = 0;
     ObservationMetadata current_sidecar_;
 
     // Configuration Controls
@@ -145,6 +165,7 @@ private:
     double ui_sample_rate_msps_ = 2.4;
     int ui_fft_size_idx_ = 2; // 8192
     int ui_baseline_idx_ = 0; // RippleFilter
+    int ui_line_method_idx_ = 0; // GaussianLS
     float ui_tsys_k_ = 100.0f;
     float ui_duration_s_ = 0.0f;
     float ui_dc_clear_khz_ = 5.0f;
@@ -168,15 +189,27 @@ private:
     std::unique_ptr<std::thread> worker_thread_;
     std::unique_ptr<std::thread> export_thread_;
 
+    mutable uint64_t val_cache_tick_ms_ = 0;
+    mutable std::string val_cache_path_;
+    mutable bool val_cache_file_ok_ = false;
+    bool validate_inputs_cached(std::string& out_error) const;
+
     // Lock-free-to-render snapshot swap
     std::mutex snapshot_mutex_;
     std::shared_ptr<const AnalysisSnapshot> active_snapshot_;
     AnalyzeParamsSig last_run_sig_;
 
+    // Interactive plot zoom/pan states (reset on new AnalysisSnapshot)
+    ui_obs::PlotZoomState zoom_cal_spec_;
+    ui_obs::PlotZoomState zoom_raw_base_;
+    ui_obs::PlotZoomState zoom_waterfall_;
+    ui_obs::PlotZoomState zoom_q2_db_;
+    const AnalysisSnapshot* last_zoom_snap_ = nullptr;
+
     // Reusable UI plot vertex & colormap scratch buffers
     std::vector<ImVec2> trace_scratch_;
+    std::vector<ImVec2> fill_scratch_;
     std::vector<uint32_t> active_lut256_;
-    std::vector<uint32_t> rgba_upload_scratch_;
 };
 
 } // namespace astro

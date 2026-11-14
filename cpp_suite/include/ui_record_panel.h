@@ -49,6 +49,9 @@ private:
     void render_spectrum_card(float width, float height);
     void render_waterfall_card(ID3D11DeviceContext* context, float width, float height);
     void update_waterfall_texture(ID3D11DeviceContext* context);
+    void render_segmented_lo_tuner(float box_h);
+    void apply_tuned_frequency_hz(double new_freq_hz);
+    void update_peak_hold(double center_hz, double rate_hz);
 
     SdrController& sdr_;
     DspPipeline& dsp_;
@@ -63,6 +66,7 @@ private:
     ID3D11ShaderResourceView* waterfall_srv_ = nullptr;
     int tex_width_ = 0;
     int tex_height_ = 0;
+    uint64_t wf_uploaded_rev_ = 0;
 
     // Hardware & Simulator entries
     std::vector<DeviceEntry> device_entries_;
@@ -70,6 +74,8 @@ private:
     std::vector<float> valid_gains_;
     std::string device_status_text_;
     bool device_status_ok_ = true;
+    std::vector<std::string> cached_blockers_;
+    std::chrono::steady_clock::time_point last_blocker_check_{};
 
     // Radio tuning & frontend parameters
     char tune_input_buf_[32] = "1420.500";
@@ -81,7 +87,7 @@ private:
     bool bias_tee_enabled_ = false;
     bool open_bias_modal_ = false;
 
-    // DSP & Display controls
+    // FFT & Display controls
     int selected_fft_size_idx_ = 1; // 4096
     float fft_max_db_ = SdrConstants::DEFAULT_FFT_MAX_DB;
     float fft_min_db_ = SdrConstants::DEFAULT_FFT_MIN_DB;
@@ -97,10 +103,26 @@ private:
     std::chrono::steady_clock::time_point last_stats_time_{};
     std::chrono::steady_clock::time_point last_wf_update_time_{};
 
-    // Cached spectrum trace & reusable plot vertex scratch buffer
+    // Cached spectrum trace, peak-hold envelope & preallocated scratch buffers
     std::vector<float> spectrum_data_;
     std::vector<ImVec2> trace_scratch_;
-    std::vector<uint32_t> colorbar_lut_scratch_;
+    std::vector<float> peak_hold_data_;
+    std::vector<ImVec2> peak_scratch_;
+    bool pending_wf_sample_ = false;
     float peak_freq_hz_ = 0.0f;
     float peak_dbfs_ = -110.0f;
+    bool show_peak_hold_ = false;
+    double peak_hold_freq_hz_ = 0.0;
+    double peak_hold_rate_hz_ = 0.0;
+    size_t peak_hold_bins_ = 0;
+    float peak_hold_max_db_ = -110.0f;
+
+    // Inline segmented LO edit & cross-plot cursor sync
+    bool editing_freq_inline_ = false;
+    bool focus_freq_inline_ = false;
+    bool hover_spec_active_ = false;
+    double hover_spec_freq_mhz_ = 0.0;
+    bool hover_wf_active_ = false;
+    double hover_wf_freq_mhz_ = 0.0;
+    float wf_row_dt_s_ = 0.033f;
 };

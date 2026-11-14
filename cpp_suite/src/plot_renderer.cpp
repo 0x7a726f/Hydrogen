@@ -9,6 +9,7 @@
 #include <sstream>
 #include <iostream>
 #include <filesystem>
+#include <mutex>
 
 namespace astro {
 
@@ -208,34 +209,35 @@ static const uint8_t FONT_8X12[95][12] = {
 
 PixelColor sample_colormap(ColormapType cmap, float t) {
     t = std::clamp(t, 0.0f, 1.0f);
-    if (cmap == ColormapType::Viridis) {
-        // Viridis approximation
-        float r = std::clamp(0.28f + 2.0f * (t - 0.4f) * (t - 0.4f), 0.0f, 1.0f);
-        if (t < 0.4f) r = 0.28f * (1.0f - t / 0.4f);
-        else r = std::min(1.0f, 0.95f * (t - 0.4f) / 0.6f + 0.1f);
-        float g = std::clamp(t < 0.5f ? (t / 0.5f * 0.7f) : (0.7f + (t - 0.5f) * 0.6f), 0.0f, 1.0f);
-        float b = std::clamp(t < 0.3f ? (0.3f + t / 0.3f * 0.4f) : (0.7f * (1.0f - (t - 0.3f) / 0.7f)), 0.0f, 1.0f);
-        return PixelColor(static_cast<uint8_t>(r * 255), static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255));
-    } else if (cmap == ColormapType::Turbo) {
-        // Turbo approximation
-        float r = std::clamp(std::sin(t * 3.14159f - 0.5f) * 0.5f + 0.5f, 0.0f, 1.0f);
-        if (t > 0.6f) r = std::clamp((t - 0.6f) / 0.35f, 0.0f, 1.0f);
-        float g = std::clamp(std::sin(t * 3.14159f) * 1.2f - 0.1f, 0.0f, 1.0f);
-        float b = std::clamp(std::cos(t * 1.57f) * 1.2f - 0.2f, 0.0f, 1.0f);
-        return PixelColor(static_cast<uint8_t>(r * 255), static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255));
-    } else if (cmap == ColormapType::Classic) {
-        // Jet / Classic
+
+    if (cmap == ColormapType::Classic) {
+        // Jet / Classic piecewise linear
         float r = std::clamp(1.5f - std::abs(4.0f * t - 3.0f), 0.0f, 1.0f);
         float g = std::clamp(1.5f - std::abs(4.0f * t - 2.0f), 0.0f, 1.0f);
         float b = std::clamp(1.5f - std::abs(4.0f * t - 1.0f), 0.0f, 1.0f);
         return PixelColor(static_cast<uint8_t>(r * 255), static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255));
-    } else {
-        // Magma
-        float r = std::clamp(t < 0.33f ? (t / 0.33f * 0.6f) : (0.6f + (t - 0.33f) / 0.67f * 0.4f), 0.0f, 1.0f);
-        float g = std::clamp(t < 0.5f ? 0.05f : ((t - 0.5f) / 0.5f * 0.95f), 0.0f, 1.0f);
-        float b = std::clamp(t < 0.25f ? (0.2f + t * 2.0f) : (0.7f * (1.0f - (t - 0.25f) / 0.75f)), 0.0f, 1.0f);
-        return PixelColor(static_cast<uint8_t>(r * 255), static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255));
     }
+
+    struct Stop { uint8_t r, g, b; };
+    static constexpr Stop viridis[5] = {{68, 1, 84}, {59, 82, 139}, {33, 145, 140}, {94, 201, 98}, {253, 231, 37}};
+    static constexpr Stop turbo[5]   = {{48, 18, 59}, {40, 188, 235}, {164, 252, 60}, {251, 126, 33}, {122, 4, 3}};
+    static constexpr Stop magma[5]   = {{0, 0, 4}, {81, 18, 124}, {183, 55, 121}, {252, 137, 97}, {252, 253, 191}};
+
+    const Stop* stops = magma;
+    if (cmap == ColormapType::Viridis) stops = viridis;
+    else if (cmap == ColormapType::Turbo) stops = turbo;
+
+    const float pos = t * 4.0f;
+    const int idx = std::clamp(static_cast<int>(pos), 0, 3);
+    const float frac = pos - static_cast<float>(idx);
+    auto lerp_u8 = [&](uint8_t a, uint8_t b) -> uint8_t {
+        return static_cast<uint8_t>(std::clamp(a + (b - a) * frac, 0.0f, 255.0f));
+    };
+    return PixelColor(
+        lerp_u8(stops[idx].r, stops[idx + 1].r),
+        lerp_u8(stops[idx].g, stops[idx + 1].g),
+        lerp_u8(stops[idx].b, stops[idx + 1].b)
+    );
 }
 
 SoftwareCanvas::SoftwareCanvas(int width, int height, PixelColor bg_color)
@@ -398,11 +400,16 @@ void SoftwareCanvas::fill_rect(int x, int y, int w, int h, PixelColor color) {
     int x_end = std::min(width_, x + w);
     int y_start = std::max(0, y);
     int y_end = std::min(height_, y + h);
+    if (x_start >= x_end || y_start >= y_end) return;
 
+    const size_t span = static_cast<size_t>(x_end - x_start);
+    const uint32_t packed = (static_cast<uint32_t>(color.a) << 24)
+                          | (static_cast<uint32_t>(color.b) << 16)
+                          | (static_cast<uint32_t>(color.g) << 8)
+                          | static_cast<uint32_t>(color.r);
+    uint32_t* px32 = reinterpret_cast<uint32_t*>(pixels_.data());
     for (int cy = y_start; cy < y_end; ++cy) {
-        for (int cx = x_start; cx < x_end; ++cx) {
-            set_pixel(cx, cy, color);
-        }
+        std::fill_n(&px32[static_cast<size_t>(cy) * width_ + x_start], span, packed);
     }
 }
 
@@ -411,10 +418,25 @@ void SoftwareCanvas::fill_rect_alpha(int x, int y, int w, int h, PixelColor colo
     int x_end = std::min(width_, x + w);
     int y_start = std::max(0, y);
     int y_end = std::min(height_, y + h);
+    if (x_start >= x_end || y_start >= y_end) return;
+    if (color.a == 255) {
+        fill_rect(x, y, w, h, color);
+        return;
+    }
+    if (color.a == 0) return;
+
+    const uint32_t a = color.a;
+    const uint32_t inv_a = 255u - a;
+    const uint32_t ra = static_cast<uint32_t>(color.r) * a + 127u;
+    const uint32_t ga = static_cast<uint32_t>(color.g) * a + 127u;
+    const uint32_t ba = static_cast<uint32_t>(color.b) * a + 127u;
 
     for (int cy = y_start; cy < y_end; ++cy) {
-        for (int cx = x_start; cx < x_end; ++cx) {
-            blend_pixel(cx, cy, color);
+        uint8_t* row = &pixels_[(static_cast<size_t>(cy) * width_ + x_start) * 4];
+        for (int cx = x_start; cx < x_end; ++cx, row += 4) {
+            row[0] = static_cast<uint8_t>((ra + row[0] * inv_a) / 255u);
+            row[1] = static_cast<uint8_t>((ga + row[1] * inv_a) / 255u);
+            row[2] = static_cast<uint8_t>((ba + row[2] * inv_a) / 255u);
         }
     }
 }
@@ -559,13 +581,68 @@ bool SoftwareCanvas::save_png(const std::string& filepath) const {
         std::error_code ec;
         std::filesystem::create_directories(p.parent_path(), ec);
     }
-    int res = stbi_write_png(filepath.c_str(), width_, height_, 4, pixels_.data(), width_ * 4);
+    const size_t n_px = static_cast<size_t>(width_) * static_cast<size_t>(height_);
+    std::vector<uint8_t> rgb(n_px * 3);
+    const uint8_t* src = pixels_.data();
+    uint8_t* dst = rgb.data();
+    for (size_t i = 0; i < n_px; ++i) {
+        dst[3 * i + 0] = src[4 * i + 0];
+        dst[3 * i + 1] = src[4 * i + 1];
+        dst[3 * i + 2] = src[4 * i + 2];
+    }
+    static std::once_flag s_stbi_init;
+    std::call_once(s_stbi_init, []() {
+        stbi_write_png_compression_level = 3;
+    });
+    int res = stbi_write_png(filepath.c_str(), width_, height_, 3, rgb.data(), width_ * 3);
     return (res != 0);
 }
 
 // ------------------------------------------------------------------------------------------------
 // PlotRenderer Publication Figures
 // ------------------------------------------------------------------------------------------------
+
+static void draw_clipped_line(
+    SoftwareCanvas& canvas,
+    int left,
+    int top,
+    int right,
+    int bottom,
+    int x0,
+    int y0,
+    int x1,
+    int y1,
+    PixelColor color,
+    int thickness
+) {
+    // Liang-Barsky parametric segment clipping against [left, right] x [top, bottom]
+    double t0 = 0.0;
+    double t1 = 1.0;
+    const double dx = static_cast<double>(x1 - x0);
+    const double dy = static_cast<double>(y1 - y0);
+    auto clip = [&](double p, double q) -> bool {
+        if (std::abs(p) < 1e-12) return q >= 0.0;
+        const double r = q / p;
+        if (p < 0.0) {
+            if (r > t1) return false;
+            if (r > t0) t0 = r;
+        } else {
+            if (r < t0) return false;
+            if (r < t1) t1 = r;
+        }
+        return true;
+    };
+    if (!clip(-dx, static_cast<double>(x0 - left))) return;
+    if (!clip(dx, static_cast<double>(right - x0))) return;
+    if (!clip(-dy, static_cast<double>(y0 - top))) return;
+    if (!clip(dy, static_cast<double>(bottom - y0))) return;
+
+    const int cx0 = static_cast<int>(std::lround(x0 + t0 * dx));
+    const int cy0 = static_cast<int>(std::lround(y0 + t0 * dy));
+    const int cx1 = static_cast<int>(std::lround(x0 + t1 * dx));
+    const int cy1 = static_cast<int>(std::lround(y0 + t1 * dy));
+    canvas.draw_line(cx0, cy0, cx1, cy1, color, thickness);
+}
 
 bool PlotRenderer::render_calibrated_spectrum(
     const std::vector<double>& freqs_mhz,
@@ -581,10 +658,10 @@ bool PlotRenderer::render_calibrated_spectrum(
     const int H = 640;
     SoftwareCanvas canvas(W, H, PixelColor(13, 17, 23)); // #0d1117
 
-    // Plot area margins
+    // Plot area margins (extra top headroom so frequency ticks and top label never collide)
     const int left = 90;
     const int right = W - 50;
-    const int top = 80;
+    const int top = 96;
     const int bottom = H - 70;
     const int plot_w = right - left;
     const int plot_h = bottom - top;
@@ -597,16 +674,19 @@ bool PlotRenderer::render_calibrated_spectrum(
     const double v_min = -200.0;
     const double v_max = 200.0;
 
+    const size_t n_pts = vel_kms.size();
+    const size_t edge_bins = static_cast<size_t>(
+        static_cast<double>(n_pts) * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
     double k_max = 0.5;
     double k_min = -0.5;
-    for (size_t i = 0; i < vel_kms.size(); ++i) {
+    for (size_t i = edge_bins; i + edge_bins < n_pts; ++i) {
         if (vel_kms[i] >= v_min && vel_kms[i] <= v_max) {
             k_max = std::max(k_max, calibrated_k[i]);
             k_min = std::min(k_min, calibrated_k[i]);
         }
     }
-    k_min = std::max(-1.0, k_min - 0.5);
-    k_max = k_max * 1.35 + 1.0;
+    k_min = std::min(-1.0, k_min * 1.15 - 0.5);
+    k_max = std::max(1.0, k_max * 1.32 + 1.0);
 
     auto map_x = [&](double v) {
         return left + static_cast<int>((v - v_min) / (v_max - v_min) * plot_w);
@@ -615,19 +695,32 @@ bool PlotRenderer::render_calibrated_spectrum(
         return bottom - static_cast<int>((k - k_min) / (k_max - k_min) * plot_h);
     };
 
-    // Grid lines
+    // Vertical Grid lines & Velocity/Frequency ticks
     for (double v = -180; v <= 180; v += 60) {
         int gx = map_x(v);
-        canvas.draw_line(gx, top, gx, bottom, PixelColor(48, 54, 61), 1);
+        canvas.draw_line(gx, top, gx, bottom, PixelColor(38, 46, 56), 1);
         std::stringstream ss;
-        ss << std::showpos << static_cast<int>(v);
+        if (std::abs(v) > 0.5) ss << std::showpos;
+        ss << static_cast<int>(v);
         canvas.draw_text(gx - 14, bottom + 12, ss.str(), PixelColor(139, 148, 158), 1);
 
         // Top axis sky frequency (MHz)
         double f_mhz = HYDROGEN_REST_FREQ_MHZ * (1.0 - v / SPEED_OF_LIGHT_KMS);
         std::stringstream ss_f;
         ss_f << std::fixed << std::setprecision(3) << f_mhz;
-        canvas.draw_text(gx - 20, top - 24, ss_f.str(), PixelColor(164, 176, 190), 1);
+        canvas.draw_text(gx - 24, top - 22, ss_f.str(), PixelColor(164, 176, 190), 1);
+    }
+
+    // Horizontal Y grid lines & Kelvin ticks
+    for (int t = 0; t < 5; ++t) {
+        double k_val = k_min + (k_max - k_min) * (static_cast<double>(t) / 4.0);
+        int gy = map_y(k_val);
+        if (gy >= top && gy <= bottom) {
+            canvas.draw_line(left, gy, right, gy, PixelColor(38, 46, 56), 1);
+            char kb[20];
+            std::snprintf(kb, sizeof(kb), "%.1f", k_val);
+            canvas.draw_text(std::max(8, left - 48), gy - 5, kb, PixelColor(139, 148, 158), 1);
+        }
     }
 
     // Zero Kelvin line
@@ -642,8 +735,9 @@ bool PlotRenderer::render_calibrated_spectrum(
         canvas.draw_line(x0, top, x0, bottom, PixelColor(116, 185, 255), 1);
     }
 
-    // Shaded fill under positive emission curve
-    for (size_t i = 1; i < vel_kms.size(); ++i) {
+    // Single-pass vertical gradient fill under positive emission curve (alpha 10 -> 58)
+    std::vector<int> col_min_y(static_cast<size_t>(plot_w + 1), bottom + 1);
+    for (size_t i = 1; i < n_pts; ++i) {
         double v_a = vel_kms[i - 1];
         double v_b = vel_kms[i];
         if (v_b < v_min || v_a > v_max) continue;
@@ -655,62 +749,87 @@ bool PlotRenderer::render_calibrated_spectrum(
         int x_step_start = std::max(left, std::min(xa, xb));
         int x_step_end = std::min(right, std::max(xa, xb));
         for (int sx = x_step_start; sx <= x_step_end; ++sx) {
-            float frac = (xa != xb) ? static_cast<float>(sx - xa) / (xb - xa) : 0.0f;
-            int cur_y = static_cast<int>(ya + frac * (yb - ya));
-            if (cur_y < y0) {
-                canvas.draw_line(sx, cur_y, sx, y0, PixelColor(0, 242, 254, 45), 1);
+            float frac = (xa != xb) ? static_cast<float>(sx - xa) / static_cast<float>(xb - xa) : 0.0f;
+            int cur_y = static_cast<int>(ya + frac * static_cast<float>(yb - ya));
+            int& slot = col_min_y[static_cast<size_t>(sx - left)];
+            slot = std::min(slot, cur_y);
+        }
+    }
+    const int y0_clamped = std::clamp(y0, top, bottom);
+    for (int dx = 0; dx <= plot_w; ++dx) {
+        int cur_y = std::max(top, col_min_y[static_cast<size_t>(dx)]);
+        if (cur_y < y0_clamped) {
+            const float span = static_cast<float>(std::max(1, y0_clamped - cur_y));
+            for (int sy = cur_y; sy < y0_clamped; ++sy) {
+                float grad = 1.0f - static_cast<float>(sy - cur_y) / span;
+                uint8_t a = static_cast<uint8_t>(10.0f + grad * 48.0f);
+                canvas.blend_pixel(left + dx, sy, PixelColor(0, 242, 254, a));
             }
         }
     }
 
-    // Calibrated spectrum line (Cyan #00f2fe)
-    for (size_t i = 1; i < vel_kms.size(); ++i) {
+    // Calibrated spectrum line (Cyan #00f2fe) - clipped to plot box
+    for (size_t i = 1; i < n_pts; ++i) {
         double v_a = vel_kms[i - 1];
         double v_b = vel_kms[i];
         if (v_b < v_min || v_a > v_max) continue;
-        int xa = map_x(v_a);
-        int xb = map_x(v_b);
-        int ya = map_y(calibrated_k[i - 1]);
-        int yb = map_y(calibrated_k[i]);
-        canvas.draw_line(xa, ya, xb, yb, PixelColor(0, 242, 254), 2);
+        draw_clipped_line(canvas, left, top, right, bottom,
+                          map_x(v_a), map_y(calibrated_k[i - 1]),
+                          map_x(v_b), map_y(calibrated_k[i]),
+                          PixelColor(0, 242, 254), 2);
     }
 
-    // Gaussian fit overlay (Salmon Pink #ff7675)
+    // Line profile fit overlay + secondary component curves (if DoubleGaussian)
     if (metrics.gauss_fit.success && !metrics.gauss_fit.fitted_curve.empty()) {
-        for (size_t i = 1; i < vel_kms.size(); ++i) {
+        if (metrics.gauss_fit.method == LineAnalysisMethod::DoubleGaussian && metrics.gauss_fit.has_secondary &&
+            metrics.gauss_fit.component1_curve.size() == n_pts && metrics.gauss_fit.component2_curve.size() == n_pts) {
+            for (size_t i = 1; i < n_pts; ++i) {
+                double v_a = vel_kms[i - 1], v_b = vel_kms[i];
+                if (v_b < v_min || v_a > v_max) continue;
+                draw_clipped_line(canvas, left, top, right, bottom,
+                                  map_x(v_a), map_y(metrics.gauss_fit.component1_curve[i - 1]),
+                                  map_x(v_b), map_y(metrics.gauss_fit.component1_curve[i]),
+                                  PixelColor(251, 146, 60), 1);
+                draw_clipped_line(canvas, left, top, right, bottom,
+                                  map_x(v_a), map_y(metrics.gauss_fit.component2_curve[i - 1]),
+                                  map_x(v_b), map_y(metrics.gauss_fit.component2_curve[i]),
+                                  PixelColor(167, 139, 250), 1);
+            }
+        }
+        for (size_t i = 1; i < n_pts; ++i) {
             double v_a = vel_kms[i - 1];
             double v_b = vel_kms[i];
             if (v_b < v_min || v_a > v_max) continue;
-            int xa = map_x(v_a);
-            int xb = map_x(v_b);
-            int ya = map_y(metrics.gauss_fit.fitted_curve[i - 1]);
-            int yb = map_y(metrics.gauss_fit.fitted_curve[i]);
-            canvas.draw_line(xa, ya, xb, yb, PixelColor(255, 118, 117), 2);
+            draw_clipped_line(canvas, left, top, right, bottom,
+                              map_x(v_a), map_y(metrics.gauss_fit.fitted_curve[i - 1]),
+                              map_x(v_b), map_y(metrics.gauss_fit.fitted_curve[i]),
+                              PixelColor(255, 118, 117), 2);
         }
     }
 
-    // Peak marker circle
-    int px = map_x(metrics.peak_vel_kms);
-    int py = map_y(metrics.peak_temp_k);
+    // Peak marker circle (clamped inside plot box)
+    int px = std::clamp(map_x(metrics.peak_vel_kms), left, right);
+    int py = std::clamp(map_y(metrics.peak_temp_k), top, bottom);
     canvas.draw_circle(px, py, 6, PixelColor(255, 71, 87), true);
     canvas.draw_circle(px, py, 7, PixelColor(255, 255, 255), false);
 
-    // Title & Axis Labels
-    canvas.draw_text(left, 25, "Calibrated Hydrogen Line (HI) Spectrum - Galactic 21cm Analysis", PixelColor(255, 255, 255), 2);
+    // Title & Axis Labels (clean vertical separation from top frequency ticks)
+    canvas.draw_text(left, 18, "Calibrated Hydrogen Line (HI) Spectrum - Galactic 21cm Analysis", PixelColor(255, 255, 255), 2);
     canvas.draw_text(left + plot_w / 2 - 140, bottom + 42, "Doppler Radial Velocity [Radio Def] (km/s)", PixelColor(201, 209, 217), 1);
-    canvas.draw_text(left + plot_w / 2 - 100, 52, "Topocentric Sky Frequency (MHz)", PixelColor(164, 176, 190), 1);
-    canvas.draw_text(15, top + plot_h / 2, "TA (K)", PixelColor(0, 242, 254), 1);
+    canvas.draw_text(left + plot_w / 2 - 108, 46, "Topocentric Sky Frequency (MHz)", PixelColor(164, 176, 190), 1);
+    canvas.draw_text(14, top - 22, "TA (K)", PixelColor(0, 242, 254), 1);
 
     // HUD Metrics Card Box
     int hud_x = left + 18;
     int hud_y = top + 18;
-    int hud_w = 340;
-    int hud_h = 160;
+    int hud_w = 360;
+    int hud_h = 174;
     canvas.fill_rect_alpha(hud_x, hud_y, hud_w, hud_h, PixelColor(30, 39, 46, 230));
     canvas.draw_rect(hud_x, hud_y, hud_w, hud_h, PixelColor(0, 210, 211), 1);
 
     std::stringstream hud;
     hud << "Target Line: Neutral Hydrogen (HI 21cm)\n"
+        << "Line Model:  " << line_analysis_method_display_name(config.line_method) << "\n"
         << "Rest Freq:   " << std::fixed << std::setprecision(4) << HYDROGEN_REST_FREQ_MHZ << " MHz\n"
         << "Obs Peak:    " << std::fixed << std::setprecision(4) << metrics.peak_freq_mhz << " MHz\n"
         << "Recession:   " << std::showpos << std::fixed << std::setprecision(2) << metrics.peak_vel_kms << " km/s\n"
@@ -759,12 +878,18 @@ bool PlotRenderer::render_raw_and_baseline(
 
     std::vector<double> raw_db(n), base_db(n), flat_db(n);
     double y1_min = 1e9, y1_max = -1e9;
+    const size_t skirt_edge = static_cast<size_t>(n * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
+    double y2_pb_min = -0.35, y2_pb_max = 0.45;
     for (size_t i = 0; i < n; ++i) {
         raw_db[i] = 10.0 * std::log10(std::max(raw_power[i], 1e-12));
         base_db[i] = 10.0 * std::log10(std::max(baseline_power[i], 1e-12));
         flat_db[i] = raw_db[i] - base_db[i];
         y1_min = std::min(y1_min, raw_db[i]);
         y1_max = std::max(y1_max, raw_db[i]);
+        if (i >= skirt_edge && i + skirt_edge < n) {
+            y2_pb_min = std::min(y2_pb_min, flat_db[i]);
+            y2_pb_max = std::max(y2_pb_max, flat_db[i]);
+        }
     }
     y1_min -= 1.0;
     y1_max += 1.0;
@@ -776,7 +901,9 @@ bool PlotRenderer::render_raw_and_baseline(
         return bottom1 - static_cast<int>((p - y1_min) / (y1_max - y1_min) * (bottom1 - top1));
     };
 
-    double y2_min = -0.4, y2_max = 0.6;
+    const double y2_pad = std::max(0.1, (y2_pb_max - y2_pb_min) * 0.15);
+    const double y2_min = std::max(-3.0, y2_pb_min - y2_pad);
+    const double y2_max = std::min(4.0, y2_pb_max + y2_pad);
     auto map_y2 = [&](double r) {
         return bottom2 - static_cast<int>((r - y2_min) / (y2_max - y2_min) * (bottom2 - top2));
     };
@@ -794,41 +921,50 @@ bool PlotRenderer::render_raw_and_baseline(
 
     // Protected HI window shaded
     double hi_half_mhz = config.hi_protection_half_width_khz / 1e3;
-    int x_hi_l = map_x(HYDROGEN_REST_FREQ_MHZ - hi_half_mhz);
-    int x_hi_r = map_x(HYDROGEN_REST_FREQ_MHZ + hi_half_mhz);
-    canvas.fill_rect_alpha(x_hi_l, top1, x_hi_r - x_hi_l, bottom1 - top1, PixelColor(16, 172, 132, 45));
-    canvas.fill_rect_alpha(x_hi_l, top2, x_hi_r - x_hi_l, bottom2 - top2, PixelColor(16, 172, 132, 45));
+    int x_hi_l = std::clamp(map_x(HYDROGEN_REST_FREQ_MHZ - hi_half_mhz), left, right);
+    int x_hi_r = std::clamp(map_x(HYDROGEN_REST_FREQ_MHZ + hi_half_mhz), left, right);
+    if (x_hi_r > x_hi_l) {
+        canvas.fill_rect_alpha(x_hi_l, top1, x_hi_r - x_hi_l, bottom1 - top1, PixelColor(16, 172, 132, 45));
+        canvas.fill_rect_alpha(x_hi_l, top2, x_hi_r - x_hi_l, bottom2 - top2, PixelColor(16, 172, 132, 45));
+    }
 
     // DC notch vertical line (LO tuned center frequency)
     double fc_mhz = config.center_freq_hz / 1e6;
     int x_dc = map_x(fc_mhz);
-    canvas.draw_line(x_dc, top1, x_dc, bottom1, PixelColor(255, 71, 87), 2);
-    canvas.draw_line(x_dc, top2, x_dc, bottom2, PixelColor(255, 71, 87), 1);
+    if (x_dc >= left && x_dc <= right) {
+        canvas.draw_line(x_dc, top1, x_dc, bottom1, PixelColor(255, 71, 87), 2);
+        canvas.draw_line(x_dc, top2, x_dc, bottom2, PixelColor(255, 71, 87), 1);
+    }
 
     // HI line vertical marker
     int x_hi = map_x(HYDROGEN_REST_FREQ_MHZ);
-    canvas.draw_line(x_hi, top1, x_hi, bottom1, PixelColor(0, 210, 211), 1);
-    canvas.draw_line(x_hi, top2, x_hi, bottom2, PixelColor(0, 210, 211), 1);
+    if (x_hi >= left && x_hi <= right) {
+        canvas.draw_line(x_hi, top1, x_hi, bottom1, PixelColor(0, 210, 211), 1);
+        canvas.draw_line(x_hi, top2, x_hi, bottom2, PixelColor(0, 210, 211), 1);
+    }
 
-    // Top panel: Raw Spectrum (Sky blue) & Baseline Model (Orange)
+    // Top panel: Raw Spectrum (Sky blue) & Baseline Model (Orange) - clipped to plot box
     for (size_t i = 1; i < n; ++i) {
         int xa = map_x(freqs_mhz[i - 1]);
         int xb = map_x(freqs_mhz[i]);
-        canvas.draw_line(xa, map_y1(raw_db[i - 1]), xb, map_y1(raw_db[i]), PixelColor(84, 160, 255), 1);
+        draw_clipped_line(canvas, left, top1, right, bottom1,
+                          xa, map_y1(raw_db[i - 1]), xb, map_y1(raw_db[i]), PixelColor(84, 160, 255), 1);
     }
     for (size_t i = 1; i < n; ++i) {
         int xa = map_x(freqs_mhz[i - 1]);
         int xb = map_x(freqs_mhz[i]);
-        canvas.draw_line(xa, map_y1(base_db[i - 1]), xb, map_y1(base_db[i]), PixelColor(255, 159, 67), 2);
+        draw_clipped_line(canvas, left, top1, right, bottom1,
+                          xa, map_y1(base_db[i - 1]), xb, map_y1(base_db[i]), PixelColor(255, 159, 67), 2);
     }
 
-    // Bottom panel: Flattened Residuals (Emerald green)
-    int y2_zero = map_y2(0.0);
+    // Bottom panel: Flattened Residuals (Emerald green) - clipped to plot box
+    int y2_zero = std::clamp(map_y2(0.0), top2, bottom2);
     canvas.draw_line(left, y2_zero, right, y2_zero, PixelColor(139, 148, 158), 1);
     for (size_t i = 1; i < n; ++i) {
         int xa = map_x(freqs_mhz[i - 1]);
         int xb = map_x(freqs_mhz[i]);
-        canvas.draw_line(xa, map_y2(flat_db[i - 1]), xb, map_y2(flat_db[i]), PixelColor(29, 209, 161), 1);
+        draw_clipped_line(canvas, left, top2, right, bottom2,
+                          xa, map_y2(flat_db[i - 1]), xb, map_y2(flat_db[i]), PixelColor(29, 209, 161), 1);
     }
 
     // Titles & Text
@@ -862,15 +998,18 @@ bool PlotRenderer::render_doppler_profile(
 
     const double v_min = -250.0;
     const double v_max = 250.0;
+    const size_t n_pts = vel_kms.size();
+    const size_t edge_bins = static_cast<size_t>(
+        static_cast<double>(n_pts) * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
     double k_max = 0.5, k_min = -0.5;
-    for (size_t i = 0; i < vel_kms.size(); ++i) {
+    for (size_t i = edge_bins; i + edge_bins < n_pts; ++i) {
         if (vel_kms[i] >= v_min && vel_kms[i] <= v_max) {
             k_max = std::max(k_max, calibrated_k[i]);
             k_min = std::min(k_min, calibrated_k[i]);
         }
     }
-    k_min = std::max(-1.0, k_min - 0.5);
-    k_max = k_max * 1.35 + 1.0;
+    k_min = std::min(-1.0, k_min * 1.15 - 0.5);
+    k_max = std::max(1.0, k_max * 1.32 + 1.0);
 
     auto map_x = [&](double v) {
         return left + static_cast<int>((v - v_min) / (v_max - v_min) * plot_w);
@@ -879,41 +1018,94 @@ bool PlotRenderer::render_doppler_profile(
         return bottom - static_cast<int>((k - k_min) / (k_max - k_min) * plot_h);
     };
 
+    // Grid lines (X velocity & Y Kelvin ticks)
+    for (double v = -200; v <= 200; v += 100) {
+        int gx = map_x(v);
+        if (gx >= left && gx <= right) {
+            canvas.draw_line(gx, top, gx, bottom, PixelColor(38, 46, 56), 1);
+            char vb[16];
+            std::snprintf(vb, sizeof(vb), "%+.0f", v);
+            canvas.draw_text(gx - 12, bottom + 10, vb, PixelColor(139, 148, 158), 1);
+        }
+    }
+    for (int t = 0; t < 5; ++t) {
+        double k_val = k_min + (k_max - k_min) * (static_cast<double>(t) / 4.0);
+        int gy = map_y(k_val);
+        if (gy >= top && gy <= bottom) {
+            canvas.draw_line(left, gy, right, gy, PixelColor(38, 46, 56), 1);
+            char kb[20];
+            std::snprintf(kb, sizeof(kb), "%.1f", k_val);
+            canvas.draw_text(std::max(8, left - 48), gy - 5, kb, PixelColor(139, 148, 158), 1);
+        }
+    }
+
     // Zero velocity & rest frame
-    int x0 = map_x(0.0);
+    int x0 = std::clamp(map_x(0.0), left, right);
     canvas.draw_line(x0, top, x0, bottom, PixelColor(254, 202, 87), 1);
     int y0 = map_y(0.0);
-    canvas.draw_line(left, y0, right, y0, PixelColor(139, 148, 158), 1);
+    if (y0 >= top && y0 <= bottom) {
+        canvas.draw_line(left, y0, right, y0, PixelColor(139, 148, 158), 1);
+    }
 
-    // Spectrum curve (Electric blue #48dbfb)
-    for (size_t i = 1; i < vel_kms.size(); ++i) {
+    // Single-pass vertical gradient fill above 0 K
+    std::vector<int> col_min_y(static_cast<size_t>(plot_w + 1), bottom + 1);
+    for (size_t i = 1; i < n_pts; ++i) {
         double v_a = vel_kms[i - 1], v_b = vel_kms[i];
         if (v_b < v_min || v_a > v_max) continue;
         int xa = map_x(v_a), xb = map_x(v_b);
         int ya = map_y(calibrated_k[i - 1]), yb = map_y(calibrated_k[i]);
-        canvas.draw_line(xa, ya, xb, yb, PixelColor(72, 219, 251), 2);
+        int xs = std::max(left, std::min(xa, xb));
+        int xe = std::min(right, std::max(xa, xb));
+        for (int sx = xs; sx <= xe; ++sx) {
+            float frac = (xa != xb) ? static_cast<float>(sx - xa) / static_cast<float>(xb - xa) : 0.0f;
+            int cy = static_cast<int>(ya + frac * static_cast<float>(yb - ya));
+            int& slot = col_min_y[static_cast<size_t>(sx - left)];
+            slot = std::min(slot, cy);
+        }
     }
-
-    // Gaussian fit
-    if (metrics.gauss_fit.success && !metrics.gauss_fit.fitted_curve.empty()) {
-        for (size_t i = 1; i < vel_kms.size(); ++i) {
-            double v_a = vel_kms[i - 1], v_b = vel_kms[i];
-            if (v_b < v_min || v_a > v_max) continue;
-            int xa = map_x(v_a), xb = map_x(v_b);
-            int ya = map_y(metrics.gauss_fit.fitted_curve[i - 1]);
-            int yb = map_y(metrics.gauss_fit.fitted_curve[i]);
-            canvas.draw_line(xa, ya, xb, yb, PixelColor(255, 107, 107), 2);
+    const int y0_clamped = std::clamp(y0, top, bottom);
+    for (int dx = 0; dx <= plot_w; ++dx) {
+        int cy = std::max(top, col_min_y[static_cast<size_t>(dx)]);
+        if (cy < y0_clamped) {
+            const float span = static_cast<float>(std::max(1, y0_clamped - cy));
+            for (int sy = cy; sy < y0_clamped; ++sy) {
+                float grad = 1.0f - static_cast<float>(sy - cy) / span;
+                uint8_t a = static_cast<uint8_t>(10.0f + grad * 48.0f);
+                canvas.blend_pixel(left + dx, sy, PixelColor(72, 219, 251, a));
+            }
         }
     }
 
-    // Peak marker
-    int px = map_x(metrics.peak_vel_kms);
-    int py = map_y(metrics.peak_temp_k);
+    // Spectrum curve (Electric blue #48dbfb) - clipped to plot box
+    for (size_t i = 1; i < n_pts; ++i) {
+        double v_a = vel_kms[i - 1], v_b = vel_kms[i];
+        if (v_b < v_min || v_a > v_max) continue;
+        draw_clipped_line(canvas, left, top, right, bottom,
+                          map_x(v_a), map_y(calibrated_k[i - 1]),
+                          map_x(v_b), map_y(calibrated_k[i]),
+                          PixelColor(72, 219, 251), 2);
+    }
+
+    // Gaussian fit - clipped to plot box
+    if (metrics.gauss_fit.success && !metrics.gauss_fit.fitted_curve.empty()) {
+        for (size_t i = 1; i < n_pts; ++i) {
+            double v_a = vel_kms[i - 1], v_b = vel_kms[i];
+            if (v_b < v_min || v_a > v_max) continue;
+            draw_clipped_line(canvas, left, top, right, bottom,
+                              map_x(v_a), map_y(metrics.gauss_fit.fitted_curve[i - 1]),
+                              map_x(v_b), map_y(metrics.gauss_fit.fitted_curve[i]),
+                              PixelColor(255, 107, 107), 2);
+        }
+    }
+
+    // Peak marker (clamped inside plot box)
+    int px = std::clamp(map_x(metrics.peak_vel_kms), left, right);
+    int py = std::clamp(map_y(metrics.peak_temp_k), top, bottom);
     canvas.draw_circle(px, py, 6, PixelColor(255, 71, 87), true);
 
-    canvas.draw_text(left, 25, "Galactic Neutral Hydrogen Radial Velocity Profile", PixelColor(255, 255, 255), 2);
+    canvas.draw_text(left, 22, "Galactic Neutral Hydrogen Radial Velocity Profile", PixelColor(255, 255, 255), 2);
     canvas.draw_text(left + plot_w / 2 - 120, bottom + 35, "Topocentric Radial Velocity v_LSR (km/s)", PixelColor(201, 209, 217), 1);
-    canvas.draw_text(15, top + plot_h / 2, "TA (K)", PixelColor(72, 219, 251), 1);
+    canvas.draw_text(14, top - 24, "TA (K)", PixelColor(72, 219, 251), 1);
 
     return canvas.save_png(output_path);
 }
@@ -1029,18 +1221,18 @@ bool PlotRenderer::render_master_dashboard(
     const int H = 1000;
     SoftwareCanvas canvas(W, H, PixelColor(13, 17, 23));
 
-    // Header banner
+    // Header banner (title scale=2, subtitle scale=1 to prevent horizontal overflow)
     std::filesystem::path fp(filepath);
     double dur_s = waterfall_times.empty() ? 0.0 : waterfall_times.back();
-    std::stringstream header;
-    header << "RADIOTELESCOPE HYDROGEN LINE ANALYSIS DASHBOARD\n"
-           << "File: " << fp.filename().string() << "  |  Duration: " << std::fixed << std::setprecision(1) << dur_s
-           << "s (" << std::fixed << std::setprecision(2) << dur_s / 60.0 << " min)  |  LO: "
-           << std::fixed << std::setprecision(4) << config.center_freq_hz / 1e6 << " MHz  |  Rate: "
-           << std::fixed << std::setprecision(2) << config.sample_rate_hz / 1e6 << " MSPS  |  SNR: "
-           << std::fixed << std::setprecision(1) << metrics.snr << " sigma";
+    std::stringstream subtitle;
+    subtitle << "File: " << fp.filename().string() << "  |  Duration: " << std::fixed << std::setprecision(1) << dur_s
+             << "s (" << std::fixed << std::setprecision(2) << dur_s / 60.0 << " min)  |  LO: "
+             << std::fixed << std::setprecision(4) << config.center_freq_hz / 1e6 << " MHz  |  Rate: "
+             << std::fixed << std::setprecision(2) << config.sample_rate_hz / 1e6 << " MSPS  |  SNR: "
+             << std::fixed << std::setprecision(1) << metrics.snr << " sigma";
 
-    canvas.draw_text(60, 25, header.str(), PixelColor(255, 255, 255), 2);
+    canvas.draw_text(50, 18, "RADIOTELESCOPE HYDROGEN LINE ANALYSIS DASHBOARD", PixelColor(255, 255, 255), 2);
+    canvas.draw_text(50, 50, subtitle.str(), PixelColor(164, 176, 190), 1);
 
     // 4 Quadrants:
     // Q1 (top-left): (A) Full Bandpass & Baseline Model
@@ -1083,42 +1275,87 @@ bool PlotRenderer::render_master_dashboard(
         p_min -= 1.0; p_max += 1.0;
 
         auto q1_mx = [&](double f) { return q1_x + 60 + static_cast<int>((f - f_min) / (f_max - f_min) * (pane_w - 80)); };
-        auto q1_my = [&](double p) { return q1_y + pane_h - 40 - static_cast<int>((p - p_min) / (p_max - p_min) * (pane_h - 80)); };
+        auto q1_my = [&](double p) {
+            return q1_y + pane_h - 40 - static_cast<int>((p - p_min) / (p_max - p_min) * (pane_h - 80));
+        };
 
+        const int q1_l = q1_x + 60, q1_r = q1_x + pane_w - 20;
+        const int q1_t = q1_y + 38, q1_b = q1_y + pane_h - 20;
         for (size_t i = 1; i < n; ++i) {
-            canvas.draw_line(q1_mx(freqs_mhz[i - 1]), q1_my(r_db[i - 1]), q1_mx(freqs_mhz[i]), q1_my(r_db[i]), PixelColor(84, 160, 255), 1);
-            canvas.draw_line(q1_mx(freqs_mhz[i - 1]), q1_my(b_db[i - 1]), q1_mx(freqs_mhz[i]), q1_my(b_db[i]), PixelColor(255, 159, 67), 2);
+            draw_clipped_line(canvas, q1_l, q1_t, q1_r, q1_b,
+                              q1_mx(freqs_mhz[i - 1]), q1_my(r_db[i - 1]),
+                              q1_mx(freqs_mhz[i]), q1_my(r_db[i]), PixelColor(84, 160, 255), 1);
+            draw_clipped_line(canvas, q1_l, q1_t, q1_r, q1_b,
+                              q1_mx(freqs_mhz[i - 1]), q1_my(b_db[i - 1]),
+                              q1_mx(freqs_mhz[i]), q1_my(b_db[i]), PixelColor(255, 159, 67), 2);
         }
     }
 
-    // Render Q2: Calibrated dB around HI
+    // Render Q2: Calibrated dB around HI (auto-scaled Y bounds)
     double f_hi_min = HYDROGEN_REST_FREQ_MHZ - 0.6;
     double f_hi_max = HYDROGEN_REST_FREQ_MHZ + 0.6;
+    double q2_min = 1e9, q2_max = -1e9;
+    for (size_t i = 0; i < n; ++i) {
+        if (freqs_mhz[i] >= f_hi_min && freqs_mhz[i] <= f_hi_max) {
+            q2_min = std::min(q2_min, calibrated_db[i]);
+            q2_max = std::max(q2_max, calibrated_db[i]);
+        }
+    }
+    if (q2_min >= q2_max) { q2_min = -0.2; q2_max = 0.8; }
+    else {
+        double q2_pad = std::max(0.08, (q2_max - q2_min) * 0.14);
+        q2_min = std::min(q2_min - q2_pad, -0.08);
+        q2_max = std::max(q2_max + q2_pad,  0.20);
+    }
     auto q2_mx = [&](double f) { return q2_x + 60 + static_cast<int>((f - f_hi_min) / (f_hi_max - f_hi_min) * (pane_w - 80)); };
-    auto q2_my = [&](double db) { return q2_y + pane_h - 40 - static_cast<int>((db - (-0.2)) / (0.8 - (-0.2)) * (pane_h - 80)); };
+    auto q2_my = [&](double db) {
+        return q2_y + pane_h - 40 - static_cast<int>((db - q2_min) / (q2_max - q2_min) * (pane_h - 80));
+    };
 
-    int q2_y0 = q2_my(0.0);
-    canvas.draw_line(q2_x + 60, q2_y0, q2_x + pane_w - 20, q2_y0, PixelColor(139, 148, 158), 1);
+    const int q2_l = q2_x + 60, q2_r = q2_x + pane_w - 20;
+    const int q2_t = q2_y + 38, q2_b = q2_y + pane_h - 20;
+    int q2_y0 = std::clamp(q2_my(0.0), q2_t, q2_b);
+    canvas.draw_line(q2_l, q2_y0, q2_r, q2_y0, PixelColor(139, 148, 158), 1);
     for (size_t i = 1; i < n; ++i) {
         if (freqs_mhz[i] < f_hi_min || freqs_mhz[i - 1] > f_hi_max) continue;
-        canvas.draw_line(q2_mx(freqs_mhz[i - 1]), q2_my(calibrated_db[i - 1]), q2_mx(freqs_mhz[i]), q2_my(calibrated_db[i]), PixelColor(29, 209, 161), 1);
+        draw_clipped_line(canvas, q2_l, q2_t, q2_r, q2_b,
+                          q2_mx(freqs_mhz[i - 1]), q2_my(calibrated_db[i - 1]),
+                          q2_mx(freqs_mhz[i]), q2_my(calibrated_db[i]), PixelColor(29, 209, 161), 1);
     }
 
     // Render Q3: Doppler Velocity Profile with Gaussian Fit
     double v_min = -180.0, v_max = 180.0;
+    const size_t q3_edge = static_cast<size_t>(
+        static_cast<double>(vel_kms.size()) * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
+    double q3_kmin = -0.5, q3_kmax = std::max(1.0, metrics.peak_temp_k * 1.35 + 0.5);
+    for (size_t i = q3_edge; i + q3_edge < vel_kms.size(); ++i) {
+        if (vel_kms[i] >= v_min && vel_kms[i] <= v_max) {
+            q3_kmin = std::min(q3_kmin, calibrated_k[i]);
+            q3_kmax = std::max(q3_kmax, calibrated_k[i] * 1.25 + 0.5);
+        }
+    }
+    q3_kmin = std::min(-0.5, q3_kmin * 1.15 - 0.5);
     auto q3_mx = [&](double v) { return q3_x + 60 + static_cast<int>((v - v_min) / (v_max - v_min) * (pane_w - 80)); };
-    auto q3_my = [&](double k) { return q3_y + pane_h - 40 - static_cast<int>((k - (-0.5)) / (metrics.peak_temp_k * 1.5 + 1.0 - (-0.5)) * (pane_h - 80)); };
+    auto q3_my = [&](double k) {
+        return q3_y + pane_h - 40 - static_cast<int>((k - q3_kmin) / (q3_kmax - q3_kmin) * (pane_h - 80));
+    };
 
-    int q3_y0 = q3_my(0.0);
-    canvas.draw_line(q3_x + 60, q3_y0, q3_x + pane_w - 20, q3_y0, PixelColor(139, 148, 158), 1);
+    const int q3_l = q3_x + 60, q3_r = q3_x + pane_w - 20;
+    const int q3_t = q3_y + 38, q3_b = q3_y + pane_h - 20;
+    int q3_y0 = std::clamp(q3_my(0.0), q3_t, q3_b);
+    canvas.draw_line(q3_l, q3_y0, q3_r, q3_y0, PixelColor(139, 148, 158), 1);
     for (size_t i = 1; i < vel_kms.size(); ++i) {
         if (vel_kms[i] < v_min || vel_kms[i - 1] > v_max) continue;
-        canvas.draw_line(q3_mx(vel_kms[i - 1]), q3_my(calibrated_k[i - 1]), q3_mx(vel_kms[i]), q3_my(calibrated_k[i]), PixelColor(0, 242, 254), 2);
+        draw_clipped_line(canvas, q3_l, q3_t, q3_r, q3_b,
+                          q3_mx(vel_kms[i - 1]), q3_my(calibrated_k[i - 1]),
+                          q3_mx(vel_kms[i]), q3_my(calibrated_k[i]), PixelColor(0, 242, 254), 2);
     }
     if (metrics.gauss_fit.success && !metrics.gauss_fit.fitted_curve.empty()) {
         for (size_t i = 1; i < vel_kms.size(); ++i) {
             if (vel_kms[i] < v_min || vel_kms[i - 1] > v_max) continue;
-            canvas.draw_line(q3_mx(vel_kms[i - 1]), q3_my(metrics.gauss_fit.fitted_curve[i - 1]), q3_mx(vel_kms[i]), q3_my(metrics.gauss_fit.fitted_curve[i]), PixelColor(255, 118, 117), 1);
+            draw_clipped_line(canvas, q3_l, q3_t, q3_r, q3_b,
+                              q3_mx(vel_kms[i - 1]), q3_my(metrics.gauss_fit.fitted_curve[i - 1]),
+                              q3_mx(vel_kms[i]), q3_my(metrics.gauss_fit.fitted_curve[i]), PixelColor(255, 118, 117), 1);
         }
     }
 

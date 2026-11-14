@@ -6,6 +6,7 @@
 #endif
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <d3d11.h>
 #include <tchar.h>
 #include <algorithm>
@@ -16,6 +17,42 @@
 
 #include "app_gui.h"
 #include "constants.h"
+#include "ui_observatory.h"
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+
+namespace {
+void apply_win32_dark_chrome(HWND hwnd) {
+    if (!hwnd) return;
+    const BOOL dark_mode = TRUE;
+    if (FAILED(DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_mode, sizeof(dark_mode)))) {
+        constexpr DWORD kDwmwaDarkModeLegacy19 = 19;
+        DwmSetWindowAttribute(hwnd, kDwmwaDarkModeLegacy19, &dark_mode, sizeof(dark_mode));
+    }
+    const DWORD corner_pref = 2; // DWMWCP_ROUND on Windows 11
+    const COLORREF caption  = RGB(15, 20, 27);   // #0F141B HeaderBg
+    const COLORREF border   = RGB(35, 45, 59);   // Subtle Slate border
+    const COLORREF text_col = RGB(230, 237, 243);
+    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner_pref, sizeof(corner_pref));
+    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
+    DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
+    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &text_col, sizeof(text_col));
+}
+} // namespace
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -102,7 +139,9 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         case WM_DPICHANGED: {
             if (ImGui::GetCurrentContext() != nullptr) {
-                ImGui::GetStyle().FontScaleDpi = static_cast<float>(LOWORD(wParam)) / 96.0f;
+                const float new_dpi = static_cast<float>(LOWORD(wParam)) / 96.0f;
+                ImGui::GetStyle().FontScaleDpi = new_dpi;
+                ui_obs::apply_observatory_slate_style(new_dpi);
             }
             RECT* const suggested = reinterpret_cast<RECT*>(lParam);
             if (suggested) {
@@ -128,8 +167,9 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplWin32_EnableDpiAwareness();
 
+    HBRUSH bg_brush = CreateSolidBrush(RGB(13, 17, 23)); // #0D1117 prevents white flash on startup/resize
     WNDCLASSEXW wc = {
-        sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, nullptr, nullptr, nullptr, nullptr,
+        sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, nullptr, nullptr, bg_brush, nullptr,
         L"ObservatorySuiteClass", nullptr
     };
     RegisterClassExW(&wc);
@@ -152,10 +192,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         L"Observatory Suite - 21cm Hydrogen Line SDR & Analysis",
         WS_OVERLAPPEDWINDOW, win_x, win_y, win_w, win_h, nullptr, nullptr, wc.hInstance, nullptr
     );
+    apply_win32_dark_chrome(hwnd);
 
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
+        DestroyWindow(hwnd);
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        if (bg_brush) DeleteObject(bg_brush);
         return 1;
     }
 
@@ -178,6 +221,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     gui.init_d3d_resources(g_pd3dDevice);
 
     bool done = false;
+    bool occluded = false;
     while (!done) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
@@ -187,6 +231,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 done = true;
         }
         if (done) break;
+
+        if (IsIconic(hwnd)) {
+            Sleep(50);
+            continue;
+        }
+        if (occluded) {
+            HRESULT hr_test = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
+            if (hr_test == DXGI_STATUS_OCCLUDED) {
+                Sleep(50);
+                continue;
+            }
+            occluded = false;
+        }
 
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0) {
             CleanupRenderTarget();
@@ -216,7 +273,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        g_pSwapChain->Present(1, 0);
+        HRESULT hr_pres = g_pSwapChain->Present(1, 0);
+        if (hr_pres == DXGI_STATUS_OCCLUDED) {
+            occluded = true;
+        }
     }
 
     gui.release_d3d_resources();
@@ -228,6 +288,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     CleanupDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    if (bg_brush) DeleteObject(bg_brush);
 
     return 0;
 }

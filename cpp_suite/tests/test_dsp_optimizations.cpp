@@ -12,6 +12,7 @@
 #include "constants.h"
 #include "cs16_writer.h"
 #include "dc_excision.h"
+#include "dsp_pipeline.h"
 #include "kiss_fft.h"
 #include "lockfree_ringbuffer.h"
 #include "rfi_filter.h"
@@ -199,6 +200,21 @@ static void test_scientific_pipeline_solvers() {
               << " K, v_center=" << fit_u8.v_center_kms
               << " km/s, fwhm=" << fit_u8.fwhm_kms << " km/s\n";
     TEST_ASSERT(std::abs(fit_u8.amplitude_k - 15.0) < 2.0, "Recovered HI brightness temp within 2 K of 15 K");
+
+    // Multi-method line profile analysis verification (DoubleGaussian, VoigtProfile, GaussHermite, SpectralMoments)
+    for (auto lm : {astro::LineAnalysisMethod::GaussianLS,
+                    astro::LineAnalysisMethod::DoubleGaussian,
+                    astro::LineAnalysisMethod::VoigtProfile,
+                    astro::LineAnalysisMethod::GaussHermite,
+                    astro::LineAnalysisMethod::SpectralMoments}) {
+        auto mfit = astro::Astrophysics::fit_line_profile(vel, cal_k, win_u8, lm);
+        TEST_ASSERT(mfit.success && mfit.fitted_curve.size() == static_cast<size_t>(n),
+                    "Multi-method fit_line_profile succeeded and populated full curve");
+        TEST_ASSERT(std::abs(mfit.v_center_kms - 6.0) < 2.5,
+                    "Multi-method fit_line_profile recovered H I velocity centroid within 2.5 km/s");
+        TEST_ASSERT(mfit.fwhm_kms > 5.0 && mfit.fwhm_kms < 22.0,
+                    "Multi-method fit_line_profile recovered physically valid FWHM");
+    }
 }
 
 static void test_streaming_fft_parity_and_sidecar_dedup() {
@@ -270,6 +286,231 @@ static void test_streaming_fft_parity_and_sidecar_dedup() {
     fs::remove_all(tmp_dir);
 }
 
+static void test_committee2_dsp_kernels() {
+    std::cout << "[Test 6] Committee 2 AVX2 exp/FFT, Batcher median-15 & O(N log N) Filter...\n";
+
+#ifdef __AVX2__
+    // 1. fast_exp_pd_avx2 precision & underflow handling
+    alignas(32) const double exp_in[8] = {-800.0, -708.1, -50.0, -0.5, 0.0, 0.5, 10.0, 300.0};
+    alignas(32) double exp_out[8] = {};
+    _mm256_storeu_pd(exp_out,     SimdDsp::fast_exp_pd_avx2(_mm256_loadu_pd(exp_in)));
+    _mm256_storeu_pd(exp_out + 4, SimdDsp::fast_exp_pd_avx2(_mm256_loadu_pd(exp_in + 4)));
+    TEST_ASSERT(exp_out[0] == 0.0 && exp_out[1] == 0.0, "fast_exp_pd_avx2 flushes <= -708 safely to 0");
+    double max_exp_rel_err = 0.0;
+    for (int k = 2; k < 8; ++k) {
+        double ref = std::exp(exp_in[k]);
+        max_exp_rel_err = std::max(max_exp_rel_err, std::abs(exp_out[k] - ref) / ref);
+    }
+    TEST_ASSERT(max_exp_rel_err < 1e-13, "fast_exp_pd_avx2 matches std::exp to < 1e-13 relative error");
+#endif
+
+    // 2. SimdDsp::fft_cpx_f32_avx2 parity against KissFFT for sizes 8..4096
+    const int fft_sizes[] = {8, 16, 32, 64, 512, 4096};
+    for (int nfft : fft_sizes) {
+        std::vector<kiss_fft_cpx> in_kiss(nfft), out_kiss(nfft);
+        std::vector<float> buf_avx(static_cast<size_t>(nfft) * 2);
+        for (int i = 0; i < nfft; ++i) {
+            float re = std::sin(0.137f * static_cast<float>(i)) + 0.5f * std::cos(0.41f * static_cast<float>(i));
+            float im = std::cos(0.219f * static_cast<float>(i)) - 0.3f * std::sin(0.07f * static_cast<float>(i));
+            in_kiss[i] = {re, im};
+            buf_avx[2 * i] = re;
+            buf_avx[2 * i + 1] = im;
+        }
+        kiss_fft_cfg cfg = kiss_fft_alloc(nfft, 0, nullptr, nullptr);
+        kiss_fft(cfg, in_kiss.data(), out_kiss.data());
+        free(cfg);
+
+        bool ok = SimdDsp::fft_cpx_f32_avx2(buf_avx.data(), nfft);
+#ifdef __AVX2__
+        TEST_ASSERT(ok, "fft_cpx_f32_avx2 succeeds for power-of-2 >= 8");
+        double max_rel = 0.0;
+        double norm_scale = static_cast<double>(nfft);
+        for (int i = 0; i < nfft; ++i) {
+            double dr = static_cast<double>(buf_avx[2 * i])     - static_cast<double>(out_kiss[i].r);
+            double di = static_cast<double>(buf_avx[2 * i + 1]) - static_cast<double>(out_kiss[i].i);
+            max_rel = std::max(max_rel, std::hypot(dr, di) / norm_scale);
+        }
+        TEST_ASSERT(max_rel < 1e-4, "fft_cpx_f32_avx2 matches KissFFT forward DFT");
+#else
+        (void)ok;
+#endif
+    }
+
+    // 3. Batcher Odd-Even Merge median-15 RFI filter parity across edge & 4k+remainder sizes
+    const int rfi_sizes[] = {10, 15, 67, 515};
+    for (int nfft : rfi_sizes) {
+        std::vector<double> pwr(nfft), freqs(nfft);
+        for (int i = 0; i < nfft; ++i) {
+            double x = static_cast<double>(i);
+            freqs[i] = 1419.5 + 2.4 * x / static_cast<double>(nfft);
+            pwr[i] = 10.0 + ((i % 3 == 0) ? 0.02 : -0.02) + 0.1 * std::sin(0.31 * x);
+        }
+        // Duplicate ties + interior/boundary RFI spikes
+        pwr[2] = pwr[1];
+        if (nfft > 20) {
+            pwr[12] = 55.0;
+            pwr[nfft / 2 + 5] = 80.0;
+            pwr[nfft - 3] = 60.0;
+        }
+        astro::AstroConfig cfg;
+        cfg.sample_rate_hz = 2.4e6;
+        cfg.center_freq_hz = 1420.5e6;
+        cfg.rfi_threshold_mad = 5.0;
+
+        std::vector<double> ref_out = pwr;
+        int ref_cnt = 0;
+        if (nfft >= 32) {
+            int edge_bins = static_cast<int>(nfft * std::clamp(cfg.passband_edge_fraction, 0.0, 0.45));
+            double hi_half = cfg.hi_protection_half_width_khz / 1e3;
+            std::vector<uint8_t> valid(nfft, 1);
+            for (int i = 0; i < nfft; ++i) {
+                if (i < edge_bins || i >= nfft - edge_bins) valid[i] = 0;
+                if (freqs[i] >= astro::HYDROGEN_REST_FREQ_MHZ - hi_half &&
+                    freqs[i] <= astro::HYDROGEN_REST_FREQ_MHZ + hi_half) valid[i] = 0;
+            }
+            std::vector<double> ref_res(nfft), ref_valid;
+            for (int i = 0; i < nfft; ++i) {
+                double win[15];
+                for (int k = -7; k <= 7; ++k) {
+                    int j = std::clamp(i + k, 0, nfft - 1);
+                    win[k + 7] = pwr[j];
+                }
+                std::nth_element(win, win + 7, win + 15);
+                ref_res[i] = pwr[i] - win[7];
+                if (valid[i]) ref_valid.push_back(ref_res[i]);
+            }
+            auto med_fn = [](std::vector<double>& v) {
+                size_t m = v.size() / 2;
+                std::nth_element(v.begin(), v.begin() + m, v.end());
+                return (v.size() % 2) ? v[m] : 0.5 * (*std::max_element(v.begin(), v.begin() + m) + v[m]);
+            };
+            double ref_med = med_fn(ref_valid);
+            for (double& r : ref_valid) r = std::abs(r - ref_med);
+            double ref_sig = std::max(1e-12, 1.4826 * med_fn(ref_valid));
+            double ref_thr = cfg.rfi_threshold_mad * ref_sig;
+            std::vector<uint8_t> is_rfi(nfft, 0);
+            std::vector<int> rfi_idx;
+            for (int i = 0; i < nfft; ++i) {
+                if (valid[i] && ref_res[i] > ref_thr) {
+                    is_rfi[i] = 1;
+                    rfi_idx.push_back(i);
+                }
+            }
+            ref_cnt = static_cast<int>(rfi_idx.size());
+            for (size_t k = 0; k < rfi_idx.size();) {
+                const int run_start = rfi_idx[k];
+                int run_end = run_start;
+                while (k + 1 < rfi_idx.size() && rfi_idx[k + 1] == run_end + 1) {
+                    run_end = rfi_idx[++k];
+                }
+                ++k;
+                int l_idx = run_start - 1;
+                while (l_idx > 0 && is_rfi[l_idx]) --l_idx;
+                int r_idx = run_end + 1;
+                while (r_idx < nfft - 1 && is_rfi[r_idx]) ++r_idx;
+                const double v_l = !is_rfi[l_idx] ? pwr[l_idx] : pwr[r_idx];
+                const double v_r = !is_rfi[r_idx] ? pwr[r_idx] : pwr[l_idx];
+                const int span = std::max(1, r_idx - l_idx);
+                for (int idx = run_start; idx <= run_end; ++idx) {
+                    const double t = static_cast<double>(idx - l_idx) / static_cast<double>(span);
+                    ref_out[idx] = v_l + t * (v_r - v_l);
+                }
+            }
+        }
+
+        int got_cnt = 0;
+        auto got_out = astro::RFIFilter::mitigate(pwr, freqs, cfg, got_cnt);
+        TEST_ASSERT(got_cnt == ref_cnt, "RfiFilter Batcher median-15 matches scalar RFI count");
+        double max_diff = 0.0;
+        for (int i = 0; i < nfft; ++i) max_diff = std::max(max_diff, std::abs(got_out[i] - ref_out[i]));
+        TEST_ASSERT(max_diff < 1e-12, "RfiFilter Batcher median-15 output matches scalar reference identically");
+    }
+
+    // 4. BaselineFitter Filter O(N log N) FFT Gaussian convolution boundary & accuracy check
+    {
+        constexpr int nfft = 512;
+        std::vector<double> pwr(nfft), freqs(nfft);
+        for (int i = 0; i < nfft; ++i) {
+            freqs[i] = 1419.5 + 2.4 * static_cast<double>(i) / nfft;
+            double lin_db = -62.0 + 1.5 * std::cos(6.283185307 * static_cast<double>(i) / nfft);
+            if (std::abs(freqs[i] - astro::HYDROGEN_REST_FREQ_MHZ) < 0.06) {
+                lin_db += 8.0 * std::exp(-0.5 * std::pow((freqs[i] - astro::HYDROGEN_REST_FREQ_MHZ) / 0.015, 2));
+            }
+            pwr[i] = std::pow(10.0, lin_db * 0.1);
+        }
+        astro::AstroConfig cfg;
+        cfg.sample_rate_hz = 2.4e6;
+        cfg.center_freq_hz = 1420.5e6;
+        cfg.baseline_method = astro::BaselineMethod::RippleFilter;
+        cfg.filter_smoothing_sigma_khz = 160.0; // radius > 24 -> exercises DoubleFftPlan convolution
+        auto bres = astro::BaselineFitter::fit(pwr, freqs, cfg);
+        bool finite_ok = (bres.baseline_db.size() == static_cast<size_t>(nfft));
+        for (int i = 0; i < nfft; ++i) {
+            if (!std::isfinite(bres.baseline_db[i]) || std::abs(bres.baseline_db[i] + 62.0) > 2.5) {
+                finite_ok = false;
+                break;
+            }
+        }
+        TEST_ASSERT(finite_ok, "Filter baseline O(N log N) FFT convolution produces accurate smooth baseline");
+    }
+}
+
+static void test_dsp_pipeline_dbfs_and_instant_fft() {
+    std::cout << "[Test 7] DspPipeline coherent full-scale dBFS & instantaneous FFT vs smoothed PSD...\n";
+    constexpr int N = 4096;
+    constexpr uint32_t FS = 2400000;
+    constexpr uint64_t FC = 1420500000ULL;
+
+    DspPipeline dsp;
+    dsp.set_fft_size(N);
+    dsp.set_averaging(0.15f); // Heavy smoothing on PSD
+
+    // Full-scale coherent complex sinusoid at bin +512 (+300 kHz)
+    std::vector<uint8_t> iq_tone1(2 * N);
+    const double two_pi = 6.28318530717958647692;
+    for (int i = 0; i < N; ++i) {
+        double ph = two_pi * 512.0 * static_cast<double>(i) / static_cast<double>(N);
+        int iv = static_cast<int>(std::lround(128.0 + 127.0 * std::cos(ph)));
+        int qv = static_cast<int>(std::lround(128.0 + 127.0 * std::sin(ph)));
+        iq_tone1[2 * i] = static_cast<uint8_t>(std::clamp(iv, 0, 255));
+        iq_tone1[2 * i + 1] = static_cast<uint8_t>(std::clamp(qv, 0, 255));
+    }
+
+    dsp.feed_samples(iq_tone1.data(), iq_tone1.size());
+    std::vector<float> psd_out;
+    float psd_pk_freq = 0.0f, psd_pk_db = 0.0f;
+    TEST_ASSERT(dsp.get_power_spectrum(psd_out, psd_pk_freq, psd_pk_db, FC, FS),
+                "DspPipeline computed initial spectrum");
+
+    const auto& fft_db = dsp.get_instant_fft_db();
+    const auto& fft_mag = dsp.get_instant_fft_mag();
+    TEST_ASSERT(fft_db.size() == static_cast<size_t>(N) && fft_mag.size() == static_cast<size_t>(N),
+                "Instantaneous FFT dBFS and linear |X| buffers have full FFT size");
+    TEST_ASSERT(dsp.get_instant_fft_peak_db() > -0.35f && dsp.get_instant_fft_peak_db() < 0.05f,
+                "Coherent full-scale complex tone normalizes near 0.0 dBFS");
+    TEST_ASSERT(dsp.get_instant_fft_peak_mag() > 0.96f && dsp.get_instant_fft_peak_mag() < 1.01f,
+                "Instantaneous linear |X| normalizes near 1.0 FS");
+    TEST_ASSERT(std::abs(dsp.get_instant_fft_peak_freq() * 1e-6f - 1420.800f) < 0.005f,
+                "Instantaneous FFT peak frequency aligns with +300 kHz tone");
+
+    // Step immediately to bin -512 (-300 kHz): instant FFT must follow immediately while heavy-smoothed PSD still retains prior tone power
+    std::vector<uint8_t> iq_tone2(2 * N);
+    for (int i = 0; i < N; ++i) {
+        double ph = two_pi * (-512.0) * static_cast<double>(i) / static_cast<double>(N);
+        int iv = static_cast<int>(std::lround(128.0 + 127.0 * std::cos(ph)));
+        int qv = static_cast<int>(std::lround(128.0 + 127.0 * std::sin(ph)));
+        iq_tone2[2 * i] = static_cast<uint8_t>(std::clamp(iv, 0, 255));
+        iq_tone2[2 * i + 1] = static_cast<uint8_t>(std::clamp(qv, 0, 255));
+    }
+    dsp.feed_samples(iq_tone2.data(), iq_tone2.size());
+    TEST_ASSERT(dsp.get_power_spectrum(psd_out, psd_pk_freq, psd_pk_db, FC, FS),
+                "DspPipeline computed step-change spectrum");
+    TEST_ASSERT(std::abs(dsp.get_instant_fft_peak_freq() * 1e-6f - 1420.200f) < 0.005f,
+                "Instantaneous FFT jumps immediately to -300 kHz tone without lag");
+    TEST_ASSERT(psd_out[2048 + 512] > fft_db[2048 + 512] + 5.0f,
+                "Smoothed PSD retains memory at prior +300 kHz bin while instant FFT drops");
+}
+
 int main() {
     std::cout << "======================================================================\n";
     std::cout << "  RUNNING TEST SUITE: test_dsp_optimizations\n";
@@ -280,6 +521,8 @@ int main() {
     test_waterfall_history_resize();
     test_scientific_pipeline_solvers();
     test_streaming_fft_parity_and_sidecar_dedup();
+    test_committee2_dsp_kernels();
+    test_dsp_pipeline_dbfs_and_instant_fft();
 
     std::cout << "----------------------------------------------------------------------\n";
     std::cout << "RESULTS: " << g_tests_passed << " / " << g_tests_run << " assertions PASSED.\n";

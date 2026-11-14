@@ -2,6 +2,9 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 namespace astro {
 
@@ -25,6 +28,74 @@ static inline double calc_median_15(const double* src) {
     return win[7];
 }
 
+// Clamped edge-replicated 15-tap window median for boundary bins [0..6] and [nfft-7..nfft-1]
+static inline double calc_median_15_clamped(const double* power, int nfft, int center_idx) {
+    double win[15];
+    for (int k = -7; k <= 7; ++k) {
+        int src_idx = center_idx + k;
+        if (src_idx < 0) src_idx = 0;
+        else if (src_idx >= nfft) src_idx = nfft - 1;
+        win[k + 7] = power[src_idx];
+    }
+    std::nth_element(win, win + 7, win + 15);
+    return win[7];
+}
+
+#ifdef __AVX2__
+static inline void avx2_cas(__m256d& a, __m256d& b) {
+    __m256d lo = _mm256_min_pd(a, b);
+    __m256d hi = _mm256_max_pd(a, b);
+    a = lo;
+    b = hi;
+}
+
+// 4-wide AVX2 Batcher Odd-Even Merge sorting network for 15-element median (output in lane index 7).
+// Treats implicit 16th lane as +infinity (all compare-swaps with index 15 omitted).
+static inline __m256d calc_median_15_avx2_4x(const double* src_minus_7) {
+    __m256d w0  = _mm256_loadu_pd(src_minus_7 + 0);
+    __m256d w1  = _mm256_loadu_pd(src_minus_7 + 1);
+    __m256d w2  = _mm256_loadu_pd(src_minus_7 + 2);
+    __m256d w3  = _mm256_loadu_pd(src_minus_7 + 3);
+    __m256d w4  = _mm256_loadu_pd(src_minus_7 + 4);
+    __m256d w5  = _mm256_loadu_pd(src_minus_7 + 5);
+    __m256d w6  = _mm256_loadu_pd(src_minus_7 + 6);
+    __m256d w7  = _mm256_loadu_pd(src_minus_7 + 7);
+    __m256d w8  = _mm256_loadu_pd(src_minus_7 + 8);
+    __m256d w9  = _mm256_loadu_pd(src_minus_7 + 9);
+    __m256d w10 = _mm256_loadu_pd(src_minus_7 + 10);
+    __m256d w11 = _mm256_loadu_pd(src_minus_7 + 11);
+    __m256d w12 = _mm256_loadu_pd(src_minus_7 + 12);
+    __m256d w13 = _mm256_loadu_pd(src_minus_7 + 13);
+    __m256d w14 = _mm256_loadu_pd(src_minus_7 + 14);
+
+    // Stage p=1, k=1
+    avx2_cas(w0, w1);   avx2_cas(w2, w3);   avx2_cas(w4, w5);   avx2_cas(w6, w7);
+    avx2_cas(w8, w9);   avx2_cas(w10, w11); avx2_cas(w12, w13);
+
+    // Stage p=2, k=2 then k=1
+    avx2_cas(w0, w2);   avx2_cas(w1, w3);   avx2_cas(w4, w6);   avx2_cas(w5, w7);
+    avx2_cas(w8, w10);  avx2_cas(w9, w11);  avx2_cas(w12, w14);
+    avx2_cas(w1, w2);   avx2_cas(w5, w6);   avx2_cas(w9, w10);  avx2_cas(w13, w14);
+
+    // Stage p=4, k=4, k=2, k=1
+    avx2_cas(w0, w4);   avx2_cas(w1, w5);   avx2_cas(w2, w6);   avx2_cas(w3, w7);
+    avx2_cas(w8, w12);  avx2_cas(w9, w13);  avx2_cas(w10, w14);
+    avx2_cas(w2, w4);   avx2_cas(w3, w5);   avx2_cas(w10, w12); avx2_cas(w11, w13);
+    avx2_cas(w1, w2);   avx2_cas(w3, w4);   avx2_cas(w5, w6);
+    avx2_cas(w9, w10);  avx2_cas(w11, w12); avx2_cas(w13, w14);
+
+    // Final merge p=8 (pruned to wires affecting index 7)
+    avx2_cas(w0, w8);   avx2_cas(w1, w9);   avx2_cas(w2, w10);  avx2_cas(w3, w11);
+    avx2_cas(w4, w12);  avx2_cas(w5, w13);  avx2_cas(w6, w14);
+    avx2_cas(w4, w8);   avx2_cas(w5, w9);   avx2_cas(w6, w10);  avx2_cas(w7, w11);
+    avx2_cas(w2, w4);   avx2_cas(w3, w5);   avx2_cas(w6, w8);   avx2_cas(w7, w9);
+    avx2_cas(w10, w12); avx2_cas(w11, w13);
+    // For k=1 in final stage, only (7, 8) modifies element 7
+    __m256d lo7 = _mm256_min_pd(w7, w8);
+    return lo7;
+}
+#endif
+
 std::vector<double> RFIFilter::mitigate(
     const std::vector<double>& power,
     const std::vector<double>& freqs_mhz,
@@ -37,7 +108,7 @@ std::vector<double> RFIFilter::mitigate(
     if (nfft < 32) return clean_power;
 
     double hi_half_width_mhz = config.hi_protection_half_width_khz / 1e3;
-    int edge_bins = static_cast<int>(nfft * 0.05);
+    int edge_bins = static_cast<int>(nfft * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
 
     std::vector<uint8_t> valid_mask(nfft, 1);
     for (int i = 0; i < edge_bins; ++i) valid_mask[i] = 0;
@@ -50,48 +121,90 @@ std::vector<double> RFIFilter::mitigate(
         }
     }
 
-    // Rolling median filter (kernel size = 15) with zero heap allocs per bin
-    constexpr int kernel_size = 15;
-    constexpr int pad_width = kernel_size / 2;
-    std::vector<double> padded(nfft + 2 * pad_width);
-    for (int i = 0; i < pad_width; ++i) padded[i] = clean_power[0];
-    std::memcpy(padded.data() + pad_width, clean_power.data(), static_cast<size_t>(nfft) * sizeof(double));
-    for (int i = 0; i < pad_width; ++i) padded[pad_width + nfft + i] = clean_power[nfft - 1];
+    // Rolling median filter (kernel size = 15) directly from clean_power (zero full-array pad copy, zero per-call scratch allocs)
+    thread_local std::vector<double> tl_residuals;
+    thread_local std::vector<double> tl_residuals_valid;
+    thread_local std::vector<int> tl_rfi_indices;
 
-    std::vector<double> residuals(nfft);
-    std::vector<double> residuals_valid;
-    residuals_valid.reserve(nfft);
+    tl_residuals.resize(static_cast<size_t>(nfft));
+    double* res_ptr = tl_residuals.data();
+    const double* pwr_ptr = clean_power.data();
+
+    // Left boundary [0..6]
+    for (int i = 0; i < 7; ++i) {
+        res_ptr[i] = pwr_ptr[i] - calc_median_15_clamped(pwr_ptr, nfft, i);
+    }
+    int i = 7;
+#ifdef __AVX2__
+    // Interior [7 .. nfft - 8] processed 4 bins at a time using Batcher Odd-Even Merge sorting network
+    for (; i + 11 <= nfft; i += 4) {
+        __m256d med = calc_median_15_avx2_4x(pwr_ptr + i - 7);
+        __m256d val = _mm256_loadu_pd(pwr_ptr + i);
+        _mm256_storeu_pd(res_ptr + i, _mm256_sub_pd(val, med));
+    }
+#endif
+    for (; i <= nfft - 8; ++i) {
+        res_ptr[i] = pwr_ptr[i] - calc_median_15(pwr_ptr + i - 7);
+    }
+    // Right boundary [nfft - 7 .. nfft - 1]
+    for (; i < nfft; ++i) {
+        res_ptr[i] = pwr_ptr[i] - calc_median_15_clamped(pwr_ptr, nfft, i);
+    }
+
+    tl_residuals_valid.clear();
+    if (tl_residuals_valid.capacity() < static_cast<size_t>(nfft)) {
+        tl_residuals_valid.reserve(static_cast<size_t>(nfft));
+    }
     for (int i = 0; i < nfft; ++i) {
-        double med = calc_median_15(&padded[i]);
-        double res = clean_power[i] - med;
-        residuals[i] = res;
         if (valid_mask[i]) {
-            residuals_valid.push_back(res);
+            tl_residuals_valid.push_back(res_ptr[i]);
         }
     }
 
-    if (residuals_valid.empty()) return clean_power;
+    if (tl_residuals_valid.empty()) {
+        out_num_rfi = 0;
+        return clean_power;
+    }
 
-    double med_res = calc_median_inplace(residuals_valid);
-    for (double& r : residuals_valid) {
+    double med_res = calc_median_inplace(tl_residuals_valid);
+    for (double& r : tl_residuals_valid) {
         r = std::abs(r - med_res);
     }
-    double mad = calc_median_inplace(residuals_valid);
+    double mad = calc_median_inplace(tl_residuals_valid);
     double sigma_est = std::max(1e-12, 1.4826 * mad);
 
     double threshold = config.rfi_threshold_mad * sigma_est;
-    std::vector<int> rfi_indices;
+    thread_local std::vector<uint8_t> is_rfi;
+    is_rfi.assign(nfft, 0);
+    tl_rfi_indices.clear();
     for (int i = 0; i < nfft; ++i) {
-        if (valid_mask[i] && residuals[i] > threshold) {
-            rfi_indices.push_back(i);
+        if (valid_mask[i] && res_ptr[i] > threshold) {
+            is_rfi[i] = 1;
+            tl_rfi_indices.push_back(i);
         }
     }
 
-    out_num_rfi = static_cast<int>(rfi_indices.size());
-    for (int idx : rfi_indices) {
-        int l_idx = std::max(0, idx - 4);
-        int r_idx = std::min(nfft - 1, idx + 4);
-        clean_power[idx] = (clean_power[l_idx] + clean_power[r_idx]) * 0.5;
+    out_num_rfi = static_cast<int>(tl_rfi_indices.size());
+    for (size_t k = 0; k < tl_rfi_indices.size();) {
+        const int run_start = tl_rfi_indices[k];
+        int run_end = run_start;
+        while (k + 1 < tl_rfi_indices.size() && tl_rfi_indices[k + 1] == run_end + 1) {
+            run_end = tl_rfi_indices[++k];
+        }
+        ++k;
+
+        int l_idx = run_start - 1;
+        while (l_idx > 0 && is_rfi[l_idx]) --l_idx;
+        int r_idx = run_end + 1;
+        while (r_idx < nfft - 1 && is_rfi[r_idx]) ++r_idx;
+
+        const double v_l = !is_rfi[l_idx] ? power[l_idx] : power[r_idx];
+        const double v_r = !is_rfi[r_idx] ? power[r_idx] : power[l_idx];
+        const int span = std::max(1, r_idx - l_idx);
+        for (int idx = run_start; idx <= run_end; ++idx) {
+            const double t = static_cast<double>(idx - l_idx) / static_cast<double>(span);
+            clean_power[idx] = v_l + t * (v_r - v_l);
+        }
     }
 
     return clean_power;

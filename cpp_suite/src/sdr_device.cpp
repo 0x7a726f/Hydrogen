@@ -1,20 +1,12 @@
 #include "sdr_device.h"
 #include <windows.h>
 #include <tlhelp32.h>
-#include <iostream>
 #include <algorithm>
 #include <cmath>
 #include <vector>
 #include <thread>
 #include <chrono>
-
-static std::wstring to_wide(const std::string& str) {
-    if (str.empty()) return std::wstring();
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
-    std::wstring result(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &result[0], size);
-    return result;
-}
+#include <mutex>
 
 static std::string to_utf8(const std::wstring& wstr) {
     if (wstr.empty()) return std::string();
@@ -22,11 +14,6 @@ static std::string to_utf8(const std::wstring& wstr) {
     std::string result(size, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &result[0], size, nullptr, nullptr);
     return result;
-}
-
-static std::string to_lower_str(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)::tolower(c); });
-    return s;
 }
 
 RtlSdrDevice::RtlSdrDevice() {
@@ -70,7 +57,7 @@ bool RtlSdrDevice::load_dll() {
 
     dll_handle_ = (void*)mod;
 
-    #define LOAD_PROC(name) fn_##name = (pfn_rtlsdr_##name)GetProcAddress(mod, "rtlsdr_" #name)
+    #define LOAD_PROC(name) fn_##name = reinterpret_cast<pfn_rtlsdr_##name>(reinterpret_cast<uintptr_t>(GetProcAddress(mod, "rtlsdr_" #name)))
     LOAD_PROC(get_device_count);
     LOAD_PROC(get_device_name);
     LOAD_PROC(get_device_usb_strings);
@@ -107,9 +94,22 @@ void RtlSdrDevice::unload_dll() {
 }
 
 std::vector<std::string> RtlSdrDevice::detect_blocking_processes() {
+    static std::mutex cache_mutex;
+    static std::vector<std::string> cached_result;
+    static uint64_t last_probe_ms = 0;
+    static bool has_cached = false;
+
+    {
+        std::lock_guard<std::mutex> lk(cache_mutex);
+        const uint64_t now_ms = GetTickCount64();
+        if (has_cached && (now_ms - last_probe_ms) < 1500ULL) {
+            return cached_result;
+        }
+    }
+
     std::vector<std::string> blocking;
-    static const std::vector<std::string> known_sdr = {
-        "satdump", "sdrpp", "sdrangel", "tv_app", "rtl_tcp", "dump1090", "welle"
+    static const wchar_t* const known_sdr_w[] = {
+        L"satdump", L"sdrpp", L"sdrangel", L"tv_app", L"rtl_tcp", L"dump1090", L"welle"
     };
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -120,9 +120,16 @@ std::vector<std::string> RtlSdrDevice::detect_blocking_processes() {
 
     if (Process32FirstW(snap, &pe)) {
         do {
-            std::string proc_name = to_lower_str(to_utf8(pe.szExeFile));
-            for (const auto& target : known_sdr) {
-                if (proc_name.find(target) != std::string::npos) {
+            wchar_t lower_exe[MAX_PATH];
+            size_t len = 0;
+            while (len + 1 < MAX_PATH && pe.szExeFile[len] != L'\0') {
+                wchar_t c = pe.szExeFile[len];
+                if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c + 32);
+                lower_exe[len++] = c;
+            }
+            lower_exe[len] = L'\0';
+            for (const wchar_t* target : known_sdr_w) {
+                if (wcsstr(lower_exe, target) != nullptr) {
                     blocking.push_back(to_utf8(pe.szExeFile));
                     break;
                 }
@@ -131,6 +138,13 @@ std::vector<std::string> RtlSdrDevice::detect_blocking_processes() {
     }
 
     CloseHandle(snap);
+
+    {
+        std::lock_guard<std::mutex> lk(cache_mutex);
+        cached_result = blocking;
+        last_probe_ms = GetTickCount64();
+        has_cached = true;
+    }
     return blocking;
 }
 

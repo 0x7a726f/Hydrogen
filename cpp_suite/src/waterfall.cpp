@@ -16,8 +16,33 @@ static inline uint32_t make_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 25
 
 Waterfall::Waterfall(int width, int height)
     : width_(width), height_(height) {
-    pixels_.assign(width_ * height_, make_rgba(13, 17, 23));
+    ring_.assign(static_cast<size_t>(width_) * height_, make_rgba(13, 17, 23));
+    head_row_ = 0;
+    revision_ = 1;
     rebuild_palette_lut();
+}
+
+void Waterfall::linearize_into(uint32_t* dst) const {
+    if (!dst || width_ <= 0 || height_ <= 0 || ring_.empty()) return;
+    const size_t row_bytes = static_cast<size_t>(width_) * sizeof(uint32_t);
+    const int top_rows = height_ - head_row_;
+    std::memcpy(dst, &ring_[static_cast<size_t>(head_row_) * width_], static_cast<size_t>(top_rows) * row_bytes);
+    if (head_row_ > 0) {
+        std::memcpy(dst + static_cast<size_t>(top_rows) * width_, &ring_[0], static_cast<size_t>(head_row_) * row_bytes);
+    }
+}
+
+void Waterfall::copy_linear_pixels(uint32_t* dst) const {
+    linearize_into(dst);
+}
+
+const uint32_t* Waterfall::get_pixel_data() const {
+    if (linear_cache_rev_ != revision_ || linear_cache_.size() != ring_.size()) {
+        linear_cache_.resize(ring_.size());
+        linearize_into(linear_cache_.data());
+        linear_cache_rev_ = revision_;
+    }
+    return linear_cache_.data();
 }
 
 void Waterfall::resize(int width, int height) {
@@ -25,28 +50,31 @@ void Waterfall::resize(int width, int height) {
     if (width != width_ || height != height_) {
         width_ = width;
         height_ = height;
-        pixels_.assign(width_ * height_, make_rgba(13, 17, 23));
+        ring_.assign(static_cast<size_t>(width_) * height_, make_rgba(13, 17, 23));
+        head_row_ = 0;
+        ++revision_;
     }
 }
 
 void Waterfall::resize_preserving_history(int width, int height) {
     if (width <= 0 || height <= 0) return;
     if (width == width_ && height == height_) return;
-    if (pixels_.empty() || width_ <= 0 || height_ <= 0) {
+    if (ring_.empty() || width_ <= 0 || height_ <= 0) {
         resize(width, height);
         return;
     }
 
+    const uint32_t* src_linear = get_pixel_data();
     const uint32_t bg = make_rgba(13, 17, 23);
     std::vector<uint32_t> next(static_cast<size_t>(width) * height, bg);
     const int copy_rows = std::min(height_, height);
 
     if (width == width_) {
-        std::memcpy(next.data(), pixels_.data(), static_cast<size_t>(copy_rows) * width * sizeof(uint32_t));
+        std::memcpy(next.data(), src_linear, static_cast<size_t>(copy_rows) * width * sizeof(uint32_t));
     } else {
         const float scale_x = static_cast<float>(width_ - 1) / static_cast<float>(std::max(1, width - 1));
         for (int y = 0; y < copy_rows; ++y) {
-            const uint32_t* src_row = &pixels_[static_cast<size_t>(y) * width_];
+            const uint32_t* src_row = &src_linear[static_cast<size_t>(y) * width_];
             uint32_t* dst_row = &next[static_cast<size_t>(y) * width];
             for (int x = 0; x < width; ++x) {
                 const float fx = x * scale_x;
@@ -74,11 +102,15 @@ void Waterfall::resize_preserving_history(int width, int height) {
 
     width_ = width;
     height_ = height;
-    pixels_ = std::move(next);
+    ring_ = std::move(next);
+    head_row_ = 0;
+    ++revision_;
 }
 
 void Waterfall::clear() {
-    std::fill(pixels_.begin(), pixels_.end(), make_rgba(13, 17, 23));
+    std::fill(ring_.begin(), ring_.end(), make_rgba(13, 17, 23));
+    head_row_ = 0;
+    ++revision_;
 }
 
 void Waterfall::set_palette(WaterfallPalette palette) {
@@ -185,13 +217,12 @@ void Waterfall::rebuild_palette_lut() {
 }
 
 void Waterfall::add_line(const std::vector<float>& power_db, float min_db, float max_db) {
-    if (width_ <= 0 || height_ <= 0 || power_db.empty()) return;
+    if (width_ <= 0 || height_ <= 0 || power_db.empty() || ring_.empty()) return;
 
-    // Roll rows down in memory (row 0 becomes row 1, etc.)
-    if (height_ > 1) {
-        std::memmove(&pixels_[width_], &pixels_[0], (size_t)(height_ - 1) * width_ * sizeof(uint32_t));
-    }
+    // Step newest row pointer backwards in O(1) instead of memmoving entire history
+    head_row_ = (head_row_ == 0) ? (height_ - 1) : (head_row_ - 1);
+    uint32_t* dst_row = &ring_[static_cast<size_t>(head_row_) * width_];
 
-    // High-performance vectorized resample and LUT palette mapping
-    SimdDsp::map_waterfall_line_fast(power_db.data(), power_db.size(), min_db, max_db, palette_lut_, pixels_.data(), width_);
+    SimdDsp::map_waterfall_line_fast(power_db.data(), power_db.size(), min_db, max_db, palette_lut_, dst_row, width_);
+    ++revision_;
 }

@@ -6,7 +6,6 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
 #include <vector>
 #include <functional>
 #include <atomic>
@@ -82,6 +81,7 @@ private:
     void stream_worker();
     void dispatch_worker();
     void process_pending_commands();
+    std::future<bool> enqueue_command(SdrCommand cmd);
 
     std::unique_ptr<ISdrDevice> device_;
     std::atomic<bool> is_streaming_{false};

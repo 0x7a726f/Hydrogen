@@ -20,6 +20,7 @@ DspPipeline::~DspPipeline() {
 }
 
 void DspPipeline::set_fft_size(int size) {
+    size = std::max(2, size);
     if (size != fft_size_) {
         std::lock_guard<std::mutex> lock(sample_mutex_);
         fft_size_ = size;
@@ -48,6 +49,7 @@ void DspPipeline::rebuild_plans() {
     fft_in_.resize(fft_size_);
     fft_out_.resize(fft_size_);
     power_raw_.resize(fft_size_);
+    fft_mag_linear_.resize(fft_size_);
     power_smooth_.assign(fft_size_, -120.0f);
     scratch_u8_.resize(static_cast<size_t>(fft_size_) * 2);
     sample_buffer_.reserve(static_cast<size_t>(fft_size_) * 2);
@@ -61,13 +63,17 @@ void DspPipeline::update_window() {
     window_scaled_.resize(fft_size_);
     const double inv_n_minus_1 = 2.0 * M_PI / static_cast<double>(fft_size_ - 1);
     const float inv_128 = 1.0f / 128.0f;
+    double sum_w = 0.0;
 
     for (int n = 0; n < fft_size_; ++n) {
         // Hann window: 0.5 * (1 - cos(2*pi*n / (N-1)))
         float w = 0.5f * (1.0f - static_cast<float>(std::cos(static_cast<double>(n) * inv_n_minus_1)));
+        sum_w += static_cast<double>(w);
         // Pre-scale by 1/128 for direct AVX multiplication with (u8 - 127.5)
         window_scaled_[n] = w * inv_128;
     }
+    // Coherent window sum so full-scale complex tone (|I|,|Q| -> 1.0) maps to 0.0 dBFS
+    coh_gain_sum_ = std::max(1.0, sum_w);
 }
 
 void DspPipeline::feed_samples(const uint8_t* data, size_t length) {
@@ -114,7 +120,7 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
     auto t_start = std::chrono::high_resolution_clock::now();
 
     const int n_pts = fft_size_;
-    const float inv_n = 1.0f / static_cast<float>(n_pts);
+    const float inv_norm_sq = static_cast<float>(1.0 / (coh_gain_sum_ * coh_gain_sum_));
 
     // 1. Vectorized Normalization & Hann Windowing (AVX2 / SSE2)
     SimdDsp::apply_hann_window_complex_fast(
@@ -124,16 +130,38 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
         n_pts
     );
 
-    // 2. High-speed complex FFT (KissFFT)
-    kiss_fft(fft_cfg_, fft_in_.data(), fft_out_.data());
+    // 2. High-speed complex FFT (AVX2+FMA Stockham for power-of-2 >= 8, KissFFT fallback)
+    const float* fft_power_src = nullptr;
+    if (SimdDsp::fft_cpx_f32_avx2(reinterpret_cast<float*>(fft_in_.data()), n_pts)) {
+        fft_power_src = reinterpret_cast<const float*>(fft_in_.data());
+    } else {
+        kiss_fft(fft_cfg_, fft_in_.data(), fft_out_.data());
+        fft_power_src = reinterpret_cast<const float*>(fft_out_.data());
+    }
 
-    // 3. Vectorized FFT Shift & Fast dBFS (AVX2 + FMA / Fast Polynomial log10)
+    // 3. Vectorized FFT Shift, Instantaneous Magnitude & Fast dBFS
+    if (fft_mag_linear_.size() != static_cast<size_t>(n_pts)) {
+        fft_mag_linear_.resize(n_pts);
+    }
     SimdDsp::compute_power_dbfs_avx2(
-        reinterpret_cast<const float*>(fft_out_.data()),
+        fft_power_src,
         power_raw_.data(),
         n_pts,
-        inv_n
+        inv_norm_sq,
+        fft_mag_linear_.data()
     );
+
+    // Track instantaneous FFT peak alongside smoothed Power Spectrum peak
+    int fft_peak_idx = 0;
+    float max_fft_db = -999.0f;
+    for (int k = 0; k < n_pts; ++k) {
+        if (power_raw_[k] > max_fft_db) {
+            max_fft_db = power_raw_[k];
+            fft_peak_idx = k;
+        }
+    }
+    fft_peak_db_ = max_fft_db;
+    fft_peak_mag_ = fft_mag_linear_[fft_peak_idx];
 
     // 4. Vectorized Exponential Smoothing
     bool do_flush = need_flush_.exchange(false);
@@ -144,7 +172,7 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
     }
     has_smooth_ = true;
 
-    // 5. Peak Detection
+    // 5. Peak Detection (Smoothed Power Spectrum)
     int peak_idx = 0;
     float max_pwr = -999.0f;
     for (int k = 0; k < n_pts; ++k) {
@@ -160,6 +188,7 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
     double start_f = static_cast<double>(center_freq_hz) - (static_cast<double>(sample_rate_hz) / 2.0);
     double step_f = static_cast<double>(sample_rate_hz) / static_cast<double>(n_pts);
     out_peak_freq = static_cast<float>(start_f + static_cast<double>(peak_idx) * step_f);
+    fft_peak_freq_ = static_cast<float>(start_f + static_cast<double>(fft_peak_idx) * step_f);
 
     // Compute Telemetry (SNR, Noise floor)
     compute_telemetry(power_smooth_, max_pwr);

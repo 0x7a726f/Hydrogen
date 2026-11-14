@@ -1,7 +1,6 @@
 #include "sidecar_reader.h"
 #include <fstream>
 #include <sstream>
-#include <iostream>
 #include <regex>
 #include <algorithm>
 #include <unordered_set>
@@ -80,11 +79,15 @@ bool SidecarReader::parse_json_sidecar(const std::string& json_path, Observation
 
     bool has_data = false;
     double val = 0.0;
-    if (json_extract_number(content, "center_freq_hz", val)) {
+    if (json_extract_number(content, "center_freq_hz", val) ||
+        json_extract_number(content, "center_frequency_hz", val) ||
+        json_extract_number(content, "fc_hz", val)) {
         meta.center_freq_hz = val;
         has_data = true;
     }
-    if (json_extract_number(content, "sample_rate_hz", val)) {
+    if (json_extract_number(content, "sample_rate_hz", val) ||
+        json_extract_number(content, "sampling_rate_hz", val) ||
+        json_extract_number(content, "fs_hz", val)) {
         meta.sample_rate_hz = val;
         has_data = true;
     }
@@ -211,17 +214,18 @@ ObservationMetadata SidecarReader::parse(const std::string& cs16_path) {
     std::filesystem::path p(cs16_path);
     std::filesystem::path base_path = p.parent_path() / p.stem();
 
+    std::error_code ec;
     // 1. Try .json sidecar
     std::filesystem::path json_path = base_path;
     json_path += ".json";
-    if (std::filesystem::exists(json_path) && parse_json_sidecar(json_path.string(), meta)) {
+    if (std::filesystem::exists(json_path, ec) && parse_json_sidecar(json_path.string(), meta)) {
         return meta;
     }
 
     // 2. Try .txt sidecar
     std::filesystem::path txt_path = base_path;
     txt_path += ".txt";
-    if (std::filesystem::exists(txt_path) && parse_txt_sidecar(txt_path.string(), meta)) {
+    if (std::filesystem::exists(txt_path, ec) && parse_txt_sidecar(txt_path.string(), meta)) {
         return meta;
     }
 

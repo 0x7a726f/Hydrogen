@@ -176,28 +176,34 @@ inline void apply_hann_window_complex_avx2(
     size_t n = 0;
     const __m256 c127_5 = _mm256_set1_ps(127.5f);
 
-    // Process 4 complex points (8 floats) per AVX2 vector iteration
-    for (; n + 4 <= n_pts; n += 4) {
-        // Load 8 uint8 bytes
-        __m128i raw8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src_u8 + 2 * n));
-        // Expand 8 x uint8 to 8 x int32
-        __m256i i32_v = _mm256_cvtepu8_epi32(raw8);
-        // Convert to 8 floats
-        __m256 f_v = _mm256_cvtepi32_ps(i32_v);
-        // Subtract 127.5f
-        __m256 centered = _mm256_sub_ps(f_v, c127_5);
+    // Process 8 complex points (16 uint8 -> 16 floats) per AVX2 vector iteration
+    for (; n + 8 <= n_pts; n += 8) {
+        __m128i raw16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_u8 + 2 * n));
+        __m256i i32_lo = _mm256_cvtepu8_epi32(raw16);
+        __m256i i32_hi = _mm256_cvtepu8_epi32(_mm_srli_si128(raw16, 8));
+        __m256 centered_lo = _mm256_sub_ps(_mm256_cvtepi32_ps(i32_lo), c127_5);
+        __m256 centered_hi = _mm256_sub_ps(_mm256_cvtepi32_ps(i32_hi), c127_5);
 
-        // Load 4 window points and duplicate: [w0, w0, w1, w1, w2, w2, w3, w3]
+        __m256 w8 = _mm256_loadu_ps(window_scaled + n);
+        // [w0, w0, w1, w1 | w4, w4, w5, w5] and [w2, w2, w3, w3 | w6, w6, w7, w7]
+        __m256 w_dup_lo = _mm256_unpacklo_ps(w8, w8);
+        __m256 w_dup_hi = _mm256_unpackhi_ps(w8, w8);
+        __m256 win03 = _mm256_permute2f128_ps(w_dup_lo, w_dup_hi, 0x20);
+        __m256 win47 = _mm256_permute2f128_ps(w_dup_lo, w_dup_hi, 0x31);
+
+        _mm256_storeu_ps(dst_cpx + 2 * n,     _mm256_mul_ps(centered_lo, win03));
+        _mm256_storeu_ps(dst_cpx + 2 * n + 8, _mm256_mul_ps(centered_hi, win47));
+    }
+
+    // 4-point cleanup
+    for (; n + 4 <= n_pts; n += 4) {
+        __m128i raw8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src_u8 + 2 * n));
+        __m256 centered = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(raw8)), c127_5);
         __m128 w4 = _mm_loadu_ps(window_scaled + n);
-        // Unpack: [w0, w0, w1, w1] and [w2, w2, w3, w3]
         __m128 w_lo = _mm_unpacklo_ps(w4, w4);
         __m128 w_hi = _mm_unpackhi_ps(w4, w4);
         __m256 win8 = _mm256_set_m128(w_hi, w_lo);
-
-        // Multiply: centered * win8
-        __m256 res = _mm256_mul_ps(centered, win8);
-
-        _mm256_storeu_ps(dst_cpx + 2 * n, res);
+        _mm256_storeu_ps(dst_cpx + 2 * n, _mm256_mul_ps(centered, win8));
     }
 
     // Remainder
@@ -237,8 +243,8 @@ inline void apply_hann_window_complex_fast(
 
 // -----------------------------------------------------------------------
 // 3. Fast Vectorized Math: log10 and Power in dBFS
-// Max error < 0.05 dB across entire dynamic range -140 dBFS to +10 dBFS.
-// Clamped to valid dBFS bounds [-140.0, +10.0], handling <= 0, subnormals, NaN/Inf.
+// Max error < 0.05 dB across entire dynamic range -140 dBFS to +40 dBFS.
+// Clamped to valid dBFS bounds [-140.0, +40.0], handling <= 0, subnormals, NaN/Inf.
 // Evaluates at > 120 MSPS with full AVX2 / FMA.
 // -----------------------------------------------------------------------
 #if defined(__AVX2__)
@@ -301,7 +307,7 @@ inline __m256 fast_10log10_avx2(__m256 x) {
     return dbfs;
 }
 
-// High-precision (~1e-14) double-precision AVX2+FMA log10(x) for positive normal doubles
+// High-precision (~1e-14) double-precision AVX2+FMA log10(x) for positive normal doubles (Estrin form)
 inline __m256d fast_log10_pd_avx2(__m256d x) {
     const __m256d k_sqrt2    = _mm256_set1_pd(1.4142135623730950488);
     const __m256d k_one      = _mm256_set1_pd(1.0);
@@ -325,6 +331,8 @@ inline __m256d fast_log10_pd_avx2(__m256d x) {
 
     __m256d u = _mm256_div_pd(_mm256_sub_pd(m, k_one), _mm256_add_pd(m, k_one));
     __m256d u2 = _mm256_mul_pd(u, u);
+    __m256d u4 = _mm256_mul_pd(u2, u2);
+    __m256d u8 = _mm256_mul_pd(u4, u4);
 
     const __m256d c15 = _mm256_set1_pd(1.0 / 15.0);
     const __m256d c13 = _mm256_set1_pd(1.0 / 13.0);
@@ -335,44 +343,42 @@ inline __m256d fast_log10_pd_avx2(__m256d x) {
     const __m256d c3  = _mm256_set1_pd(1.0 / 3.0);
 
 #if SIMD_HAS_FMA
-    __m256d poly = _mm256_fmadd_pd(c15, u2, c13);
-    poly = _mm256_fmadd_pd(poly, u2, c11);
-    poly = _mm256_fmadd_pd(poly, u2, c9);
-    poly = _mm256_fmadd_pd(poly, u2, c7);
-    poly = _mm256_fmadd_pd(poly, u2, c5);
-    poly = _mm256_fmadd_pd(poly, u2, c3);
-    poly = _mm256_fmadd_pd(poly, u2, k_one);
+    __m256d p01 = _mm256_fmadd_pd(c3,  u2, k_one);
+    __m256d p23 = _mm256_fmadd_pd(c7,  u2, c5);
+    __m256d p45 = _mm256_fmadd_pd(c11, u2, c9);
+    __m256d p67 = _mm256_fmadd_pd(c15, u2, c13);
+    __m256d q03 = _mm256_fmadd_pd(p23, u4, p01);
+    __m256d q47 = _mm256_fmadd_pd(p67, u4, p45);
+    __m256d poly = _mm256_fmadd_pd(q47, u8, q03);
     __m256d log10_m = _mm256_mul_pd(_mm256_mul_pd(k_2log10_e, u), poly);
     return _mm256_fmadd_pd(k, k_log10_2, log10_m);
 #else
-    __m256d poly = _mm256_add_pd(_mm256_mul_pd(c15, u2), c13);
-    poly = _mm256_add_pd(_mm256_mul_pd(poly, u2), c11);
-    poly = _mm256_add_pd(_mm256_mul_pd(poly, u2), c9);
-    poly = _mm256_add_pd(_mm256_mul_pd(poly, u2), c7);
-    poly = _mm256_add_pd(_mm256_mul_pd(poly, u2), c5);
-    poly = _mm256_add_pd(_mm256_mul_pd(poly, u2), c3);
-    poly = _mm256_add_pd(_mm256_mul_pd(poly, u2), k_one);
+    __m256d p01 = _mm256_add_pd(_mm256_mul_pd(c3,  u2), k_one);
+    __m256d p23 = _mm256_add_pd(_mm256_mul_pd(c7,  u2), c5);
+    __m256d p45 = _mm256_add_pd(_mm256_mul_pd(c11, u2), c9);
+    __m256d p67 = _mm256_add_pd(_mm256_mul_pd(c15, u2), c13);
+    __m256d q03 = _mm256_add_pd(_mm256_mul_pd(p23, u4), p01);
+    __m256d q47 = _mm256_add_pd(_mm256_mul_pd(p67, u4), p45);
+    __m256d poly = _mm256_add_pd(_mm256_mul_pd(q47, u8), q03);
     __m256d log10_m = _mm256_mul_pd(_mm256_mul_pd(k_2log10_e, u), poly);
     return _mm256_add_pd(_mm256_mul_pd(k, k_log10_2), log10_m);
 #endif
 }
 
-// High-precision (~1e-14) double-precision AVX2+FMA pow(10, x) for x in [-300, +300]
-inline __m256d fast_exp10_pd_avx2(__m256d x) {
-    const __m256d k_min_x   = _mm256_set1_pd(-300.0);
-    const __m256d k_max_x   = _mm256_set1_pd(300.0);
-    const __m256d k_log2_10 = _mm256_set1_pd(3.32192809488736234787);
-    const __m256d k_ln2     = _mm256_set1_pd(0.69314718055994530942);
-    const __m256d k_bias    = _mm256_set1_pd(4503599627371519.0); // 2^52 + 1023
-    const __m256d k_one     = _mm256_set1_pd(1.0);
+// Shared core: evaluates 2^z = 2^k * exp((z - k) * ln2) in double precision (Estrin deg-11)
+// Caller guarantees z is bounded so (k + 1023) is a valid positive normal IEEE-754 exponent.
+inline __m256d exp2_pd_core_avx2(__m256d z) {
+    const __m256d k_ln2  = _mm256_set1_pd(0.69314718055994530942);
+    const __m256d k_bias = _mm256_set1_pd(4503599627371519.0); // 2^52 + 1023
+    const __m256d k_one  = _mm256_set1_pd(1.0);
 
-    __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_max_x);
-    __m256d z = _mm256_mul_pd(safe_x, k_log2_10);
     __m256d k = _mm256_round_pd(z, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    __m256d f = _mm256_sub_pd(z, k); // |f| <= 0.5
-    __m256d t = _mm256_mul_pd(f, k_ln2); // |t| <= 0.346574
+    __m256d f = _mm256_sub_pd(z, k);      // |f| <= 0.5
+    __m256d t = _mm256_mul_pd(f, k_ln2);  // |t| <= 0.346574
+    __m256d t2 = _mm256_mul_pd(t, t);
+    __m256d t4 = _mm256_mul_pd(t2, t2);
+    __m256d t8 = _mm256_mul_pd(t4, t4);
 
-    // Degree-11 Taylor polynomial of exp(t)
     const __m256d c11 = _mm256_set1_pd(1.0 / 39916800.0);
     const __m256d c10 = _mm256_set1_pd(1.0 / 3628800.0);
     const __m256d c9  = _mm256_set1_pd(1.0 / 362880.0);
@@ -384,49 +390,79 @@ inline __m256d fast_exp10_pd_avx2(__m256d x) {
     const __m256d c3  = _mm256_set1_pd(1.0 / 6.0);
     const __m256d c2  = _mm256_set1_pd(0.5);
 
+    __m256d q0 = _mm256_add_pd(k_one, t);
 #if SIMD_HAS_FMA
-    __m256d p = _mm256_fmadd_pd(c11, t, c10);
-    p = _mm256_fmadd_pd(p, t, c9);
-    p = _mm256_fmadd_pd(p, t, c8);
-    p = _mm256_fmadd_pd(p, t, c7);
-    p = _mm256_fmadd_pd(p, t, c6);
-    p = _mm256_fmadd_pd(p, t, c5);
-    p = _mm256_fmadd_pd(p, t, c4);
-    p = _mm256_fmadd_pd(p, t, c3);
-    p = _mm256_fmadd_pd(p, t, c2);
-    p = _mm256_fmadd_pd(p, t, k_one);
-    p = _mm256_fmadd_pd(p, t, k_one);
+    __m256d q1 = _mm256_fmadd_pd(c3,  t, c2);
+    __m256d q2 = _mm256_fmadd_pd(c5,  t, c4);
+    __m256d q3 = _mm256_fmadd_pd(c7,  t, c6);
+    __m256d q4 = _mm256_fmadd_pd(c9,  t, c8);
+    __m256d q5 = _mm256_fmadd_pd(c11, t, c10);
+    __m256d r0 = _mm256_fmadd_pd(q1, t2, q0);
+    __m256d r1 = _mm256_fmadd_pd(q3, t2, q2);
+    __m256d r2 = _mm256_fmadd_pd(q5, t2, q4);
+    __m256d s0 = _mm256_fmadd_pd(r1, t4, r0);
+    __m256d p  = _mm256_fmadd_pd(r2, t8, s0);
 #else
-    __m256d p = _mm256_add_pd(_mm256_mul_pd(c11, t), c10);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c9);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c8);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c7);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c6);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c5);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c4);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c3);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), c2);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), k_one);
-    p = _mm256_add_pd(_mm256_mul_pd(p, t), k_one);
+    __m256d q1 = _mm256_add_pd(_mm256_mul_pd(c3,  t), c2);
+    __m256d q2 = _mm256_add_pd(_mm256_mul_pd(c5,  t), c4);
+    __m256d q3 = _mm256_add_pd(_mm256_mul_pd(c7,  t), c6);
+    __m256d q4 = _mm256_add_pd(_mm256_mul_pd(c9,  t), c8);
+    __m256d q5 = _mm256_add_pd(_mm256_mul_pd(c11, t), c10);
+    __m256d r0 = _mm256_add_pd(_mm256_mul_pd(q1, t2), q0);
+    __m256d r1 = _mm256_add_pd(_mm256_mul_pd(q3, t2), q2);
+    __m256d r2 = _mm256_add_pd(_mm256_mul_pd(q5, t2), q4);
+    __m256d s0 = _mm256_add_pd(_mm256_mul_pd(r1, t4), r0);
+    __m256d p  = _mm256_add_pd(_mm256_mul_pd(r2, t8), s0);
 #endif
 
     __m256i pow2k_i = _mm256_slli_epi64(_mm256_castpd_si256(_mm256_add_pd(k, k_bias)), 52);
     return _mm256_mul_pd(p, _mm256_castsi256_pd(pow2k_i));
 }
+
+// High-precision (~1e-14) double-precision AVX2+FMA exp(x); flushes underflow <= -708.0 safely to +0.0
+inline __m256d fast_exp_pd_avx2(__m256d x) {
+    const __m256d k_min_x  = _mm256_set1_pd(-708.0);
+    const __m256d k_max_x  = _mm256_set1_pd(709.0);
+    const __m256d k_log2_e = _mm256_set1_pd(1.44269504088896340736);
+
+    __m256d mask_gt = _mm256_cmp_pd(x, k_min_x, _CMP_GT_OQ);
+    __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_max_x);
+    __m256d res = exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_e));
+    return _mm256_and_pd(res, mask_gt);
+}
+
+// High-precision (~1e-14) double-precision AVX2+FMA pow(10, x) for x in [-300, +300]
+inline __m256d fast_exp10_pd_avx2(__m256d x) {
+    const __m256d k_min_x   = _mm256_set1_pd(-300.0);
+    const __m256d k_max_x   = _mm256_set1_pd(300.0);
+    const __m256d k_log2_10 = _mm256_set1_pd(3.32192809488736234787);
+
+    __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_max_x);
+    return exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_10));
+}
 #endif
 
-// Vectorized 10 * log10(max(in[i], floor_val)) over double array
+// Vectorized 10 * log10(max(in[i], floor_val)) over double array (2x unrolled AVX2)
 inline void power_to_db_f64(const double* __restrict in, double* __restrict out, size_t n, double floor_val = 1e-12) {
     size_t i = 0;
 #if defined(__AVX2__)
     const __m256d v_floor = _mm256_set1_pd(floor_val);
     const __m256d v_ten   = _mm256_set1_pd(10.0);
+    for (; i + 8 <= n; i += 8) {
+        __m256d x0 = _mm256_loadu_pd(in + i);
+        __m256d x1 = _mm256_loadu_pd(in + i + 4);
+        __m256d nan0 = _mm256_cmp_pd(x0, x0, _CMP_UNORD_Q);
+        __m256d nan1 = _mm256_cmp_pd(x1, x1, _CMP_UNORD_Q);
+        __m256d safe0 = _mm256_max_pd(_mm256_blendv_pd(x0, v_floor, nan0), v_floor);
+        __m256d safe1 = _mm256_max_pd(_mm256_blendv_pd(x1, v_floor, nan1), v_floor);
+        _mm256_storeu_pd(out + i,     _mm256_mul_pd(v_ten, fast_log10_pd_avx2(safe0)));
+        _mm256_storeu_pd(out + i + 4, _mm256_mul_pd(v_ten, fast_log10_pd_avx2(safe1)));
+    }
     for (; i + 4 <= n; i += 4) {
         __m256d x = _mm256_loadu_pd(in + i);
         __m256d is_nan = _mm256_cmp_pd(x, x, _CMP_UNORD_Q);
         __m256d safe_x = _mm256_max_pd(_mm256_blendv_pd(x, v_floor, is_nan), v_floor);
-        __m256d db = _mm256_mul_pd(v_ten, fast_log10_pd_avx2(safe_x));
-        _mm256_storeu_pd(out + i, db);
+        _mm256_storeu_pd(out + i, _mm256_mul_pd(v_ten, fast_log10_pd_avx2(safe_x)));
     }
 #endif
     for (; i < n; ++i) {
@@ -435,15 +471,20 @@ inline void power_to_db_f64(const double* __restrict in, double* __restrict out,
     }
 }
 
-// Vectorized 10^(in_db[i] / 10.0) over double array
+// Vectorized 10^(in_db[i] / 10.0) over double array (2x unrolled AVX2)
 inline void db_to_power_f64(const double* __restrict in_db, double* __restrict out, size_t n) {
     size_t i = 0;
 #if defined(__AVX2__)
     const __m256d v_inv10 = _mm256_set1_pd(0.1);
+    for (; i + 8 <= n; i += 8) {
+        __m256d db0 = _mm256_loadu_pd(in_db + i);
+        __m256d db1 = _mm256_loadu_pd(in_db + i + 4);
+        _mm256_storeu_pd(out + i,     fast_exp10_pd_avx2(_mm256_mul_pd(db0, v_inv10)));
+        _mm256_storeu_pd(out + i + 4, fast_exp10_pd_avx2(_mm256_mul_pd(db1, v_inv10)));
+    }
     for (; i + 4 <= n; i += 4) {
         __m256d db = _mm256_loadu_pd(in_db + i);
-        __m256d pwr = fast_exp10_pd_avx2(_mm256_mul_pd(db, v_inv10));
-        _mm256_storeu_pd(out + i, pwr);
+        _mm256_storeu_pd(out + i, fast_exp10_pd_avx2(_mm256_mul_pd(db, v_inv10)));
     }
 #endif
     for (; i < n; ++i) {
@@ -501,58 +542,73 @@ inline float fast_10log10_scalar(float x) {
     return std::clamp(val, -140.0f, 40.0f);
 }
 
-// Vectorized Power & dBFS computation for FFT output with FFT-shift
-// out_power[k] = 10 * log10((r^2 + i^2) * inv_n + eps)
+// Vectorized Power (dBFS) & optional Linear Normalized Magnitude for FFT output with FFT-shift
+// out_power_db[k] = 10 * log10((r^2 + i^2) * inv_norm + eps)
+// If out_mag_linear != nullptr, out_mag_linear[k] = sqrt((r^2 + i^2) * inv_norm)
 inline void compute_power_dbfs_avx2(
     const float* __restrict fft_out_cpx,
     float* __restrict out_power_db,
     size_t n_pts,
-    float inv_n
+    float inv_norm,
+    float* __restrict out_mag_linear = nullptr
 ) {
     const size_t half_n = n_pts / 2;
 #if defined(__AVX2__)
-    const __m256 v_inv_n = _mm256_set1_ps(inv_n);
+    const __m256 v_inv_n = _mm256_set1_ps(inv_norm);
     const __m256 v_eps = _mm256_set1_ps(1e-14f);
 
     // Helper lambda to process a contiguous complex range [src_base .. src_base + len) -> out_base
-    auto process_range = [&](const float* __restrict src_cpx, float* __restrict dst_db, size_t len) {
+    auto process_range = [&](const float* __restrict src_cpx, float* __restrict dst_db,
+                             float* __restrict dst_mag, size_t len) {
         size_t i = 0;
         for (; i + 8 <= len; i += 8) {
             __m256 v0 = _mm256_loadu_ps(src_cpx + 2 * i);
             __m256 v1 = _mm256_loadu_ps(src_cpx + 2 * i + 8);
-            __m256 sq0 = _mm256_mul_ps(v0, v0);
-            __m256 sq1 = _mm256_mul_ps(v1, v1);
-            // Horizontal add pairs of r^2 + i^2, then permute 64-bit lanes back to linear [0..7]
-            __m256 hsum = _mm256_hadd_ps(sq0, sq1);
-            __m256 mag2 = _mm256_castsi256_ps(_mm256_permute4x64_epi64(_mm256_castps_si256(hsum), 0xD8));
-
+            // Deinterleave within 128-bit lanes -> [r0, r1, r4, r5 | r2, r3, r6, r7] and [i0, i1, i4, i5 | i2, i3, i6, i7]
+            __m256 re_p = _mm256_shuffle_ps(v0, v1, _MM_SHUFFLE(2, 0, 2, 0));
+            __m256 im_p = _mm256_shuffle_ps(v0, v1, _MM_SHUFFLE(3, 1, 3, 1));
 #if SIMD_HAS_FMA
-            __m256 scaled = _mm256_fmadd_ps(mag2, v_inv_n, v_eps);
+            __m256 mag2_p = _mm256_fmadd_ps(re_p, re_p, _mm256_mul_ps(im_p, im_p));
 #else
-            __m256 scaled = _mm256_add_ps(_mm256_mul_ps(mag2, v_inv_n), v_eps);
+            __m256 mag2_p = _mm256_add_ps(_mm256_mul_ps(re_p, re_p), _mm256_mul_ps(im_p, im_p));
 #endif
+            __m256 mag2 = _mm256_castsi256_ps(_mm256_permute4x64_epi64(_mm256_castps_si256(mag2_p), 0xD8));
+
+            __m256 norm_pwr = _mm256_mul_ps(mag2, v_inv_n);
+            if (dst_mag) {
+                _mm256_storeu_ps(dst_mag + i, _mm256_sqrt_ps(norm_pwr));
+            }
+            __m256 scaled = _mm256_add_ps(norm_pwr, v_eps);
             __m256 dbfs = fast_10log10_avx2(scaled);
             _mm256_storeu_ps(dst_db + i, dbfs);
         }
         for (; i < len; ++i) {
             float r = src_cpx[2 * i];
             float im = src_cpx[2 * i + 1];
-            float mag2 = r * r + im * im;
-            dst_db[i] = fast_10log10_scalar(mag2 * inv_n + 1e-14f);
+            float norm_pwr = (r * r + im * im) * inv_norm;
+            if (dst_mag) {
+                dst_mag[i] = std::sqrt(norm_pwr);
+            }
+            dst_db[i] = fast_10log10_scalar(norm_pwr + 1e-14f);
         }
     };
 
     // FFT shift: [half_n .. n_pts) -> out[0 .. n_pts - half_n), then [0 .. half_n) -> out[n_pts - half_n .. n_pts)
     const size_t first_len = n_pts - half_n;
-    process_range(fft_out_cpx + 2 * half_n, out_power_db, first_len);
-    process_range(fft_out_cpx, out_power_db + first_len, half_n);
+    process_range(fft_out_cpx + 2 * half_n, out_power_db, out_mag_linear, first_len);
+    process_range(fft_out_cpx, out_power_db + first_len,
+                  out_mag_linear ? (out_mag_linear + first_len) : nullptr, half_n);
 #else
+    const size_t first_len = n_pts - half_n;
     for (size_t k = 0; k < n_pts; ++k) {
-        size_t src_idx = (k < half_n) ? (k + half_n) : (k - half_n);
+        size_t src_idx = (k < first_len) ? (k + half_n) : (k - first_len);
         float r = fft_out_cpx[2 * src_idx];
         float i = fft_out_cpx[2 * src_idx + 1];
-        float mag2 = r * r + i * i;
-        out_power_db[k] = fast_10log10_scalar(mag2 * inv_n + 1e-14f);
+        float norm_pwr = (r * r + i * i) * inv_norm;
+        if (out_mag_linear) {
+            out_mag_linear[k] = std::sqrt(norm_pwr);
+        }
+        out_power_db[k] = fast_10log10_scalar(norm_pwr + 1e-14f);
     }
 #endif
 }
@@ -668,6 +724,349 @@ inline void map_waterfall_line_fast(
         else if (norm > 255.0f) norm = 255.0f;
         out_pixels[x] = palette_lut[static_cast<uint8_t>(norm)];
     }
+}
+
+// -----------------------------------------------------------------------
+// 6. Fast In-Place AVX2+FMA Forward Complex FFT (Power-of-2 N >= 8)
+// Stockham Auto-Sort Radix-8 (first stage) + Radix-4 + trailing Radix-2.
+// Computes standard forward DFT: X[k] = sum_{n=0}^{N-1} x[n] * exp(-i*2*pi*k*n/N).
+// Returns false if AVX2 is unavailable or N is not a power of 2 >= 8.
+// -----------------------------------------------------------------------
+inline bool fft_cpx_f32_avx2(float* __restrict cpx, int nfft) {
+#if defined(__AVX2__)
+    if (!cpx || nfft < 8 || (nfft & (nfft - 1)) != 0) {
+        return false;
+    }
+
+    struct ScratchF32 {
+        std::vector<float> storage;
+        float* ptr = nullptr;
+        void resize(size_t count) {
+            storage.resize(count + 16);
+            uintptr_t raw = reinterpret_cast<uintptr_t>(storage.data());
+            ptr = reinterpret_cast<float*>((raw + 31u) & ~uintptr_t(31u));
+        }
+    };
+
+    struct StageTwiddles {
+        int s = 0;
+        int radix = 0; // 4 or 2
+        ScratchF32 wr;
+        ScratchF32 wi;
+    };
+
+    struct FftPlan {
+        int n = 0;
+        ScratchF32 re_a, im_a, re_b, im_b;
+        std::vector<StageTwiddles> stages;
+    };
+
+    thread_local FftPlan plan;
+    if (plan.n != nfft) {
+        plan.n = nfft;
+        plan.re_a.resize(static_cast<size_t>(nfft));
+        plan.im_a.resize(static_cast<size_t>(nfft));
+        plan.re_b.resize(static_cast<size_t>(nfft));
+        plan.im_b.resize(static_cast<size_t>(nfft));
+        plan.stages.clear();
+
+        constexpr double kTwoPi = 6.283185307179586476925286766559;
+        int s = 8;
+        int rem = nfft / 8;
+        while (rem >= 4) {
+            StageTwiddles st;
+            st.s = s;
+            st.radix = 4;
+            st.wr.resize(static_cast<size_t>(s) * 3);
+            st.wi.resize(static_cast<size_t>(s) * 3);
+            const double base_ang = -kTwoPi / static_cast<double>(4 * s);
+            for (int j = 0; j < s; ++j) {
+                double a1 = base_ang * static_cast<double>(j);
+                double a2 = 2.0 * a1;
+                double a3 = 3.0 * a1;
+                st.wr.ptr[j]         = static_cast<float>(std::cos(a1));
+                st.wi.ptr[j]         = static_cast<float>(std::sin(a1));
+                st.wr.ptr[s + j]     = static_cast<float>(std::cos(a2));
+                st.wi.ptr[s + j]     = static_cast<float>(std::sin(a2));
+                st.wr.ptr[2 * s + j] = static_cast<float>(std::cos(a3));
+                st.wi.ptr[2 * s + j] = static_cast<float>(std::sin(a3));
+            }
+            plan.stages.push_back(std::move(st));
+            s *= 4;
+            rem /= 4;
+        }
+        if (rem == 2) {
+            StageTwiddles st;
+            st.s = s;
+            st.radix = 2;
+            st.wr.resize(static_cast<size_t>(s));
+            st.wi.resize(static_cast<size_t>(s));
+            const double base_ang = -kTwoPi / static_cast<double>(2 * s);
+            for (int j = 0; j < s; ++j) {
+                double a1 = base_ang * static_cast<double>(j);
+                st.wr.ptr[j] = static_cast<float>(std::cos(a1));
+                st.wi.ptr[j] = static_cast<float>(std::sin(a1));
+            }
+            plan.stages.push_back(std::move(st));
+        }
+    }
+
+    auto transpose_8x8 = [](__m256& r0, __m256& r1, __m256& r2, __m256& r3,
+                            __m256& r4, __m256& r5, __m256& r6, __m256& r7) {
+        __m256 t0 = _mm256_unpacklo_ps(r0, r1);
+        __m256 t1 = _mm256_unpackhi_ps(r0, r1);
+        __m256 t2 = _mm256_unpacklo_ps(r2, r3);
+        __m256 t3 = _mm256_unpackhi_ps(r2, r3);
+        __m256 t4 = _mm256_unpacklo_ps(r4, r5);
+        __m256 t5 = _mm256_unpackhi_ps(r4, r5);
+        __m256 t6 = _mm256_unpacklo_ps(r6, r7);
+        __m256 t7 = _mm256_unpackhi_ps(r6, r7);
+
+        __m256 u0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+        __m256 u1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+        __m256 u2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+        __m256 u3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+        __m256 u4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+        __m256 u5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+        __m256 u6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+        __m256 u7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+
+        r0 = _mm256_permute2f128_ps(u0, u4, 0x20);
+        r1 = _mm256_permute2f128_ps(u1, u5, 0x20);
+        r2 = _mm256_permute2f128_ps(u2, u6, 0x20);
+        r3 = _mm256_permute2f128_ps(u3, u7, 0x20);
+        r4 = _mm256_permute2f128_ps(u0, u4, 0x31);
+        r5 = _mm256_permute2f128_ps(u1, u5, 0x31);
+        r6 = _mm256_permute2f128_ps(u2, u6, 0x31);
+        r7 = _mm256_permute2f128_ps(u3, u7, 0x31);
+    };
+
+    float* re_b = plan.re_b.ptr;
+    float* im_b = plan.im_b.ptr;
+    const int M = nfft / 8;
+
+    // Stage 1: Fused deinterleave + Radix-8 Stockham DIT
+    if (M >= 8) {
+        const __m256 c_sqrt2_2 = _mm256_set1_ps(0.7071067811865475244f);
+        for (int k = 0; k < M; k += 8) {
+            __m256 xr[8], xi[8];
+            for (int r = 0; r < 8; ++r) {
+                const float* src = cpx + 2 * (r * M + k);
+                __m256 v0 = _mm256_loadu_ps(src);
+                __m256 v1 = _mm256_loadu_ps(src + 8);
+                xr[r] = _mm256_castsi256_ps(_mm256_permute4x64_epi64(
+                    _mm256_castps_si256(_mm256_shuffle_ps(v0, v1, _MM_SHUFFLE(2, 0, 2, 0))), 0xD8));
+                xi[r] = _mm256_castsi256_ps(_mm256_permute4x64_epi64(
+                    _mm256_castps_si256(_mm256_shuffle_ps(v0, v1, _MM_SHUFFLE(3, 1, 3, 1))), 0xD8));
+            }
+
+            // 8-point forward DFT across xr[0..7], xi[0..7]
+            __m256 sr0 = _mm256_add_ps(xr[0], xr[4]), si0 = _mm256_add_ps(xi[0], xi[4]);
+            __m256 dr0 = _mm256_sub_ps(xr[0], xr[4]), di0 = _mm256_sub_ps(xi[0], xi[4]);
+            __m256 sr1 = _mm256_add_ps(xr[1], xr[5]), si1 = _mm256_add_ps(xi[1], xi[5]);
+            __m256 dr1 = _mm256_sub_ps(xr[1], xr[5]), di1 = _mm256_sub_ps(xi[1], xi[5]);
+            __m256 sr2 = _mm256_add_ps(xr[2], xr[6]), si2 = _mm256_add_ps(xi[2], xi[6]);
+            __m256 dr2 = _mm256_sub_ps(xr[2], xr[6]), di2 = _mm256_sub_ps(xi[2], xi[6]);
+            __m256 sr3 = _mm256_add_ps(xr[3], xr[7]), si3 = _mm256_add_ps(xi[3], xi[7]);
+            __m256 dr3 = _mm256_sub_ps(xr[3], xr[7]), di3 = _mm256_sub_ps(xi[3], xi[7]);
+
+            __m256 er0 = _mm256_add_ps(sr0, sr2), ei0 = _mm256_add_ps(si0, si2);
+            __m256 er1 = _mm256_sub_ps(sr0, sr2), ei1 = _mm256_sub_ps(si0, si2);
+            __m256 er2 = _mm256_add_ps(sr1, sr3), ei2 = _mm256_add_ps(si1, si3);
+            __m256 er3 = _mm256_sub_ps(sr1, sr3), ei3 = _mm256_sub_ps(si1, si3);
+
+            __m256 yr0 = _mm256_add_ps(er0, er2), yi0 = _mm256_add_ps(ei0, ei2);
+            __m256 yr4 = _mm256_sub_ps(er0, er2), yi4 = _mm256_sub_ps(ei0, ei2);
+            __m256 yr2 = _mm256_add_ps(er1, ei3), yi2 = _mm256_sub_ps(ei1, er3);
+            __m256 yr6 = _mm256_sub_ps(er1, ei3), yi6 = _mm256_add_ps(ei1, er3);
+
+            // Odd half twiddles: W_8^0 = 1, W_8^1 = c(1-i), W_8^2 = -i, W_8^3 = c(-1-i)
+            __m256 tr0 = dr0, ti0 = di0;
+            __m256 tr1 = _mm256_mul_ps(c_sqrt2_2, _mm256_add_ps(dr1, di1));
+            __m256 ti1 = _mm256_mul_ps(c_sqrt2_2, _mm256_sub_ps(di1, dr1));
+            __m256 tr2 = di2;
+            __m256 ti2 = _mm256_sub_ps(_mm256_setzero_ps(), dr2);
+            __m256 tr3 = _mm256_mul_ps(c_sqrt2_2, _mm256_sub_ps(di3, dr3));
+            __m256 ti3 = _mm256_sub_ps(_mm256_setzero_ps(), _mm256_mul_ps(c_sqrt2_2, _mm256_add_ps(dr3, di3)));
+
+            __m256 or0 = _mm256_add_ps(tr0, tr2), oi0 = _mm256_add_ps(ti0, ti2);
+            __m256 or1 = _mm256_sub_ps(tr0, tr2), oi1 = _mm256_sub_ps(ti0, ti2);
+            __m256 or2 = _mm256_add_ps(tr1, tr3), oi2 = _mm256_add_ps(ti1, ti3);
+            __m256 or3 = _mm256_sub_ps(tr1, tr3), oi3 = _mm256_sub_ps(ti1, ti3);
+
+            __m256 yr1 = _mm256_add_ps(or0, or2), yi1 = _mm256_add_ps(oi0, oi2);
+            __m256 yr5 = _mm256_sub_ps(or0, or2), yi5 = _mm256_sub_ps(oi0, oi2);
+            __m256 yr3 = _mm256_add_ps(or1, oi3), yi3 = _mm256_sub_ps(oi1, or3);
+            __m256 yr7 = _mm256_sub_ps(or1, oi3), yi7 = _mm256_add_ps(oi1, or3);
+
+            transpose_8x8(yr0, yr1, yr2, yr3, yr4, yr5, yr6, yr7);
+            transpose_8x8(yi0, yi1, yi2, yi3, yi4, yi5, yi6, yi7);
+
+            __m256* oy_r[8] = { &yr0, &yr1, &yr2, &yr3, &yr4, &yr5, &yr6, &yr7 };
+            __m256* oy_i[8] = { &yi0, &yi1, &yi2, &yi3, &yi4, &yi5, &yi6, &yi7 };
+            for (int m = 0; m < 8; ++m) {
+                _mm256_store_ps(re_b + 8 * (k + m), *oy_r[m]);
+                _mm256_store_ps(im_b + 8 * (k + m), *oy_i[m]);
+            }
+        }
+    } else {
+        constexpr float kSqrt2_2 = 0.7071067811865475244f;
+        for (int k = 0; k < M; ++k) {
+            float xr[8], xi[8];
+            for (int r = 0; r < 8; ++r) {
+                xr[r] = cpx[2 * (r * M + k)];
+                xi[r] = cpx[2 * (r * M + k) + 1];
+            }
+            float sr0 = xr[0] + xr[4], si0 = xi[0] + xi[4];
+            float dr0 = xr[0] - xr[4], di0 = xi[0] - xi[4];
+            float sr1 = xr[1] + xr[5], si1 = xi[1] + xi[5];
+            float dr1 = xr[1] - xr[5], di1 = xi[1] - xi[5];
+            float sr2 = xr[2] + xr[6], si2 = xi[2] + xi[6];
+            float dr2 = xr[2] - xr[6], di2 = xi[2] - xi[6];
+            float sr3 = xr[3] + xr[7], si3 = xi[3] + xi[7];
+            float dr3 = xr[3] - xr[7], di3 = xi[3] - xi[7];
+
+            float er0 = sr0 + sr2, ei0 = si0 + si2;
+            float er1 = sr0 - sr2, ei1 = si0 - si2;
+            float er2 = sr1 + sr3, ei2 = si1 + si3;
+            float er3 = sr1 - sr3, ei3 = si1 - si3;
+
+            float* ob_r = re_b + 8 * k;
+            float* ob_i = im_b + 8 * k;
+            ob_r[0] = er0 + er2; ob_i[0] = ei0 + ei2;
+            ob_r[4] = er0 - er2; ob_i[4] = ei0 - ei2;
+            ob_r[2] = er1 + ei3; ob_i[2] = ei1 - er3;
+            ob_r[6] = er1 - ei3; ob_i[6] = ei1 + er3;
+
+            float tr0 = dr0, ti0 = di0;
+            float tr1 = kSqrt2_2 * (dr1 + di1), ti1 = kSqrt2_2 * (di1 - dr1);
+            float tr2 = di2, ti2 = -dr2;
+            float tr3 = kSqrt2_2 * (di3 - dr3), ti3 = -kSqrt2_2 * (dr3 + di3);
+
+            float or0 = tr0 + tr2, oi0 = ti0 + ti2;
+            float or1 = tr0 - tr2, oi1 = ti0 - ti2;
+            float or2 = tr1 + tr3, oi2 = ti1 + ti3;
+            float or3 = tr1 - tr3, oi3 = ti1 - ti3;
+
+            ob_r[1] = or0 + or2; ob_i[1] = oi0 + oi2;
+            ob_r[5] = or0 - or2; ob_i[5] = oi0 - oi2;
+            ob_r[3] = or1 + oi3; ob_i[3] = oi1 - or3;
+            ob_r[7] = or1 - oi3; ob_i[7] = oi1 + or3;
+        }
+    }
+
+    float* cur_re = re_b;
+    float* cur_im = im_b;
+    float* nxt_re = plan.re_a.ptr;
+    float* nxt_im = plan.im_a.ptr;
+
+    const int q1 = nfft / 4;
+    const int q2 = nfft / 2;
+    const int q3 = 3 * q1;
+
+    for (const auto& st : plan.stages) {
+        const int s = st.s;
+        if (st.radix == 4) {
+            const int rem = nfft / (4 * s);
+            const float* wr1_base = st.wr.ptr;
+            const float* wi1_base = st.wi.ptr;
+            const float* wr2_base = wr1_base + s;
+            const float* wi2_base = wi1_base + s;
+            const float* wr3_base = wr2_base + s;
+            const float* wi3_base = wi2_base + s;
+
+            for (int k = 0; k < rem; ++k) {
+                const int in_off = k * s;
+                const int out_off = k * (4 * s);
+                for (int j = 0; j < s; j += 8) {
+                    __m256 ar = _mm256_load_ps(cur_re + in_off + j);
+                    __m256 ai = _mm256_load_ps(cur_im + in_off + j);
+
+                    __m256 br_raw = _mm256_load_ps(cur_re + in_off + q1 + j);
+                    __m256 bi_raw = _mm256_load_ps(cur_im + in_off + q1 + j);
+                    __m256 cr_raw = _mm256_load_ps(cur_re + in_off + q2 + j);
+                    __m256 ci_raw = _mm256_load_ps(cur_im + in_off + q2 + j);
+                    __m256 dr_raw = _mm256_load_ps(cur_re + in_off + q3 + j);
+                    __m256 di_raw = _mm256_load_ps(cur_im + in_off + q3 + j);
+
+                    __m256 wr1 = _mm256_load_ps(wr1_base + j), wi1 = _mm256_load_ps(wi1_base + j);
+                    __m256 wr2 = _mm256_load_ps(wr2_base + j), wi2 = _mm256_load_ps(wi2_base + j);
+                    __m256 wr3 = _mm256_load_ps(wr3_base + j), wi3 = _mm256_load_ps(wi3_base + j);
+
+#if SIMD_HAS_FMA
+                    __m256 br = _mm256_fmsub_ps(br_raw, wr1, _mm256_mul_ps(bi_raw, wi1));
+                    __m256 bi = _mm256_fmadd_ps(br_raw, wi1, _mm256_mul_ps(bi_raw, wr1));
+                    __m256 cr = _mm256_fmsub_ps(cr_raw, wr2, _mm256_mul_ps(ci_raw, wi2));
+                    __m256 ci = _mm256_fmadd_ps(cr_raw, wi2, _mm256_mul_ps(ci_raw, wr2));
+                    __m256 dr = _mm256_fmsub_ps(dr_raw, wr3, _mm256_mul_ps(di_raw, wi3));
+                    __m256 di = _mm256_fmadd_ps(dr_raw, wi3, _mm256_mul_ps(di_raw, wr3));
+#else
+                    __m256 br = _mm256_sub_ps(_mm256_mul_ps(br_raw, wr1), _mm256_mul_ps(bi_raw, wi1));
+                    __m256 bi = _mm256_add_ps(_mm256_mul_ps(br_raw, wi1), _mm256_mul_ps(bi_raw, wr1));
+                    __m256 cr = _mm256_sub_ps(_mm256_mul_ps(cr_raw, wr2), _mm256_mul_ps(ci_raw, wi2));
+                    __m256 ci = _mm256_add_ps(_mm256_mul_ps(cr_raw, wi2), _mm256_mul_ps(ci_raw, wr2));
+                    __m256 dr = _mm256_sub_ps(_mm256_mul_ps(dr_raw, wr3), _mm256_mul_ps(di_raw, wi3));
+                    __m256 di = _mm256_add_ps(_mm256_mul_ps(dr_raw, wi3), _mm256_mul_ps(di_raw, wr3));
+#endif
+
+                    __m256 t0r = _mm256_add_ps(ar, cr), t0i = _mm256_add_ps(ai, ci);
+                    __m256 t1r = _mm256_sub_ps(ar, cr), t1i = _mm256_sub_ps(ai, ci);
+                    __m256 t2r = _mm256_add_ps(br, dr), t2i = _mm256_add_ps(bi, di);
+                    __m256 t3r = _mm256_sub_ps(br, dr), t3i = _mm256_sub_ps(bi, di);
+
+                    _mm256_store_ps(nxt_re + out_off + j,         _mm256_add_ps(t0r, t2r));
+                    _mm256_store_ps(nxt_im + out_off + j,         _mm256_add_ps(t0i, t2i));
+                    _mm256_store_ps(nxt_re + out_off + s + j,     _mm256_add_ps(t1r, t3i));
+                    _mm256_store_ps(nxt_im + out_off + s + j,     _mm256_sub_ps(t1i, t3r));
+                    _mm256_store_ps(nxt_re + out_off + 2 * s + j, _mm256_sub_ps(t0r, t2r));
+                    _mm256_store_ps(nxt_im + out_off + 2 * s + j, _mm256_sub_ps(t0i, t2i));
+                    _mm256_store_ps(nxt_re + out_off + 3 * s + j, _mm256_sub_ps(t1r, t3i));
+                    _mm256_store_ps(nxt_im + out_off + 3 * s + j, _mm256_add_ps(t1i, t3r));
+                }
+            }
+        } else {
+            // Trailing Radix-2 stage (s == nfft / 2)
+            const float* wr_base = st.wr.ptr;
+            const float* wi_base = st.wi.ptr;
+            for (int j = 0; j < s; j += 8) {
+                __m256 ar = _mm256_load_ps(cur_re + j);
+                __m256 ai = _mm256_load_ps(cur_im + j);
+                __m256 br_raw = _mm256_load_ps(cur_re + s + j);
+                __m256 bi_raw = _mm256_load_ps(cur_im + s + j);
+                __m256 wr = _mm256_load_ps(wr_base + j);
+                __m256 wi = _mm256_load_ps(wi_base + j);
+#if SIMD_HAS_FMA
+                __m256 br = _mm256_fmsub_ps(br_raw, wr, _mm256_mul_ps(bi_raw, wi));
+                __m256 bi = _mm256_fmadd_ps(br_raw, wi, _mm256_mul_ps(bi_raw, wr));
+#else
+                __m256 br = _mm256_sub_ps(_mm256_mul_ps(br_raw, wr), _mm256_mul_ps(bi_raw, wi));
+                __m256 bi = _mm256_add_ps(_mm256_mul_ps(br_raw, wi), _mm256_mul_ps(bi_raw, wr));
+#endif
+                _mm256_store_ps(nxt_re + j,     _mm256_add_ps(ar, br));
+                _mm256_store_ps(nxt_im + j,     _mm256_add_ps(ai, bi));
+                _mm256_store_ps(nxt_re + s + j, _mm256_sub_ps(ar, br));
+                _mm256_store_ps(nxt_im + s + j, _mm256_sub_ps(ai, bi));
+            }
+        }
+        std::swap(cur_re, nxt_re);
+        std::swap(cur_im, nxt_im);
+    }
+
+    // Re-interleave into interleaved complex buffer
+    for (int i = 0; i + 8 <= nfft; i += 8) {
+        __m256 vr = _mm256_load_ps(cur_re + i);
+        __m256 vi = _mm256_load_ps(cur_im + i);
+        __m256 lo = _mm256_unpacklo_ps(vr, vi);
+        __m256 hi = _mm256_unpackhi_ps(vr, vi);
+        _mm256_storeu_ps(cpx + 2 * i,     _mm256_permute2f128_ps(lo, hi, 0x20));
+        _mm256_storeu_ps(cpx + 2 * i + 8, _mm256_permute2f128_ps(lo, hi, 0x31));
+    }
+    return true;
+#else
+    (void)cpx;
+    (void)nfft;
+    return false;
+#endif
 }
 
 } // namespace SimdDsp
