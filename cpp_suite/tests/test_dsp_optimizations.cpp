@@ -286,8 +286,8 @@ static void test_streaming_fft_parity_and_sidecar_dedup() {
     fs::remove_all(tmp_dir);
 }
 
-static void test_committee2_dsp_kernels() {
-    std::cout << "[Test 6] Committee 2 AVX2 exp/FFT, Batcher median-15 & O(N log N) Filter...\n";
+static void test_simd_fft_and_rfi_kernels() {
+    std::cout << "[Test 6] AVX2 exp/FFT, Batcher median-15 & O(N log N) Filter...\n";
 
 #ifdef __AVX2__
     // 1. fast_exp_pd_avx2 precision & underflow handling
@@ -370,13 +370,15 @@ static void test_committee2_dsp_kernels() {
             }
             std::vector<double> ref_res(nfft), ref_valid;
             for (int i = 0; i < nfft; ++i) {
-                double win[15];
-                for (int k = -7; k <= 7; ++k) {
-                    int j = std::clamp(i + k, 0, nfft - 1);
-                    win[k + 7] = pwr[j];
-                }
-                std::nth_element(win, win + 7, win + 15);
-                ref_res[i] = pwr[i] - win[7];
+                double win[15] = {};
+                int lo = std::max(0, i - 7);
+                int hi = std::min(nfft - 1, i + 7);
+                int count = 0;
+                for (int j = lo; j <= hi; ++j) win[count++] = pwr[j];
+                int mid_w = count / 2;
+                std::nth_element(win, win + mid_w, win + count);
+                double med_w = (count % 2) ? win[mid_w] : 0.5 * (*std::max_element(win, win + mid_w) + win[mid_w]);
+                ref_res[i] = pwr[i] - med_w;
                 if (valid[i]) ref_valid.push_back(ref_res[i]);
             }
             auto med_fn = [](std::vector<double>& v) {
@@ -391,7 +393,7 @@ static void test_committee2_dsp_kernels() {
             std::vector<uint8_t> is_rfi(nfft, 0);
             std::vector<int> rfi_idx;
             for (int i = 0; i < nfft; ++i) {
-                if (valid[i] && ref_res[i] > ref_thr) {
+                if (valid[i] && (ref_res[i] - ref_med) > ref_thr) {
                     is_rfi[i] = 1;
                     rfi_idx.push_back(i);
                 }
@@ -405,15 +407,22 @@ static void test_committee2_dsp_kernels() {
                 }
                 ++k;
                 int l_idx = run_start - 1;
-                while (l_idx > 0 && is_rfi[l_idx]) --l_idx;
+                while (l_idx >= 0 && is_rfi[l_idx]) --l_idx;
                 int r_idx = run_end + 1;
-                while (r_idx < nfft - 1 && is_rfi[r_idx]) ++r_idx;
-                const double v_l = !is_rfi[l_idx] ? pwr[l_idx] : pwr[r_idx];
-                const double v_r = !is_rfi[r_idx] ? pwr[r_idx] : pwr[l_idx];
-                const int span = std::max(1, r_idx - l_idx);
-                for (int idx = run_start; idx <= run_end; ++idx) {
-                    const double t = static_cast<double>(idx - l_idx) / static_cast<double>(span);
-                    ref_out[idx] = v_l + t * (v_r - v_l);
+                while (r_idx < nfft && is_rfi[r_idx]) ++r_idx;
+                if (l_idx < 0 && r_idx >= nfft) continue;
+                const double v_l = (l_idx >= 0) ? pwr[l_idx] : pwr[r_idx];
+                const double v_r = (r_idx < nfft) ? pwr[r_idx] : pwr[l_idx];
+                if (l_idx < 0) {
+                    for (int idx = run_start; idx <= run_end; ++idx) ref_out[idx] = v_r;
+                } else if (r_idx >= nfft) {
+                    for (int idx = run_start; idx <= run_end; ++idx) ref_out[idx] = v_l;
+                } else {
+                    const int span = std::max(1, r_idx - l_idx);
+                    for (int idx = run_start; idx <= run_end; ++idx) {
+                        const double t = static_cast<double>(idx - l_idx) / static_cast<double>(span);
+                        ref_out[idx] = v_l + t * (v_r - v_l);
+                    }
                 }
             }
         }
@@ -424,6 +433,24 @@ static void test_committee2_dsp_kernels() {
         double max_diff = 0.0;
         for (int i = 0; i < nfft; ++i) max_diff = std::max(max_diff, std::abs(got_out[i] - ref_out[i]));
         TEST_ASSERT(max_diff < 1e-12, "RfiFilter Batcher median-15 output matches scalar reference identically");
+    }
+
+    // Boundary-index RFI spike test (idx=0 and idx=nfft-1 with edge_fraction=0.0) -> must not read OOB
+    {
+        constexpr int nfft = 64;
+        std::vector<double> pwr(nfft, 10.0), freqs(nfft);
+        for (int i = 0; i < nfft; ++i) {
+            freqs[i] = 1419.5 + 2.4 * static_cast<double>(i) / nfft;
+            pwr[i] += 0.01 * std::sin(0.5 * i);
+        }
+        pwr[0] = 500.0;
+        pwr[nfft - 1] = 500.0;
+        astro::AstroConfig cfg;
+        cfg.passband_edge_fraction = 0.0;
+        int cnt = 0;
+        auto out = astro::RFIFilter::mitigate(pwr, freqs, cfg, cnt);
+        TEST_ASSERT(cnt >= 2 && out[0] < 20.0 && out[nfft - 1] < 20.0,
+                    "RFIFilter replaces boundary index (0 and nfft-1) RFI safely without OOB read");
     }
 
     // 4. BaselineFitter Filter O(N log N) FFT Gaussian convolution boundary & accuracy check
@@ -511,6 +538,340 @@ static void test_dsp_pipeline_dbfs_and_instant_fft() {
                 "Smoothed PSD retains memory at prior +300 kHz bin while instant FFT drops");
 }
 
+static void test_math_accuracy_and_solvers() {
+    std::cout << "[Test 8] Math accuracy, noise unbiasedness, odd-NFFT shift & parametric recovery...\n";
+
+    // 1. fast_10log10_scalar & AVX2 log2 power-of-two boundary continuity (< 0.002 dB)
+    {
+        float max_err_db = 0.0f;
+        for (int exp2 = -36; exp2 <= 10; ++exp2) {
+            for (int sub = -3; sub <= 3; ++sub) {
+                float x = std::ldexp(1.0f + 0.0002f * static_cast<float>(sub), exp2);
+                if (x <= 0.0f) continue;
+                float approx = SimdDsp::fast_10log10_scalar(x);
+                float exact = 10.0f * std::log10(x);
+                max_err_db = std::max(max_err_db, std::abs(approx - exact));
+            }
+        }
+        TEST_ASSERT(max_err_db < 0.002f, "fast_10log10_scalar accurate & continuous across 2^k (< 0.002 dB)");
+    }
+
+    // 2. DspPipeline linear-power EMA unbiasedness (no -2.506 dB Rayleigh log-averaging bias)
+    {
+        constexpr int N = 1024;
+        DspPipeline dsp_raw, dsp_smooth;
+        dsp_raw.set_fft_size(N);
+        dsp_raw.set_averaging(1.0f);   // No EMA smoothing (gamma=1): single block noise floor
+        dsp_smooth.set_fft_size(N);
+        dsp_smooth.set_averaging(0.05f); // Heavy EMA smoothing: in linear power, E[P_smooth] == E[P_raw]
+
+        // Deterministic PRNG white Gaussian-like I/Q noise (box-muller / LCG)
+        uint32_t rng = 0x12345678u;
+        auto next_u01 = [&]() {
+            rng = rng * 1664525u + 1013904223u;
+            return (static_cast<double>(rng >> 8) + 0.5) / 16777216.0;
+        };
+        std::vector<uint8_t> iq_noise(2 * N * 64);
+        for (size_t i = 0; i < N * 64; ++i) {
+            double u1 = std::max(1e-7, next_u01());
+            double u2 = next_u01();
+            double r = 24.0 * std::sqrt(-2.0 * std::log(u1));
+            double a = 6.28318530717958647692 * u2;
+            int iv = static_cast<int>(std::lround(128.0 + r * std::cos(a)));
+            int qv = static_cast<int>(std::lround(128.0 + r * std::sin(a)));
+            iq_noise[2 * i] = static_cast<uint8_t>(std::clamp(iv, 1, 254));
+            iq_noise[2 * i + 1] = static_cast<uint8_t>(std::clamp(qv, 1, 254));
+        }
+
+        // Accumulate mean linear power of raw single-block PSD vs heavily EMA-smoothed PSD
+        double sum_lin_raw = 0.0;
+        int cnt_raw = 0;
+        std::vector<float> spec;
+        float pk_f = 0.0f, pk_d = 0.0f;
+        for (int b = 0; b < 64; ++b) {
+            const uint8_t* blk = iq_noise.data() + static_cast<size_t>(b) * 2 * N;
+            dsp_raw.feed_samples(blk, 2 * N);
+            dsp_smooth.feed_samples(blk, 2 * N);
+            if (dsp_raw.get_power_spectrum(spec, pk_f, pk_d, 1420500000ULL, 2400000U)) {
+                for (float dbv : spec) sum_lin_raw += std::pow(10.0, static_cast<double>(dbv) * 0.1);
+                cnt_raw += static_cast<int>(spec.size());
+            }
+            dsp_smooth.get_power_spectrum(spec, pk_f, pk_d, 1420500000ULL, 2400000U);
+        }
+        double mean_lin_raw_db = 10.0 * std::log10(sum_lin_raw / std::max(1, cnt_raw));
+        double sum_lin_smooth = 0.0;
+        for (float dbv : spec) sum_lin_smooth += std::pow(10.0, static_cast<double>(dbv) * 0.1);
+        double mean_lin_smooth_db = 10.0 * std::log10(sum_lin_smooth / std::max<size_t>(1, spec.size()));
+        TEST_ASSERT(std::abs(mean_lin_smooth_db - mean_lin_raw_db) < 0.35,
+                    "DspPipeline linear-power EMA preserves unbiased mean noise power (no -2.51 dB log bias)");
+    }
+
+    // 3. Odd-NFFT StreamingProcessor FFT shift DC-bin placement (DC must map to nfft / 2 without OOB)
+    {
+        fs::path odd_tmp = fs::path("tests") / "test_odd_nfft.cs16";
+        constexpr int odd_nfft = 1023;
+        constexpr size_t total_cpx = odd_nfft * 8;
+        {
+            std::ofstream ofs(odd_tmp, std::ios::binary);
+            std::vector<int16_t> iq(2 * total_cpx);
+            for (size_t i = 0; i < total_cpx; ++i) {
+                iq[2 * i] = 10000; // Pure DC offset (+0 Hz)
+                iq[2 * i + 1] = 0;
+            }
+            ofs.write(reinterpret_cast<const char*>(iq.data()), static_cast<std::streamsize>(iq.size() * sizeof(int16_t)));
+        }
+        astro::AstroConfig cfg;
+        cfg.center_freq_hz = 1420.5e6;
+        cfg.sample_rate_hz = 2.4e6;
+        cfg.fft_size = odd_nfft;
+        cfg.verbose = false;
+        astro::StreamingProcessor proc(odd_tmp.string(), cfg);
+        auto res = proc.process();
+        size_t max_bin = 0;
+        for (size_t i = 1; i < res.averaged_power.size(); ++i) {
+            if (res.averaged_power[i] > res.averaged_power[max_bin]) max_bin = i;
+        }
+        TEST_ASSERT(res.averaged_power.size() == static_cast<size_t>(odd_nfft) &&
+                    max_bin == static_cast<size_t>(odd_nfft / 2),
+                    "Odd-NFFT StreamingProcessor places DC accurately at nfft/2 without OOB");
+        std::error_code ec;
+        fs::remove(odd_tmp, ec);
+    }
+
+    // 4. Zero-mean pure noise baseline/metrics unbiasedness (no positive Jensen bias)
+    {
+        constexpr int n = 1024;
+        std::vector<double> freq_mhz(n), vel_kms(n), cal_k(n), cal_db(n);
+        uint32_t rng = 0x9E3779B9u;
+        auto next_u01 = [&]() {
+            rng = rng * 1664525u + 1013904223u;
+            return (static_cast<double>(rng >> 8) + 0.5) / 16777216.0;
+        };
+        astro::AstroConfig cfg;
+        cfg.center_freq_hz = 1420.5e6;
+        cfg.sample_rate_hz = 2.4e6;
+        cfg.system_temp_k = 100.0;
+        for (int i = 0; i < n; ++i) {
+            double f_hz = (cfg.center_freq_hz - 0.5 * cfg.sample_rate_hz) +
+                          cfg.sample_rate_hz * static_cast<double>(i) / static_cast<double>(n);
+            freq_mhz[i] = f_hz * 1e-6;
+            vel_kms[i] = astro::SPEED_OF_LIGHT_KMS * (astro::HYDROGEN_REST_FREQ_MHZ - freq_mhz[i]) / astro::HYDROGEN_REST_FREQ_MHZ;
+            double u1 = std::max(1e-7, next_u01());
+            double u2 = next_u01();
+            double z = std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
+            cal_k[i] = 1.0 * z + 0.2; // Add small 0.2 K offset for refine_local to remove
+            cal_db[i] = 10.0 * std::log10(std::max(1e-6, 1.0 + cal_k[i] / cfg.system_temp_k));
+        }
+        double slope = 0.0, intercept = 0.0;
+        astro::BaselineFitter::refine_local(vel_kms, cal_k, cal_db, cfg, slope, intercept);
+        double mean_hi_k = 0.0;
+        int cnt_hi = 0;
+        for (int i = 0; i < n; ++i) {
+            if (std::abs(vel_kms[i]) <= 60.0) { mean_hi_k += cal_k[i]; ++cnt_hi; }
+        }
+        mean_hi_k /= std::max(1, cnt_hi);
+        auto m = astro::Astrophysics::calculate_metrics(freq_mhz, vel_kms, cal_k, cal_db, cfg);
+        TEST_ASSERT(std::abs(mean_hi_k) < 0.25, "refine_local linear-space subtraction is unbiased on pure noise");
+        TEST_ASSERT(std::abs(m.integrated_flux_k_kms) < 15.0 && m.column_density_cm2 >= 0.0,
+                    "Pure noise metrics are zero-mean without positive clamping bias");
+    }
+
+    // 5. Parametric recovery for DoubleGaussian, VoigtProfile, GaussHermite (h3, h4>0, h4<0), SpectralMoments
+    {
+        constexpr int n = 401;
+        std::vector<double> vel(n), y(n);
+        std::vector<uint8_t> win(n, 0);
+        for (int i = 0; i < n; ++i) {
+            vel[i] = -100.0 + 0.5 * static_cast<double>(i);
+            if (std::abs(vel[i]) <= 80.0) win[i] = 1;
+        }
+
+        // 5a. DoubleGaussian: two distinct components at -22 km/s (12 K, sig=5) and +16 km/s (8 K, sig=6)
+        for (int i = 0; i < n; ++i) {
+            double c1 = 12.0 * std::exp(-0.5 * std::pow((vel[i] + 22.0) / 5.0, 2));
+            double c2 =  8.0 * std::exp(-0.5 * std::pow((vel[i] - 16.0) / 6.0, 2));
+            y[i] = c1 + c2;
+        }
+        auto dg = astro::Astrophysics::fit_line_profile(vel, y, win, astro::LineAnalysisMethod::DoubleGaussian);
+        TEST_ASSERT(dg.success && dg.has_secondary, "DoubleGaussian converged and identified two arms");
+        double v_lo = std::min(dg.v_center_kms, dg.v2_center_kms);
+        double v_hi = std::max(dg.v_center_kms, dg.v2_center_kms);
+        TEST_ASSERT(std::abs(v_lo + 22.0) < 1.5 && std::abs(v_hi - 16.0) < 1.5 && dg.rmse_k < 0.2,
+                    "DoubleGaussian recovered both arm velocities accurately");
+
+        // 5b. VoigtProfile: eta = 0.55, sigma_g = 4.0, matched HWHM gamma_l = sigma_g * sqrt(2*ln(2))
+        const double eta_true = 0.55;
+        const double gamma_true = 4.0 * std::sqrt(2.0 * std::log(2.0));
+        for (int i = 0; i < n; ++i) {
+            double dv = vel[i] - 5.0;
+            double g = std::exp(-0.5 * std::pow(dv / 4.0, 2));
+            double l = 1.0 / (1.0 + std::pow(dv / gamma_true, 2));
+            y[i] = 18.0 * ((1.0 - eta_true) * g + eta_true * l);
+        }
+        auto vp = astro::Astrophysics::fit_line_profile(vel, y, win, astro::LineAnalysisMethod::VoigtProfile);
+        TEST_ASSERT(vp.success && std::abs(vp.voigt_eta - eta_true) < 0.15 && vp.rmse_k < 0.2,
+                    "VoigtProfile recovered mixing eta and profile accurately");
+
+        // 5c. GaussHermite: test h3 asymmetry + h4 > 0 (narrower than Gaussian FWHM) & h4 < 0 (wider)
+        auto eval_gh = [](double v, double A, double v0, double sig, double h3, double h4) {
+            double w = (v - v0) / sig;
+            double H3 = (2.0 * std::sqrt(2.0) * w * w * w - 3.0 * std::sqrt(2.0) * w) / std::sqrt(6.0);
+            double w2 = w * w;
+            double H4 = (4.0 * w2 * w2 - 12.0 * w2 + 3.0) / std::sqrt(24.0);
+            return A * std::exp(-0.5 * w2) * (1.0 + h3 * H3 + h4 * H4);
+        };
+        for (int i = 0; i < n; ++i) y[i] = eval_gh(vel[i], 20.0, 4.0, 8.0, 0.12, 0.15);
+        auto gh_pos = astro::Astrophysics::fit_line_profile(vel, y, win, astro::LineAnalysisMethod::GaussHermite);
+        const double gauss_fwhm_ref = 2.354820045 * gh_pos.sigma_kms;
+        TEST_ASSERT(gh_pos.success && std::abs(gh_pos.gh_h3 - 0.12) < 0.05 && std::abs(gh_pos.gh_h4 - 0.15) < 0.05,
+                    "GaussHermite recovered h3 > 0 and h4 > 0 accurately");
+        TEST_ASSERT(gh_pos.fwhm_kms < gauss_fwhm_ref,
+                    "GaussHermite h4 > 0 produces strictly narrower true numerical FWHM than 2.355*sigma");
+
+        for (int i = 0; i < n; ++i) y[i] = eval_gh(vel[i], 20.0, 4.0, 8.0, -0.05, -0.14);
+        auto gh_neg = astro::Astrophysics::fit_line_profile(vel, y, win, astro::LineAnalysisMethod::GaussHermite);
+        const double gauss_fwhm_neg_ref = 2.354820045 * gh_neg.sigma_kms;
+        TEST_ASSERT(gh_neg.success && std::abs(gh_neg.gh_h4 + 0.14) < 0.05 && gh_neg.fwhm_kms > gauss_fwhm_neg_ref,
+                    "GaussHermite h4 < 0 produces strictly wider true numerical FWHM than 2.355*sigma");
+
+        // 5d. SpectralMoments: exact known Gaussian A=16, v0=9.5, sigma=6.0 -> M0 = 16*6*sqrt(2*pi) ~ 240.63
+        for (int i = 0; i < n; ++i) y[i] = 16.0 * std::exp(-0.5 * std::pow((vel[i] - 9.5) / 6.0, 2));
+        auto sm = astro::Astrophysics::fit_line_profile(vel, y, win, astro::LineAnalysisMethod::SpectralMoments);
+        double expected_m0 = 16.0 * 6.0 * std::sqrt(2.0 * 3.14159265358979323846);
+        TEST_ASSERT(sm.success && std::abs(sm.moment0_k_kms - expected_m0) < 3.0 &&
+                    std::abs(sm.moment1_kms - 9.5) < 0.3 &&
+                    std::abs(sm.moment2_sigma_kms - 6.0) < 0.4,
+                    "SpectralMoments recovered exact analytical M0, M1, and sqrt(M2)");
+
+        // 5e. TripleGaussian: 3 distinct Galactic spiral arms at -30, +2, and +34 km/s
+        for (int i = 0; i < n; ++i) {
+            double c1 = 14.0 * std::exp(-0.5 * std::pow((vel[i] + 30.0) / 4.5, 2));
+            double c2 = 10.0 * std::exp(-0.5 * std::pow((vel[i] -  2.0) / 5.0, 2));
+            double c3 =  6.5 * std::exp(-0.5 * std::pow((vel[i] - 34.0) / 4.5, 2));
+            y[i] = c1 + c2 + c3;
+        }
+        auto tg = astro::Astrophysics::fit_line_profile(vel, y, win, astro::LineAnalysisMethod::TripleGaussian);
+        TEST_ASSERT(tg.success && tg.has_secondary && tg.has_tertiary,
+                    "TripleGaussian converged and identified all three kinematic arms");
+        std::vector<double> arm_v = { tg.v_center_kms, tg.v2_center_kms, tg.v3_center_kms };
+        std::sort(arm_v.begin(), arm_v.end());
+        TEST_ASSERT(std::abs(arm_v[0] + 30.0) < 1.5 &&
+                    std::abs(arm_v[1] -  2.0) < 1.5 &&
+                    std::abs(arm_v[2] - 34.0) < 1.5 &&
+                    tg.rmse_k < 0.25,
+                    "TripleGaussian recovered all three spiral arm velocities and amplitudes accurately");
+
+        // 5f. BusyFunction (Westmeier et al. 2014): double-horned profile with central trough
+        for (int i = 0; i < n; ++i) {
+            double dv = vel[i] - 5.0;
+            double e1 = std::erf(0.35 * (22.0 + dv)) + 1.0;
+            double e2 = std::erf(0.35 * (22.0 - dv)) + 1.0;
+            y[i] = 0.25 * 10.0 * e1 * e2 * (1.0 + 0.0025 * dv * dv);
+        }
+        auto bf = astro::Astrophysics::fit_line_profile(vel, y, win, astro::LineAnalysisMethod::BusyFunction);
+        TEST_ASSERT(bf.success &&
+                    std::abs(bf.v_center_kms - 5.0) < 1.0 &&
+                    std::abs(bf.busy_half_width_kms - 22.0) < 2.0 &&
+                    bf.busy_trough_c > 0.001 &&
+                    bf.rmse_k < 0.25,
+                    "BusyFunction recovered double-horned half-width, centroid, and trough curvature");
+    }
+
+    // 6. SavitzkyGolay & StandingWave Continuum Baselines + Derived 21-cm Physical Metrics
+    {
+        constexpr int n = 2048;
+        astro::AstroConfig cfg;
+        cfg.center_freq_hz = 1420.405751768e6;
+        cfg.sample_rate_hz = 2.4e6;
+        cfg.fft_size = n;
+        cfg.system_temp_k = 100.0;
+        cfg.spin_temp_k = 150.0;
+
+        std::vector<double> freqs_hz(n), freqs_mhz(n), true_base_db(n), raw_power(n);
+        for (int i = 0; i < n; ++i) {
+            freqs_hz[i] = (cfg.center_freq_hz - 0.5 * cfg.sample_rate_hz) +
+                          cfg.sample_rate_hz * static_cast<double>(i) / static_cast<double>(n);
+            freqs_mhz[i] = freqs_hz[i] * 1e-6;
+            double x = (static_cast<double>(i) - 0.5 * n) / (0.5 * n);
+            // Smooth quadratic passband + sinusoidal coaxial standing wave (14 cycles across passband)
+            double ripple_db = 0.35 * std::cos(2.0 * 3.14159265358979323846 * 14.0 * i / n + 0.4)
+                             + 0.12 * std::sin(2.0 * 3.14159265358979323846 * 23.0 * i / n - 0.7);
+            true_base_db[i] = -20.0 - 0.8 * x * x + 0.15 * x + ripple_db;
+        }
+        auto vel_kms = astro::Astrophysics::compute_doppler_velocity(freqs_hz);
+        for (int i = 0; i < n; ++i) {
+            double hi_temp_k = 30.0 * std::exp(-0.5 * std::pow((vel_kms[i] + 10.0) / 8.0, 2));
+            double base_lin = std::pow(10.0, true_base_db[i] * 0.1);
+            raw_power[i] = base_lin * (1.0 + hi_temp_k / cfg.system_temp_k);
+        }
+
+        // Test StandingWave baseline recovery across the protected H I window
+        cfg.baseline_method = astro::BaselineMethod::StandingWave;
+        auto sw_res = astro::BaselineFitter::fit(raw_power, freqs_mhz, cfg);
+        double sw_hi_rmse_db = 0.0;
+        int hi_cnt = 0;
+        for (int i = 0; i < n; ++i) {
+            if (std::abs(freqs_mhz[i] - astro::HYDROGEN_REST_FREQ_MHZ) <= 0.19) {
+                double err = sw_res.baseline_db[i] - true_base_db[i];
+                sw_hi_rmse_db += err * err;
+                ++hi_cnt;
+            }
+        }
+        sw_hi_rmse_db = std::sqrt(sw_hi_rmse_db / std::max(1, hi_cnt));
+        TEST_ASSERT(sw_hi_rmse_db < 0.08,
+                    "StandingWave baseline models 2-tone sinusoidal coax ripple across H I window (< 0.08 dB)");
+
+        // Test SavitzkyGolay baseline recovery on smooth quadratic continuum
+        std::vector<double> sg_true_db(n), sg_raw_power(n);
+        for (int i = 0; i < n; ++i) {
+            double x = (static_cast<double>(i) - 0.5 * n) / (0.5 * n);
+            sg_true_db[i] = -20.0 - 1.2 * x * x + 0.25 * x;
+            double hi_temp_k = 25.0 * std::exp(-0.5 * std::pow((vel_kms[i] - 5.0) / 7.0, 2));
+            double base_lin = std::pow(10.0, sg_true_db[i] * 0.1);
+            sg_raw_power[i] = base_lin * (1.0 + hi_temp_k / cfg.system_temp_k);
+        }
+        cfg.baseline_method = astro::BaselineMethod::SavitzkyGolay;
+        auto sg_res = astro::BaselineFitter::fit(sg_raw_power, freqs_mhz, cfg);
+        double sg_hi_rmse_db = 0.0;
+        for (int i = 0; i < n; ++i) {
+            if (std::abs(freqs_mhz[i] - astro::HYDROGEN_REST_FREQ_MHZ) <= 0.19) {
+                double err = sg_res.baseline_db[i] - sg_true_db[i];
+                sg_hi_rmse_db += err * err;
+            }
+        }
+        sg_hi_rmse_db = std::sqrt(sg_hi_rmse_db / std::max(1, hi_cnt));
+        TEST_ASSERT(sg_hi_rmse_db < 0.05,
+                    "SavitzkyGolay degree-2 baseline preserves quadratic continuum across H I window (< 0.05 dB)");
+
+        // Test derived 21-cm physical & kinematic metrics on exact synthetic profile (A=30 K, sigma=8 km/s, Ts=150 K)
+        std::vector<double> cal_k(n), cal_db(n);
+        for (int i = 0; i < n; ++i) {
+            cal_k[i] = 30.0 * std::exp(-0.5 * std::pow((vel_kms[i] + 10.0) / 8.0, 2));
+            cal_db[i] = 10.0 * std::log10(1.0 + cal_k[i] / cfg.system_temp_k);
+        }
+        cfg.line_method = astro::LineAnalysisMethod::GaussianLS;
+        auto m = astro::Astrophysics::calculate_metrics(freqs_mhz, vel_kms, cal_k, cal_db, cfg);
+        const double fwhm_true = astro::GAUSSIAN_SIGMA_TO_FWHM * 8.0; // 18.83856 km/s
+        const double tk_expected = astro::HI_THERMAL_TEMP_FACTOR_K * fwhm_true * fwhm_true; // ~7756.3 K
+        const double tau_expected = -std::log(1.0 - 30.0 / 150.0); // 0.22314355
+        const double weq_expected = std::sqrt(2.0 * 3.14159265358979323846) * 8.0; // 20.053 km/s
+        const double w20_w50_ratio = m.w20_kms / std::max(1e-6, m.w50_kms);
+
+        TEST_ASSERT(std::abs(m.doppler_temp_max_k - tk_expected) / tk_expected < 0.015,
+                    "Derived max kinetic temperature T_k,max matches theoretical 21.855 * FWHM^2");
+        TEST_ASSERT(std::abs(m.peak_optical_depth - tau_expected) < 0.002,
+                    "Derived peak optical depth tau_max matches -ln(1 - T_peak / T_spin)");
+        TEST_ASSERT(m.column_density_thick_cm2 > m.column_density_cm2 * 1.07 &&
+                    m.column_density_thick_cm2 < m.column_density_cm2 * 1.10,
+                    "Optically-thick column density N_HI,thick accurately corrects for tau=0.223 self-absorption");
+        TEST_ASSERT(std::abs(m.equivalent_width_kms - weq_expected) < 0.3,
+                    "Equivalent width W_eq matches analytical sqrt(2*pi)*sigma");
+        TEST_ASSERT(std::abs(m.w50_kms - fwhm_true) < 0.25 &&
+                    std::abs(w20_w50_ratio - std::sqrt(std::log(5.0) / std::log(2.0))) < 0.02,
+                    "Velocity widths W50 and W20 match theoretical Gaussian crossing ratio sqrt(ln 5 / ln 2)");
+    }
+}
+
 int main() {
     std::cout << "======================================================================\n";
     std::cout << "  RUNNING TEST SUITE: test_dsp_optimizations\n";
@@ -521,8 +882,9 @@ int main() {
     test_waterfall_history_resize();
     test_scientific_pipeline_solvers();
     test_streaming_fft_parity_and_sidecar_dedup();
-    test_committee2_dsp_kernels();
+    test_simd_fft_and_rfi_kernels();
     test_dsp_pipeline_dbfs_and_instant_fft();
+    test_math_accuracy_and_solvers();
 
     std::cout << "----------------------------------------------------------------------\n";
     std::cout << "RESULTS: " << g_tests_passed << " / " << g_tests_run << " assertions PASSED.\n";

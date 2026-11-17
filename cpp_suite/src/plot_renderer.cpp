@@ -779,10 +779,11 @@ bool PlotRenderer::render_calibrated_spectrum(
                           PixelColor(0, 242, 254), 2);
     }
 
-    // Line profile fit overlay + secondary component curves (if DoubleGaussian)
+    // Line profile fit overlay + multi-component curves (DoubleGaussian / TripleGaussian)
     if (metrics.gauss_fit.success && !metrics.gauss_fit.fitted_curve.empty()) {
-        if (metrics.gauss_fit.method == LineAnalysisMethod::DoubleGaussian && metrics.gauss_fit.has_secondary &&
-            metrics.gauss_fit.component1_curve.size() == n_pts && metrics.gauss_fit.component2_curve.size() == n_pts) {
+        if (metrics.gauss_fit.has_secondary &&
+            metrics.gauss_fit.component1_curve.size() == n_pts &&
+            metrics.gauss_fit.component2_curve.size() == n_pts) {
             for (size_t i = 1; i < n_pts; ++i) {
                 double v_a = vel_kms[i - 1], v_b = vel_kms[i];
                 if (v_b < v_min || v_a > v_max) continue;
@@ -794,6 +795,12 @@ bool PlotRenderer::render_calibrated_spectrum(
                                   map_x(v_a), map_y(metrics.gauss_fit.component2_curve[i - 1]),
                                   map_x(v_b), map_y(metrics.gauss_fit.component2_curve[i]),
                                   PixelColor(167, 139, 250), 1);
+                if (metrics.gauss_fit.has_tertiary && metrics.gauss_fit.component3_curve.size() == n_pts) {
+                    draw_clipped_line(canvas, left, top, right, bottom,
+                                      map_x(v_a), map_y(metrics.gauss_fit.component3_curve[i - 1]),
+                                      map_x(v_b), map_y(metrics.gauss_fit.component3_curve[i]),
+                                      PixelColor(16, 185, 129), 1);
+                }
             }
         }
         for (size_t i = 1; i < n_pts; ++i) {
@@ -804,6 +811,13 @@ bool PlotRenderer::render_calibrated_spectrum(
                               map_x(v_a), map_y(metrics.gauss_fit.fitted_curve[i - 1]),
                               map_x(v_b), map_y(metrics.gauss_fit.fitted_curve[i]),
                               PixelColor(255, 118, 117), 2);
+        }
+        if (metrics.gauss_fit.fwhm_right_kms > metrics.gauss_fit.fwhm_left_kms &&
+            metrics.gauss_fit.fwhm_half_temp_k > 0.05) {
+            draw_clipped_line(canvas, left, top, right, bottom,
+                              map_x(metrics.gauss_fit.fwhm_left_kms), map_y(metrics.gauss_fit.fwhm_half_temp_k),
+                              map_x(metrics.gauss_fit.fwhm_right_kms), map_y(metrics.gauss_fit.fwhm_half_temp_k),
+                              PixelColor(245, 158, 11), 1);
         }
     }
 
@@ -1086,8 +1100,30 @@ bool PlotRenderer::render_doppler_profile(
                           PixelColor(72, 219, 251), 2);
     }
 
-    // Gaussian fit - clipped to plot box
+    // Line profile fit + multi-component curves - clipped to plot box
     if (metrics.gauss_fit.success && !metrics.gauss_fit.fitted_curve.empty()) {
+        if (metrics.gauss_fit.has_secondary &&
+            metrics.gauss_fit.component1_curve.size() == n_pts &&
+            metrics.gauss_fit.component2_curve.size() == n_pts) {
+            for (size_t i = 1; i < n_pts; ++i) {
+                double v_a = vel_kms[i - 1], v_b = vel_kms[i];
+                if (v_b < v_min || v_a > v_max) continue;
+                draw_clipped_line(canvas, left, top, right, bottom,
+                                  map_x(v_a), map_y(metrics.gauss_fit.component1_curve[i - 1]),
+                                  map_x(v_b), map_y(metrics.gauss_fit.component1_curve[i]),
+                                  PixelColor(251, 146, 60), 1);
+                draw_clipped_line(canvas, left, top, right, bottom,
+                                  map_x(v_a), map_y(metrics.gauss_fit.component2_curve[i - 1]),
+                                  map_x(v_b), map_y(metrics.gauss_fit.component2_curve[i]),
+                                  PixelColor(167, 139, 250), 1);
+                if (metrics.gauss_fit.has_tertiary && metrics.gauss_fit.component3_curve.size() == n_pts) {
+                    draw_clipped_line(canvas, left, top, right, bottom,
+                                      map_x(v_a), map_y(metrics.gauss_fit.component3_curve[i - 1]),
+                                      map_x(v_b), map_y(metrics.gauss_fit.component3_curve[i]),
+                                      PixelColor(16, 185, 129), 1);
+                }
+            }
+        }
         for (size_t i = 1; i < n_pts; ++i) {
             double v_a = vel_kms[i - 1], v_b = vel_kms[i];
             if (v_b < v_min || v_a > v_max) continue;
@@ -1257,7 +1293,7 @@ bool PlotRenderer::render_master_dashboard(
 
     draw_pane(q1_x, q1_y, "(A) Full Bandpass & Instrumental Baseline");
     draw_pane(q2_x, q2_y, "(B) Calibrated Frequency Spectrum (HI Region)");
-    draw_pane(q3_x, q3_y, "(C) Doppler Velocity & Gaussian Line Profile");
+    draw_pane(q3_x, q3_y, std::string("(C) Doppler Velocity & ") + line_analysis_method_display_name(config.line_method));
     draw_pane(q4_x, q4_y, "(D) Time-Frequency Waterfall Spectrogram");
 
     // Render Q1: Raw vs Baseline
@@ -1323,7 +1359,7 @@ bool PlotRenderer::render_master_dashboard(
                           q2_mx(freqs_mhz[i]), q2_my(calibrated_db[i]), PixelColor(29, 209, 161), 1);
     }
 
-    // Render Q3: Doppler Velocity Profile with Gaussian Fit
+    // Render Q3: Doppler Velocity Profile with Line Fit
     double v_min = -180.0, v_max = 180.0;
     const size_t q3_edge = static_cast<size_t>(
         static_cast<double>(vel_kms.size()) * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
@@ -1351,7 +1387,29 @@ bool PlotRenderer::render_master_dashboard(
                           q3_mx(vel_kms[i]), q3_my(calibrated_k[i]), PixelColor(0, 242, 254), 2);
     }
     if (metrics.gauss_fit.success && !metrics.gauss_fit.fitted_curve.empty()) {
-        for (size_t i = 1; i < vel_kms.size(); ++i) {
+        const size_t n_q3 = vel_kms.size();
+        if (metrics.gauss_fit.has_secondary &&
+            metrics.gauss_fit.component1_curve.size() == n_q3 &&
+            metrics.gauss_fit.component2_curve.size() == n_q3) {
+            for (size_t i = 1; i < n_q3; ++i) {
+                if (vel_kms[i] < v_min || vel_kms[i - 1] > v_max) continue;
+                draw_clipped_line(canvas, q3_l, q3_t, q3_r, q3_b,
+                                  q3_mx(vel_kms[i - 1]), q3_my(metrics.gauss_fit.component1_curve[i - 1]),
+                                  q3_mx(vel_kms[i]), q3_my(metrics.gauss_fit.component1_curve[i]),
+                                  PixelColor(251, 146, 60), 1);
+                draw_clipped_line(canvas, q3_l, q3_t, q3_r, q3_b,
+                                  q3_mx(vel_kms[i - 1]), q3_my(metrics.gauss_fit.component2_curve[i - 1]),
+                                  q3_mx(vel_kms[i]), q3_my(metrics.gauss_fit.component2_curve[i]),
+                                  PixelColor(167, 139, 250), 1);
+                if (metrics.gauss_fit.has_tertiary && metrics.gauss_fit.component3_curve.size() == n_q3) {
+                    draw_clipped_line(canvas, q3_l, q3_t, q3_r, q3_b,
+                                      q3_mx(vel_kms[i - 1]), q3_my(metrics.gauss_fit.component3_curve[i - 1]),
+                                      q3_mx(vel_kms[i]), q3_my(metrics.gauss_fit.component3_curve[i]),
+                                      PixelColor(16, 185, 129), 1);
+                }
+            }
+        }
+        for (size_t i = 1; i < n_q3; ++i) {
             if (vel_kms[i] < v_min || vel_kms[i - 1] > v_max) continue;
             draw_clipped_line(canvas, q3_l, q3_t, q3_r, q3_b,
                               q3_mx(vel_kms[i - 1]), q3_my(metrics.gauss_fit.fitted_curve[i - 1]),

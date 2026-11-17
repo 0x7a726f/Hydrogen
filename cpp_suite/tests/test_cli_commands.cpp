@@ -1,9 +1,13 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <cstdio>
 #include <cstdlib>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 static int g_tests_run = 0;
 static int g_tests_passed = 0;
@@ -27,18 +31,37 @@ struct CommandResult {
 };
 
 static CommandResult run_cli(const std::string& args) {
-    // Look for radio_suite_cli.exe in bin/ or ../bin/
-    std::string exe_path = "bin\\radio_suite_cli.exe";
-    if (!std::filesystem::exists(exe_path)) {
-        if (std::filesystem::exists("radio_suite_cli.exe")) {
-            exe_path = "radio_suite_cli.exe";
-        } else if (std::filesystem::exists("..\\bin\\radio_suite_cli.exe")) {
-            exe_path = "..\\bin\\radio_suite_cli.exe";
+    std::string exe_path;
+#ifdef _WIN32
+    const std::vector<std::string> candidates = {
+        "bin\\radio_suite_cli.exe",
+        "radio_suite_cli.exe",
+        "..\\bin\\radio_suite_cli.exe"
+    };
+#else
+    const std::vector<std::string> candidates = {
+        "bin/radio_suite_cli",
+        "./radio_suite_cli",
+        "../bin/radio_suite_cli",
+        "build/bin/radio_suite_cli"
+    };
+#endif
+    for (const auto& c : candidates) {
+        if (std::filesystem::exists(c)) {
+            exe_path = c;
+            break;
         }
+    }
+    if (exe_path.empty()) {
+        exe_path = candidates.front();
     }
 
     std::string cmd = "\"" + exe_path + "\" " + args + " 2>&1";
+#ifdef _WIN32
     FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
     if (!pipe) return {-1, "Failed to execute pipe"};
 
     char buffer[512];
@@ -46,7 +69,12 @@ static CommandResult run_cli(const std::string& args) {
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         out += buffer;
     }
+#ifdef _WIN32
     int rc = _pclose(pipe);
+#else
+    int raw_rc = pclose(pipe);
+    int rc = WIFEXITED(raw_rc) ? WEXITSTATUS(raw_rc) : -1;
+#endif
     return {rc, out};
 }
 
@@ -70,9 +98,9 @@ int main() {
     {
         auto res = run_cli("--help");
         ASSERT_EQ(res.exit_code, 0, "CLI --help exits with code 0");
-        ASSERT_TRUE(res.output.find("HYDROGEN LINE UNIFIED SDR") != std::string::npos, "Help contains banner title");
-        ASSERT_TRUE(res.output.find("Subcommand: record") != std::string::npos, "Help lists record subcommand");
-        ASSERT_TRUE(res.output.find("Subcommand: analyze") != std::string::npos, "Help lists analyze subcommand");
+        ASSERT_TRUE(res.output.find("radio_suite_cli") != std::string::npos, "Help identifies radio_suite_cli");
+        ASSERT_TRUE(res.output.find("Record Options:") != std::string::npos, "Help lists record subcommand");
+        ASSERT_TRUE(res.output.find("Analyze Options:") != std::string::npos, "Help lists analyze subcommand");
 
         auto res2 = run_cli("-h");
         ASSERT_EQ(res2.exit_code, 0, "CLI -h exits with code 0");
@@ -89,13 +117,11 @@ int main() {
     // -----------------------------------------------------------------------
     std::cout << "\n[Test 2] Testing Record Subcommand Flag Validation...\n";
     {
-        // Unrecognized flag
         auto res_bad_flag = run_cli("record --nonexistent-option");
         ASSERT_EQ(res_bad_flag.exit_code, 1, "Unrecognized option exits with error code 1");
         ASSERT_TRUE(res_bad_flag.output.find("Unrecognized option for record") != std::string::npos,
                     "Reports unrecognized option error message");
 
-        // Missing argument values
         auto res_m_fc = run_cli("record --fc");
         ASSERT_EQ(res_m_fc.exit_code, 1, "Missing --fc argument exits with error code 1");
         ASSERT_TRUE(res_m_fc.output.find("Missing value for --fc") != std::string::npos, "Reports missing value error");
@@ -111,6 +137,12 @@ int main() {
 
         auto res_m_out = run_cli("record -o");
         ASSERT_EQ(res_m_out.exit_code, 1, "Missing -o argument exits with error code 1");
+
+        auto res_bad_fc = run_cli("record --fc 0");
+        ASSERT_EQ(res_bad_fc.exit_code, 1, "Invalid zero center frequency rejected with exit code 1");
+
+        auto res_bad_fs = run_cli("record --fs 0");
+        ASSERT_EQ(res_bad_fs.exit_code, 1, "Invalid zero sample rate rejected with exit code 1");
     }
 
     // -----------------------------------------------------------------------
@@ -118,19 +150,16 @@ int main() {
     // -----------------------------------------------------------------------
     std::cout << "\n[Test 3] Testing Analyze Subcommand Flag Validation...\n";
     {
-        // Unrecognized flag
         auto res_bad_flag = run_cli("analyze --invalid-flag");
         ASSERT_EQ(res_bad_flag.exit_code, 1, "Unrecognized analyze option exits with error code 1");
         ASSERT_TRUE(res_bad_flag.output.find("Unrecognized option for analyze") != std::string::npos,
                     "Reports unrecognized option for analyze");
 
-        // Non-existent file
         auto res_missing_file = run_cli("analyze nonexistent_obs_file_987654.cs16");
         ASSERT_EQ(res_missing_file.exit_code, 1, "Non-existent file exits with code 1");
         ASSERT_TRUE(res_missing_file.output.find("does not exist") != std::string::npos,
                     "Reports file does not exist error");
 
-        // Missing argument values
         auto res_m_f = run_cli("analyze -f");
         ASSERT_EQ(res_m_f.exit_code, 1, "Missing -f argument exits with code 1");
 
@@ -145,6 +174,12 @@ int main() {
 
         auto res_m_out = run_cli("analyze -o");
         ASSERT_EQ(res_m_out.exit_code, 1, "Missing -o argument exits with code 1");
+
+        auto res_bad_n = run_cli("analyze foo.cs16 -n 63");
+        ASSERT_EQ(res_bad_n.exit_code, 1, "Odd/too-small FFT size (-n 63) exits with code 1");
+
+        auto res_bad_tsys = run_cli("analyze foo.cs16 --tsys -5");
+        ASSERT_EQ(res_bad_tsys.exit_code, 1, "Non-positive Tsys exits with code 1");
     }
 
     // -----------------------------------------------------------------------
@@ -164,9 +199,9 @@ int main() {
     std::cout << "\n[Test 5] Functional Execution: Virtual SDR Record (1.0s) -> CS16 -> Analyze...\n";
     std::string rec_target = test_dir + "/cli_test.cs16";
     {
-        std::string rec_cmd = "record --virtual --fc 1420.5M --fs 2.4M --duration 1.0 -o " + rec_target;
+        std::string rec_cmd = "record --virtual --fc 1420.5 --fs 2.4 --duration 1.0 -o " + rec_target;
         auto rec_res = run_cli(rec_cmd);
-        ASSERT_EQ(rec_res.exit_code, 0, "CLI record subcommand succeeded with exit code 0");
+        ASSERT_EQ(rec_res.exit_code, 0, "CLI record subcommand with suffixless --fc 1420.5 --fs 2.4 succeeded");
         ASSERT_TRUE(rec_res.output.find("Recording completed successfully") != std::string::npos,
                     "Terminal reports recording completion");
 
@@ -176,12 +211,14 @@ int main() {
         ASSERT_TRUE(std::filesystem::exists(json_sidecar), "Output .json sidecar generated");
         ASSERT_TRUE(std::filesystem::exists(txt_sidecar), "Output .txt sidecar generated");
 
+        std::ifstream jifs(json_sidecar);
+        std::string jtxt((std::istreambuf_iterator<char>(jifs)), std::istreambuf_iterator<char>());
+        ASSERT_TRUE(jtxt.find("2400000") != std::string::npos, "Suffixless --fs 2.4 parsed as 2400000 Hz (2.4 MSPS)");
+
         // Run analyze on the generated file
         std::string ana_cmd = "analyze " + rec_target + " -o " + out_dir;
         auto ana_res = run_cli(ana_cmd);
         ASSERT_EQ(ana_res.exit_code, 0, "CLI analyze subcommand succeeded with exit code 0");
-        ASSERT_TRUE(ana_res.output.find("ASTROPHYSICAL EXECUTIVE REPORT") != std::string::npos,
-                    "Terminal reports executive scientific summary");
         ASSERT_TRUE(ana_res.output.find("Peak Frequency:") != std::string::npos, "Reports peak frequency");
         ASSERT_TRUE(ana_res.output.find("Radial Velocity:") != std::string::npos, "Reports radial velocity");
         ASSERT_TRUE(ana_res.output.find("H I Column Density:") != std::string::npos, "Reports H I column density");
@@ -198,16 +235,14 @@ int main() {
     // -----------------------------------------------------------------------
     std::cout << "\n[Test 6] Testing Subcommand Auto-Detection Modes...\n";
     {
-        // 1. Passing a CS16 file directly without "analyze" subcommand keyword
         std::string auto_out = "tests/test_auto_out";
         std::string auto_cmd = rec_target + " -o " + auto_out;
         auto res_auto_ana = run_cli(auto_cmd);
         ASSERT_EQ(res_auto_ana.exit_code, 0, "Auto-detected analyze mode from .cs16 argument");
-        ASSERT_TRUE(res_auto_ana.output.find("ASTROPHYSICAL EXECUTIVE REPORT") != std::string::npos,
-                    "Auto-detect run output contains scientific report");
+        ASSERT_TRUE(res_auto_ana.output.find("Peak Frequency:") != std::string::npos,
+                    "Auto-detect run output contains astrophysical metrics");
         std::filesystem::remove_all(auto_out, ec);
 
-        // 2. Passing record flags without "record" subcommand keyword
         std::string auto_rec_file = test_dir + "/auto_rec.cs16";
         std::string auto_rec_cmd = "--virtual --gain 25.4 --duration 1.0 -o " + auto_rec_file;
         auto res_auto_rec = run_cli(auto_rec_cmd);

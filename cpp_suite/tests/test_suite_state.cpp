@@ -113,7 +113,7 @@ void test_collision_prevention() {
 }
 
 void test_record_to_analyze_bridge() {
-    std::cout << "[Test 5] Testing [ ⚡ Analyze This Recording Now ] Bridge...\n";
+    std::cout << "[Test 5] Testing Analyze Capture Bridge...\n";
     AppState state;
 
     std::string rec_path = "recordings/hi_survey_001.cs16";

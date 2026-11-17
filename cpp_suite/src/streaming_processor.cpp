@@ -397,15 +397,13 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
     const bool can_use_avx2_fft =
 #ifdef __AVX2__
         (SimdDsp::detect_cpu_simd() == SimdDsp::CpuSimdLevel::AVX2) && is_power_of_two(nfft) && nfft >= 16;
-#else
-        false;
-#endif
-
-#ifdef __AVX2__
     StockhamTwiddles twiddles;
     if (can_use_avx2_fft) {
         twiddles.init(nfft);
     }
+#else
+        false;
+    (void)can_use_avx2_fft;
 #endif
 
     std::vector<KissFftPtr> fft_configs(num_threads);
@@ -622,8 +620,11 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
     }
 
     struct CleanupGuard {
+#ifdef _WIN32
         HANDLE* win_file;
+#else
         std::ifstream* cpp_file;
+#endif
         std::mutex& io_m;
         std::condition_variable& io_cv;
         bool& io_stop;
@@ -660,9 +661,9 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         }
     } cleanup{
 #ifdef _WIN32
-        &h_file, nullptr,
+        &h_file,
 #else
-        nullptr, &file,
+        &file,
 #endif
         io_mutex, io_cv, io_stop, reader_thread,
         pool_mutex, pool_cv_work, pool_stop, workers
@@ -673,11 +674,11 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         flat_waterfall.resize(old_sz + static_cast<size_t>(nfft));
         float* dst = flat_waterfall.data() + old_sz;
         const float inv_b = 1.0f / static_cast<float>(row_blocks);
-        for (int k = 0; k < shift_first; ++k) {
-            dst[k] = static_cast<float>(current_row_accum[k + half_nfft]) * inv_b;
-        }
         for (int k = 0; k < half_nfft; ++k) {
-            dst[shift_first + k] = static_cast<float>(current_row_accum[k]) * inv_b;
+            dst[k] = static_cast<float>(current_row_accum[k + shift_first]) * inv_b;
+        }
+        for (int k = 0; k < shift_first; ++k) {
+            dst[half_nfft + k] = static_cast<float>(current_row_accum[k]) * inv_b;
         }
         waterfall_timestamps.push_back(timestamp_s);
     };
@@ -794,11 +795,11 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
 
     res.averaged_power.resize(nfft);
     const double inv_total = 1.0 / static_cast<double>(total_blocks_accumulated);
-    for (int k = 0; k < shift_first; ++k) {
-        res.averaged_power[k] = unshifted_total[k + half_nfft] * inv_total;
-    }
     for (int k = 0; k < half_nfft; ++k) {
-        res.averaged_power[shift_first + k] = unshifted_total[k] * inv_total;
+        res.averaged_power[k] = unshifted_total[k + shift_first] * inv_total;
+    }
+    for (int k = 0; k < shift_first; ++k) {
+        res.averaged_power[half_nfft + k] = unshifted_total[k] * inv_total;
     }
 
     res.waterfall_rows = static_cast<int>(waterfall_timestamps.size());

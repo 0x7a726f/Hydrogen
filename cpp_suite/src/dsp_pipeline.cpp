@@ -20,7 +20,7 @@ DspPipeline::~DspPipeline() {
 }
 
 void DspPipeline::set_fft_size(int size) {
-    size = std::max(2, size);
+    size = std::max(2, (size + 1) & ~1);
     if (size != fft_size_) {
         std::lock_guard<std::mutex> lock(sample_mutex_);
         fft_size_ = size;
@@ -50,6 +50,8 @@ void DspPipeline::rebuild_plans() {
     fft_out_.resize(fft_size_);
     power_raw_.resize(fft_size_);
     fft_mag_linear_.resize(fft_size_);
+    power_linear_raw_.resize(fft_size_, 0.0f);
+    power_linear_smooth_.assign(fft_size_, 1e-12f);
     power_smooth_.assign(fft_size_, -120.0f);
     scratch_u8_.resize(static_cast<size_t>(fft_size_) * 2);
     sample_buffer_.reserve(static_cast<size_t>(fft_size_) * 2);
@@ -88,14 +90,14 @@ void DspPipeline::feed_samples(const uint8_t* data, size_t length) {
 void DspPipeline::compute_telemetry(const std::vector<float>& power, float peak_db) {
     if (power.empty()) return;
 
-    // Estimate noise floor by taking the 25th-percentile of decimated bins
+    // Estimate noise floor using the 50th-percentile (median) of decimated bins
     telemetry_scratch_.clear();
     for (size_t i = 0; i < power.size(); i += 16) {
         telemetry_scratch_.push_back(power[i]);
     }
-    const size_t q1_idx = telemetry_scratch_.size() / 4;
-    std::nth_element(telemetry_scratch_.begin(), telemetry_scratch_.begin() + q1_idx, telemetry_scratch_.end());
-    float noise_floor = telemetry_scratch_[q1_idx];
+    const size_t mid_idx = telemetry_scratch_.size() / 2;
+    std::nth_element(telemetry_scratch_.begin(), telemetry_scratch_.begin() + mid_idx, telemetry_scratch_.end());
+    float noise_floor = telemetry_scratch_[mid_idx];
 
     noise_floor_db_.store(noise_floor, std::memory_order_relaxed);
     float snr = std::max(0.0f, peak_db - noise_floor);
@@ -143,6 +145,10 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
     if (fft_mag_linear_.size() != static_cast<size_t>(n_pts)) {
         fft_mag_linear_.resize(n_pts);
     }
+    if (power_linear_raw_.size() != static_cast<size_t>(n_pts)) {
+        power_linear_raw_.resize(n_pts);
+        power_linear_smooth_.assign(n_pts, 1e-12f);
+    }
     SimdDsp::compute_power_dbfs_avx2(
         fft_power_src,
         power_raw_.data(),
@@ -155,6 +161,7 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
     int fft_peak_idx = 0;
     float max_fft_db = -999.0f;
     for (int k = 0; k < n_pts; ++k) {
+        power_linear_raw_[k] = fft_mag_linear_[k] * fft_mag_linear_[k];
         if (power_raw_[k] > max_fft_db) {
             max_fft_db = power_raw_[k];
             fft_peak_idx = k;
@@ -163,12 +170,24 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
     fft_peak_db_ = max_fft_db;
     fft_peak_mag_ = fft_mag_linear_[fft_peak_idx];
 
-    // 4. Vectorized Exponential Smoothing
+    // 4. Exponential Smoothing in linear power (unbiased noise PSD estimator) -> dBFS
     bool do_flush = need_flush_.exchange(false);
     if (do_flush || !has_smooth_) {
+        std::memcpy(power_linear_smooth_.data(), power_linear_raw_.data(), n_pts * sizeof(float));
         std::memcpy(power_smooth_.data(), power_raw_.data(), n_pts * sizeof(float));
     } else {
-        SimdDsp::apply_smoothing_avx2(power_smooth_.data(), power_raw_.data(), n_pts, avg_factor_);
+        SimdDsp::apply_smoothing_avx2(power_linear_smooth_.data(), power_linear_raw_.data(), n_pts, avg_factor_);
+        int k = 0;
+#if defined(__AVX2__)
+        const __m256 v_eps = _mm256_set1_ps(1e-14f);
+        for (; k + 8 <= n_pts; k += 8) {
+            __m256 pwr = _mm256_add_ps(_mm256_loadu_ps(power_linear_smooth_.data() + k), v_eps);
+            _mm256_storeu_ps(power_smooth_.data() + k, SimdDsp::fast_10log10_avx2(pwr));
+        }
+#endif
+        for (; k < n_pts; ++k) {
+            power_smooth_[k] = SimdDsp::fast_10log10_scalar(power_linear_smooth_[k] + 1e-14f);
+        }
     }
     has_smooth_ = true;
 

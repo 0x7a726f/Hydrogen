@@ -1,6 +1,10 @@
 #include "sdr_device.h"
+#ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#else
+#include <dlfcn.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -8,6 +12,7 @@
 #include <chrono>
 #include <mutex>
 
+#ifdef _WIN32
 static std::string to_utf8(const std::wstring& wstr) {
     if (wstr.empty()) return std::string();
     int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), nullptr, 0, nullptr, nullptr);
@@ -15,6 +20,7 @@ static std::string to_utf8(const std::wstring& wstr) {
     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &result[0], size, nullptr, nullptr);
     return result;
 }
+#endif
 
 RtlSdrDevice::RtlSdrDevice() {
     load_dll();
@@ -28,10 +34,8 @@ RtlSdrDevice::~RtlSdrDevice() {
 bool RtlSdrDevice::load_dll() {
     if (dll_handle_) return true;
 
-    // Candidates to search for rtlsdr.dll
+#ifdef _WIN32
     std::vector<std::wstring> candidates;
-
-    // Check executable directory and local bin/PATH
     wchar_t exe_path[MAX_PATH] = {0};
     if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH)) {
         wchar_t* last_slash = wcsrchr(exe_path, L'\\');
@@ -41,7 +45,6 @@ bool RtlSdrDevice::load_dll() {
             candidates.push_back(std::wstring(exe_path) + L"\\bin\\rtlsdr.dll");
         }
     }
-
     candidates.push_back(L"rtlsdr.dll");
 
     HMODULE mod = nullptr;
@@ -58,6 +61,23 @@ bool RtlSdrDevice::load_dll() {
     dll_handle_ = (void*)mod;
 
     #define LOAD_PROC(name) fn_##name = reinterpret_cast<pfn_rtlsdr_##name>(reinterpret_cast<uintptr_t>(GetProcAddress(mod, "rtlsdr_" #name)))
+#else
+    const char* so_candidates[] = {"librtlsdr.so.0", "librtlsdr.so"};
+    void* mod = nullptr;
+    for (const char* path : so_candidates) {
+        mod = dlopen(path, RTLD_LAZY);
+        if (mod) break;
+    }
+
+    if (!mod) {
+        status_detail_ = "librtlsdr shared library not found; virtual mode available.";
+        return false;
+    }
+
+    dll_handle_ = mod;
+
+    #define LOAD_PROC(name) fn_##name = reinterpret_cast<pfn_rtlsdr_##name>(dlsym(mod, "rtlsdr_" #name))
+#endif
     LOAD_PROC(get_device_count);
     LOAD_PROC(get_device_name);
     LOAD_PROC(get_device_usb_strings);
@@ -77,23 +97,29 @@ bool RtlSdrDevice::load_dll() {
     #undef LOAD_PROC
 
     if (!fn_open || !fn_close || !fn_read_sync) {
-        status_detail_ = "rtlsdr.dll is missing core API exports.";
+        status_detail_ = "RTL-SDR library is missing required API exports.";
         unload_dll();
         return false;
     }
 
-    status_detail_ = "rtlsdr.dll loaded successfully.";
+    status_detail_ = "RTL-SDR library loaded.";
     return true;
 }
 
 void RtlSdrDevice::unload_dll() {
     if (dll_handle_) {
+#ifdef _WIN32
         FreeLibrary((HMODULE)dll_handle_);
+#else
+        dlclose(dll_handle_);
+#endif
         dll_handle_ = nullptr;
     }
 }
 
 std::vector<std::string> RtlSdrDevice::detect_blocking_processes() {
+    std::vector<std::string> blocking;
+#ifdef _WIN32
     static std::mutex cache_mutex;
     static std::vector<std::string> cached_result;
     static uint64_t last_probe_ms = 0;
@@ -107,7 +133,6 @@ std::vector<std::string> RtlSdrDevice::detect_blocking_processes() {
         }
     }
 
-    std::vector<std::string> blocking;
     static const wchar_t* const known_sdr_w[] = {
         L"satdump", L"sdrpp", L"sdrangel", L"tv_app", L"rtl_tcp", L"dump1090", L"welle"
     };
@@ -145,6 +170,7 @@ std::vector<std::string> RtlSdrDevice::detect_blocking_processes() {
         last_probe_ms = GetTickCount64();
         has_cached = true;
     }
+#endif
     return blocking;
 }
 
@@ -185,7 +211,6 @@ std::vector<std::string> RtlSdrDevice::scan_devices() {
 bool RtlSdrDevice::open(uint32_t index) {
     close();
 
-    // Check for blocking apps holding WinUSB
     auto blocking = detect_blocking_processes();
     if (!blocking.empty()) {
         status_detail_ = "USB device held by active SDR process. Running in Virtual mode.";
@@ -193,7 +218,7 @@ bool RtlSdrDevice::open(uint32_t index) {
     }
 
     if (!load_dll() || !fn_open) {
-        status_detail_ = "rtlsdr.dll unavailable.";
+        if (status_detail_.empty()) status_detail_ = "RTL-SDR library unavailable.";
         return false;
     }
 
@@ -276,11 +301,15 @@ bool RtlSdrDevice::set_sample_rate(uint32_t rate_hz) {
 }
 
 bool RtlSdrDevice::set_frequency(uint64_t freq_hz) {
+    if (freq_hz == 0 || freq_hz > 0xFFFFFFFFULL) {
+        status_detail_ = "Frequency out of 32-bit RTL-SDR tuner range.";
+        return false;
+    }
     if (dev_ && fn_set_center_freq) {
         int ret = -1;
         // Retry up to 3 times in case of transient I2C bus collision
         for (int attempt = 0; attempt < 3; ++attempt) {
-            ret = fn_set_center_freq(dev_, (uint32_t)freq_hz);
+            ret = fn_set_center_freq(dev_, static_cast<uint32_t>(freq_hz));
             if (ret == 0) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -340,10 +369,9 @@ bool RtlSdrDevice::set_gain(float gain_db, bool auto_gain) {
 
     if (dev_ && fn_set_tuner_gain_mode) {
         if (auto_gain) {
-            fn_set_tuner_gain_mode(dev_, 0); // AGC auto
-            return true;
+            return (fn_set_tuner_gain_mode(dev_, 0) == 0);
         } else {
-            fn_set_tuner_gain_mode(dev_, 1); // Manual
+            if (fn_set_tuner_gain_mode(dev_, 1) != 0) return false;
             if (fn_set_tuner_gain) {
                 return (fn_set_tuner_gain(dev_, static_cast<int>(std::lround(gain_db_ * 10.0f))) == 0);
             }

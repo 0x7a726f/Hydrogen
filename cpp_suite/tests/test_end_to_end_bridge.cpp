@@ -139,7 +139,7 @@ int main() {
     // -----------------------------------------------------------------------
     // STEP 3: TRIGGER RECORD -> ANALYZE BRIDGE
     // -----------------------------------------------------------------------
-    std::cout << "\n[Step 3] Triggering [ ⚡ Analyze This Recording Now ] Bridge...\n";
+    std::cout << "\n[Step 3] Triggering Analyze Capture Bridge...\n";
     app_state.switch_to_analyze(recorded_path, true);
     ASSERT_EQ(app_state.get_section(), AppSection::Analyze, "AppState successfully switched to Analyze section");
 
@@ -157,6 +157,32 @@ int main() {
     ASSERT_TRUE(sidecar.found_sidecar, "SidecarReader successfully detected metadata sidecar");
     ASSERT_EQ(sidecar.center_freq_hz, center_freq_hz, "Parsed center LO matches recording");
     ASSERT_EQ(sidecar.sample_rate_hz, sample_rate_hz, "Parsed sample rate matches recording");
+
+    // Verify TXT sidecar bias-tee "none (disabled)" & MSPS parsing + JSON string escape roundtrip
+    {
+        std::string txt_only_cs16 = test_dir + "/txt_only_check.cs16";
+        {
+            std::ofstream ofs_c(txt_only_cs16, std::ios::binary);
+            ofs_c << "abcd";
+            std::ofstream ofs_t(test_dir + "/txt_only_check.txt");
+            ofs_t << "Center Frequency: 1420.500 MHz (1420500000 Hz)\n"
+                  << "Sample Rate:      2.400 MSPS (2400000 Hz)\n"
+                  << "Bias-Tee (+4.5V): DISABLED (none)\n"
+                  << "Receiver Hardware: Virtual \"SDR\" \\ Test\n";
+        }
+        ObservationMetadata txt_meta = SidecarReader::parse(txt_only_cs16);
+        ASSERT_TRUE(txt_meta.found_sidecar, "TXT-only sidecar parsed");
+        ASSERT_EQ(txt_meta.sample_rate_hz, 2400000ULL, "TXT sidecar parsed 2.400 MSPS without losing digits");
+        ASSERT_FALSE(txt_meta.bias_tee, "TXT sidecar does not treat DISABLED (none) as enabled");
+        ASSERT_TRUE(txt_meta.device_name.find("Virtual") != std::string::npos, "TXT sidecar parsed Receiver Hardware");
+
+        Cs16Writer esc_writer(test_dir);
+        std::string esc_cs16 = test_dir + "/esc_check.cs16";
+        std::string esc_res = esc_writer.start_recording(2400000, 1420500000ULL, "RTL\"Test\\Unit", 25.4f, false, esc_cs16, 0.0);
+        esc_writer.stop_recording();
+        ObservationMetadata esc_meta = SidecarReader::parse(esc_res);
+        ASSERT_EQ(esc_meta.device_name, "RTL\"Test\\Unit", "JSON sidecar escape/unescape roundtrip preserves device string");
+    }
 
     AstroConfig config;
     config.fft_size = 8192;

@@ -167,13 +167,18 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
         // Simulate Doppler-shifted (+7.4 km/s) narrowband thermal 21cm H I emission (~12 km/s FWHM)
         const double hi_line_freq_hz = SdrConstants::HI_REST_FREQ_HZ - 35000.0;
         const double hi_offset = hi_line_freq_hz - static_cast<double>(fc);
-        Phasor hi_osc, ripple_osc;
+        Phasor hi_osc, test_spur_osc;
         hi_osc.init(hi_phase_, two_pi_dt * hi_offset);
-        ripple_osc.init(ripple_phase_, two_pi_dt * 710000.0);
+        // Inject weak CW tone at -710 kHz (conjugate spur outside the HI rest window) for RFI/waterfall checks
+        test_spur_osc.init(ripple_phase_, two_pi_dt * 710000.0);
 
-        // Two cascaded 1-pole IIR filters shape white complex Gaussian excitation into a narrowband spectral peak
-        // |H2(w)|^2 has unity peak gain (|H2(0)|^2 = 1.0) so peak excess power = hi_sigma^2 / noise_sigma^2
-        const float lp_alpha = static_cast<float>(std::clamp(2.0 * M_PI * 42000.0 / (0.6436 * span), 0.02, 0.5));
+        // Two cascaded 1-pole IIR filters shape white complex Gaussian excitation into a narrowband peak.
+        // Solve |H_1(w)|^4 = 0.5 at w = 2*pi*f_hwhm/Fs (~28.43 kHz HWHM for 12 km/s FWHM).
+        constexpr double kHiHwhmHz = 28427.79;
+        const double w_hwhm = two_pi_dt * kHiHwhmHz;
+        const double k_bw = 2.0 * (1.0 - std::cos(w_hwhm)) / (std::sqrt(2.0) - 1.0);
+        const double alpha_exact = 0.5 * (-k_bw + std::sqrt(k_bw * k_bw + 4.0 * k_bw));
+        const float lp_alpha = static_cast<float>(std::clamp(alpha_exact, 0.02, 0.5));
         const float lp_decay = 1.0f - lp_alpha;
         const float hi_sigma = noise_sigma * 0.50f; // +25% excess PSD (~+25 K at T_sys = 100 K)
         float lp1_i = hi_lp1_i_, lp1_q = hi_lp1_q_;
@@ -190,22 +195,22 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
             lp2_q = lp_decay * lp2_q + lp_alpha * lp1_q;
 
             hi_osc.step();
-            ripple_osc.step();
+            test_spur_osc.step();
             if ((n & 1023) == 1023) {
                 hi_osc.renorm();
-                ripple_osc.renorm();
+                test_spur_osc.renorm();
             }
 
             float sig_i = lp2_i * static_cast<float>(hi_osc.re) - lp2_q * static_cast<float>(hi_osc.im)
-                        + 3.5f * static_cast<float>(ripple_osc.im);
+                        + 3.5f * static_cast<float>(test_spur_osc.im);
             float sig_q = lp2_i * static_cast<float>(hi_osc.im) + lp2_q * static_cast<float>(hi_osc.re)
-                        + 3.5f * static_cast<float>(ripple_osc.re);
+                        + 3.5f * static_cast<float>(test_spur_osc.re);
 
             buffer[2 * n]     = clamp_u8(ni + sig_i + dc_offset_i);
             buffer[2 * n + 1] = clamp_u8(nq + sig_q + dc_offset_q);
         }
         hi_phase_ = hi_osc.final_phase();
-        ripple_phase_ = ripple_osc.final_phase();
+        ripple_phase_ = test_spur_osc.final_phase();
         hi_lp1_i_ = lp1_i; hi_lp1_q_ = lp1_q;
         hi_lp2_i_ = lp2_i; hi_lp2_q_ = lp2_q;
     } else if (fc >= 80000000ULL && fc <= 115000000ULL) {

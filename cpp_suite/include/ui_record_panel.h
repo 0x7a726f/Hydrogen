@@ -26,6 +26,7 @@ public:
     void set_frequency(uint64_t freq_hz);
     void step_frequency(int64_t delta_hz);
     void sync_device_selection();
+    void sync_recording_state();
 
 private:
     struct DeviceEntry {
@@ -73,7 +74,6 @@ private:
     int selected_device_idx_ = 0;
     std::vector<float> valid_gains_;
     std::string device_status_text_;
-    bool device_status_ok_ = true;
     std::vector<std::string> cached_blockers_;
     std::chrono::steady_clock::time_point last_blocker_check_{};
 

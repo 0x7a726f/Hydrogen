@@ -49,10 +49,28 @@ static bool json_extract_number(const std::string& content, const std::string& k
 static bool json_extract_string(const std::string& content, const std::string& key, std::string& out_str) {
     size_t p = find_json_value_start(content, key);
     if (p == std::string::npos || p >= content.size() || content[p] != '"') return false;
-    size_t close = content.find('"', p + 1);
-    if (close == std::string::npos) return false;
-    out_str = content.substr(p + 1, close - (p + 1));
-    return true;
+    std::string decoded;
+    for (size_t i = p + 1; i < content.size(); ++i) {
+        char c = content[i];
+        if (c == '\\' && i + 1 < content.size()) {
+            char next = content[++i];
+            switch (next) {
+                case '"':  decoded.push_back('"'); break;
+                case '\\': decoded.push_back('\\'); break;
+                case '/':  decoded.push_back('/'); break;
+                case 'n':  decoded.push_back('\n'); break;
+                case 'r':  decoded.push_back('\r'); break;
+                case 't':  decoded.push_back('\t'); break;
+                default:   decoded.push_back(next); break;
+            }
+        } else if (c == '"') {
+            out_str = std::move(decoded);
+            return true;
+        } else {
+            decoded.push_back(c);
+        }
+    }
+    return false;
 }
 
 static bool json_extract_bool(const std::string& content, const std::string& key, bool& out_bool) {
@@ -94,20 +112,25 @@ bool SidecarReader::parse_json_sidecar(const std::string& json_path, Observation
     if (json_extract_number(content, "gain_db", val)) {
         meta.gain_db = val;
         meta.has_gain = true;
+        has_data = true;
     }
     if (json_extract_number(content, "lo_offset_khz", val)) {
         meta.lo_offset_khz = val;
+        has_data = true;
     }
     bool bval = false;
     if (json_extract_bool(content, "bias_tee", bval)) {
         meta.bias_tee = bval;
+        has_data = true;
     }
     std::string sval;
     if (json_extract_string(content, "device", sval) || json_extract_string(content, "device_name", sval)) {
         meta.device_name = sval;
+        has_data = true;
     }
     if (json_extract_string(content, "timestamp", sval)) {
         meta.timestamp = sval;
+        has_data = true;
     }
 
     if (has_data) {
@@ -126,18 +149,22 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
     bool has_data = false;
 
     while (std::getline(file, line)) {
-        if (line.find("Tuned SDR Center LO:") != std::string::npos || line.find("Center Frequency (LO):") != std::string::npos) {
+        if (line.find("Tuned SDR Center LO:") != std::string::npos ||
+            line.find("Center Frequency (LO):") != std::string::npos ||
+            line.find("Center Frequency:") != std::string::npos) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
                 meta.center_freq_hz = parse_frequency_or_rate(val_str, true);
                 has_data = true;
             }
-        } else if (line.find("Sampling Rate (Fs):") != std::string::npos || line.find("SDR Sample Rate:") != std::string::npos) {
+        } else if (line.find("Sampling Rate (Fs):") != std::string::npos ||
+                   line.find("SDR Sample Rate:") != std::string::npos ||
+                   line.find("Sample Rate:") != std::string::npos) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
-                meta.sample_rate_hz = parse_frequency_or_rate(val_str, true);
+                meta.sample_rate_hz = parse_sample_rate(val_str);
                 has_data = true;
             }
         } else if (line.find("RF Gain:") != std::string::npos || line.find("Gain:") != std::string::npos) {
@@ -147,6 +174,7 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
                 try {
                     meta.gain_db = std::stod(val_str);
                     meta.has_gain = true;
+                    has_data = true;
                 } catch (...) {}
             }
         } else if (line.find("Bias-Tee") != std::string::npos || line.find("Bias Tee") != std::string::npos) {
@@ -154,7 +182,15 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
                 std::transform(val_str.begin(), val_str.end(), val_str.begin(), [](unsigned char c) { return std::tolower(c); });
-                meta.bias_tee = (val_str.find("on") != std::string::npos || val_str.find("enabled") != std::string::npos || val_str.find("true") != std::string::npos);
+                bool disabled = (val_str.find("off") != std::string::npos ||
+                                 val_str.find("disabled") != std::string::npos ||
+                                 val_str.find("false") != std::string::npos ||
+                                 val_str.find("none") != std::string::npos);
+                meta.bias_tee = !disabled && (val_str == "on" ||
+                                              val_str.rfind("on ", 0) == 0 ||
+                                              val_str.find("enabled") != std::string::npos ||
+                                              val_str.find("true") != std::string::npos);
+                has_data = true;
             }
         } else if (line.find("LO Offset") != std::string::npos || line.find("Offset Shift:") != std::string::npos) {
             size_t colon = line.find(':');
@@ -163,12 +199,15 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
                 val_str.erase(std::remove(val_str.begin(), val_str.end(), ','), val_str.end());
                 try {
                     meta.lo_offset_khz = std::stod(val_str);
+                    has_data = true;
                 } catch (...) {}
             }
-        } else if (line.find("Device:") != std::string::npos || line.find("Frontend Device:") != std::string::npos || line.find("Device Name:") != std::string::npos) {
+        } else if (line.find("Device:") != std::string::npos || line.find("Frontend Device:") != std::string::npos ||
+                   line.find("Device Name:") != std::string::npos || line.find("Receiver Hardware:") != std::string::npos) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 meta.device_name = trim(line.substr(colon + 1));
+                has_data = true;
             }
         }
     }

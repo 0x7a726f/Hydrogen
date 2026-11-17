@@ -60,6 +60,8 @@ private:
 
     std::vector<float> power_raw_;
     std::vector<float> fft_mag_linear_;
+    std::vector<float> power_linear_raw_;
+    std::vector<float> power_linear_smooth_;
     std::vector<float> power_smooth_;
     std::vector<float> telemetry_scratch_;
     bool has_smooth_ = false;

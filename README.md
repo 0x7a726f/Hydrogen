@@ -1,232 +1,97 @@
-# Hydrogen Line SDR & Radio Astronomy Scientific Analysis Suite (C++)
+# Hydrogen Line SDR & Analysis Suite
 
-A unified, high-performance, real-time SDR receiver, lossless 16-bit CS16 data recorder, and scientific radio astronomy offline analysis workstation engineered specifically for the **21-cm (1420.405751768 MHz) Neutral Hydrogen (H I) Line**.
+A C++17 software-defined radio receiver, lossless `CS16` I/Q recorder, and offline 21-cm Neutral Hydrogen (H I, `1420.405751768 MHz`) analysis suite.
 
-Built natively in modern C++17 with AVX2/FMA/SSE4.1 SIMD vectorized DSP kernels (including an 8-block batched SoA AVX2 Stockham FFT accumulator and AVX2 double-precision `log10`/`exp10`/`exp`), lock-free SPSC ring buffers, and a high-contrast **Observatory Slate** DirectX 11 + Dear ImGui desktop interface (`radio_suite.exe`) with crisp integer-snapped instrumentation typography (`Calibri` + `Consolas`).
+## Overview
 
----
+The suite compiles two primary executables from CMake:
 
-## Architecture Overview
+- **`radio_suite_cli`** (Windows & Linux): Headless CLI for live/simulated IQ recording (`record`) and offline calibration/fitting (`analyze`).
+- **`radio_suite`** (Windows x64 DirectX 11 + Dear ImGui): Desktop application combining real-time PSD + waterfall monitoring, timed CS16 capture, and interactive spectral analysis.
 
-```
-                      +---------------------------------------+
-                      |     RTL-SDR / Virtual SDR Device      |
-                      +---------------------------------------+
-                                          |
-                      +---------------------------------------+
-                      |       Lock-Free Circular Buffer       |
-                      |          (32 Chunks x 256 KB)         |
-                      +---------------------------------------+
-                                   /             \
-                                  /               \
-        +--------------------------------+   +--------------------------------+
-        |     Real-Time DSP Pipeline     |   |    Lossless CS16 Disk Writer   |
-        |  - AVX2 Hann Window & MagSq    |   |  - Pre-pooled 128-slot Queue   |
-        |  - Coherent Full-Scale dBFS    |   |  - Batched Win32 Sequential I/O|
-        |  - Zero-Alloc Telemetry EMA    |   |  - JSON & TXT Sidecars (.768)  |
-        +--------------------------------+   +--------------------------------+
-                        |                                    |
-                        |                    +--------------------------------+
-                        |                    |  Analyze Capture -> Bridge     |
-                        |                    +--------------------------------+
-                        |                                    |
-                        v                                    v
-+------------------------------------+       +------------------------------------+
-|  1. Live SDR & Record              |       |  2. H I Scientific Analysis        |
-|  - Scrollable Mono LCD LO Tuner    |       |  - Sidecar / Native File Browse    |
-|  - Unified PSD + Peak Hold + Floor |       |  - DC excision & MAD RFI filter    |
-|  - Dynamic History Waterfall + LUT |       |  - AVX2 RippleFilter, ALS, Poly    |
-|  - Discrete Snapped LNA & AGC      |       |  - 5 Line Profile Analysis Models  |
-|  - Bias-Tee +4.5V Safety Modal     |       |  - Pinned 6-KPI Strip & 4 Tabs     |
-|  - Timed / Manual CS16 Capture     |       |  - Parallel 5-PNG + CSV/JSON Export|
-+------------------------------------+       +------------------------------------+
-```
+## Pipeline & Solvers
 
----
+- **Real-Time RX (`DspPipeline`, `Waterfall`)**:
+  - Hann-windowed complex FFT with AVX2/FMA/SSE4.1 acceleration (`SimdDsp`).
+  - Linear-power exponential moving average (`P_smooth`) converted to full-scale dBFS (`0 dBFS` = full-scale complex tone), preserving unbiased noise power statistics.
+  - Lock-free SPSC ring buffer between SDR capture and DSP/disk threads.
+- **Offline Calibration & Artifact Removal (`StreamingProcessor`, `DCExcision`, `RFIFilter`)**:
+  - Multi-threaded batched FFT accumulator (`StreamingProcessor`) yielding averaged power spectra and time-frequency waterfall histories.
+  - Local oscillator DC notch excision (`DCExcision`).
+  - Modified Z-score median-15 MAD RFI mitigation (`RFIFilter`) with H I line protection (`±190 kHz` around `1420.40575 MHz`).
+- **Continuum Baseline Solvers (`BaselineFitter`)**:
+  - `ripple_filter` (`RippleFilter`): $O(N \log N)$ frequency-domain Gaussian baseline estimator with H I window masking.
+  - `als` (`Asymmetric Least Squares`): $O(N)$ macro-binned Whittaker-Eilers pentadiagonal Cholesky solver (`lambda`, `p`).
+  - `poly` (`Poly`): Chebyshev-scaled sigma-clipped polynomial fit.
+  - `savitzky_golay` (`SavitzkyGolay`): 2-pass outlier-clipped, moment-preserving degree-2 Savitzky-Golay polynomial filter with local-median H I gap anchoring.
+  - `standing_wave` (`StandingWave`): Delay-domain FFT coaxial/dish reflection peak detector with sub-bin parabolic frequency refinement and 2-harmonic sinusoidal least-squares excision across line-free channels.
+  - Local linear trend removal in linear brightness temperature $T_A$ space (`refine_local`).
+- **21-cm Line Profile Models (`Astrophysics`)**:
+  - `gaussian_ls`: 3-parameter Levenberg-Marquardt Gaussian fit (`A`, `v0`, `sigma`).
+  - `double_gaussian`: 6-parameter two-component Levenberg-Marquardt decomposition with individual arm profiles.
+  - `triple_gaussian`: 9-parameter three-component Levenberg-Marquardt decomposition for multi-arm Galactic sightlines (e.g. Local + Perseus + Outer arms or CNM + WNM halos).
+  - `voigt`: 4-parameter equal-FWHM Pseudo-Voigt fit (`A`, `v0`, `sigma`, `eta`).
+  - `gauss_hermite`: 5-parameter Gauss-Hermite fit (`A`, `v0`, `sigma`, `h3`, `h4`) with numerical FWHM measurement.
+  - `moments`: Non-parametric spectral moments ($M_0$, $M_1$, $\sigma_{M_2} = \sqrt{M_2}$) and smoothed half-maximum FWHM.
+  - `busy_function`: 6-parameter Generalized Busy Function (Westmeier et al. 2014) modeling flat-topped, double-horned, and asymmetric 21-cm profiles.
+- **Derived 21-cm Physical & Kinematic Metrics (`AstrophysicalMetrics`)**:
+  - Optically-thin ($N_{\text{HI}}$) and optically-thick corrected ($N_{\text{HI,thick}}$) column densities, peak optical depth $\tau_{\max}$, upper-bound Doppler kinetic temperature $T_{k,\max} = 21.855\,\text{FWHM}^2$, equivalent width $W_{\text{eq}}$, and full velocity widths $W_{50}$ and $W_{20}$.
+- **Exports (`Exporter`, `PlotRenderer`)**:
+  - Generates 5 diagnostic PNG plots (`1_hi_spectrum_calibrated.png` through `5_hi_master_dashboard.png`), `calibrated_spectrum.csv`, `analysis_report.json`, and `analysis_report.txt`.
 
-## Key Features & Scientific Capabilities
+## Build & Test (CMake)
 
-The suite provides a single DPI-aware desktop interface (`cpp_suite/bin/radio_suite.exe`) and a companion headless CLI (`cpp_suite/bin/radio_suite_cli.exe`) unifying two operational modes (switchable via the segmented top pill or `F1` / `F2`).
+### Requirements
+- CMake `>= 3.16`, C++17 compiler (`g++`, `clang++`, or MSVC)
+- Optional on Linux for hardware RTL-SDR: `librtlsdr` runtime (`librtlsdr.so.0` / `librtlsdr.so`)
+- Windows GUI builds require Windows SDK (DirectX 11, Win32)
 
-### Section 1: Live SDR & Record (`AppSection::Record`)
-Designed for real-time sky observation, antenna alignment, and raw data logging:
-- **Interactive Monospace LCD Frequency Tuner**:
-  - Direct MHz text entry, 1-click frequency step controls (`±1M`, `±100k`, `±10k`), mouse-wheel tuning (`±10 kHz`), and automatic `"Custom LO"` vs Band Preset synchronization.
-  - Pre-calibrated default LO frequency: `1420.500 MHz` (`+94.248 kHz` offset placing the `1420.405751768 MHz` H I line safely clear of the DC tuner spike).
-- **Hardware Source & RF Front-End Controls**:
-  - Runtime hardware RTL-SDR vs internal `Virtual 21cm H I Simulator` switcher (`scan`, `initialize`, and active driver sync).
-  - Discrete LNA gain slider snapped cleanly to hardware-valid tuner gain steps (auto-disabled under AGC).
-  - **Bias-Tee `+4.5V` Safety Confirmation Modal** and persistent amber `BIAS 4.5V` header badge when active.
-- **Unified Power Spectrum (PSD) & History-Preserving Waterfall**:
-  - Dedicated `POWER SPECTRUM (PSD)` display with coherent full-scale dBFS normalization, EMA smoothing (`0.02–1.00`), optional Peak Hold envelope, noise floor marker, H I rest reference line (`1420.4058 MHz`), and hover crosshair readout (`MHz`, `V_LSR km/s`, `dBFS`).
-  - Dynamic DirectX 11 waterfall (`LIVE WATERFALL HISTORY`) using `resize_preserving_history()` and a synchronized right-aligned dBFS colorbar (`Viridis`, `Turbo`, `Inferno`, `Magma`, `ClassicYoussef`).
-- **Async CS16 Recorder & Bridge**:
-  - Interleaved 16-bit I/Q (`CS16`) capture backed by a 128-slot pre-allocated buffer pool and batched Win32 `WriteFile` sequential I/O.
-  - Non-blocking timed duration auto-stop, automatic `.json` and `.txt` sidecar generation, and 1-click `Analyze Capture ->` handoff.
+### Configure, Build, and Run CTest
 
----
-
-### Section 2: Offline Analysis Workstation (`AppSection::Analyze`)
-Designed for scientific post-processing, baseline correction, and astrophysical parameter extraction:
-- **Native File Discovery, Browse & Stale-Config Detection**:
-  - Scans executable-relative `recordings/` and workspace folders via canonical path deduplication, with native Windows `[Browse...]` and `[Open Output Directory]` actions.
-  - Parses `.json` and `.txt` sidecars automatically, validates RF inputs, and shows an amber banner if sidebar configuration changes after the active run.
-- **Five 21-cm Line Profile Analysis Methods (`--line-method` / GUI Selector)**:
-  1. **Single Gaussian (L-M)** (`gaussian`): Classic 4-parameter Levenberg-Marquardt Gaussian fit (`A`, `v_0`, `sigma`, `offset`) for isolated thermal/turbulent H I clouds.
-  2. **Double Gaussian (2-Component)** (`double_gaussian`): Joint 7-parameter Levenberg-Marquardt two-component decomposition separating primary and secondary Galactic spiral-arm velocity peaks, rendering individual component overlay curves (`Comp 1` in amber, `Comp 2` in violet) alongside the total profile.
-  3. **Pseudo-Voigt Profile** (`voigt`): 5-parameter Levenberg-Marquardt fit combining a Gaussian core with Lorentzian damping wings via mixing parameter `eta in [0, 1]` and half-width `Gamma`.
-  4. **Gauss-Hermite ($h_3/h_4$ Moments)** (`gauss_hermite`): Orthogonal Gauss-Hermite series expansion measuring line skewness (`h3`, rotational asymmetry) and kurtosis (`h4`, peakiness vs flat-topped wings).
-  5. **Spectral Moments ($M_0/M_1/M_2$)** (`moments`): Model-independent, non-parametric integration over the signal window yielding zeroth moment `M0` (`int T_A dv`), intensity-weighted centroid velocity `M1`, velocity dispersion `sigma_M2 = sqrt(M2)`, direct linear-interpolated half-maximum `FWHM`, and a Savitzky-Golay smoothed empirical envelope.
-- **Three Baseline Continua Solvers (`--baseline` / GUI Selector)**:
-  - **FFT Ripple / Notch Filter (`ripple_filter`)**: $O(N \log N)$ frequency-domain low-pass baseline estimator with iterative H I window replacement.
-  - **Whittaker-Eilers ALS (`als`)**: Exact $O(N)$ Cholesky pentadiagonal solver with configurable smoothness `lambda` and asymmetry `p`.
-  - **Iterative Polynomial (`poly`)**: Chebyshev-scaled Vandermonde normal equations with sigma-clipping exclusion across the H I line window.
-- **Four Scientific Views & Pinned 6-KPI Telemetry Strip**:
-  1. **Calibrated H I Spectrum (`T_A K` vs `V_LSR km/s`)**: Dual bottom `km/s` + top Sky Frequency `MHz` axes, active line model curve + secondary component overlays, and a method-aware **Smart Fit Summary Card** (`RMSE`, `v0`, `FWHM`, `v2`, `eta`, `h3/h4`, `sigma_M2`).
-  2. **Raw Passband & Baseline (`dB` vs `MHz`)**: Superimposes raw passband power against the fitted baseline model with shaded H I protection band.
-  3. **Time-Frequency Waterfall**: GPU-uploaded `<= 2048x1024` spectrogram normalized via `5th–99.5th` percentile contrast with instant 256-entry colormap LUT switching.
-  4. **Master Executive Dashboard (`2x2`)**: Raw & Baseline (`Q1`), Calibrated H I Frequency Spectrum (`Q2`, `dB vs MHz`), Doppler Velocity Profile (`Q3`, `K vs km/s`), and Integrated Waterfall (`Q4`).
-- **Parallel Publication Export (`Export All 8 Artifacts`)**:
-  - Generates 5 PNG plots concurrently via `std::async` (`1_hi_spectrum_calibrated.png` through `5_hi_master_dashboard.png`), plus buffered `calibrated_spectrum.csv`, `analysis_report.json`, and `analysis_report.txt` (including full multi-method fit telemetry).
-
----
-
-## 1-Click Laptop Build & Test Guide (Windows)
-
-### Prerequisites
-- Modern Windows laptop/desktop (Windows 10 / 11, 64-bit).
-- MinGW-w64 (GCC 10+), Clang/LLVM, or MSVC.
-- Recommended compiler: WinLibs MinGW-w64 UCRT (`winget install BrechtSanders.WinLibs.POSIX.UCRT`).
-
-### 1. Build the Unified Binaries (1-Click)
-Run the automated build script from `cpp_suite\`:
-```cmd
-cd cpp_suite
-build_mingw.bat
-```
-This builds both executables into `cpp_suite\bin\`:
-- `bin\radio_suite.exe` (Unified Desktop GUI)
-- `bin\radio_suite_cli.exe` (Unified Headless CLI)
-
-*(Alternatively, MSVC users can run `build_msvc.bat`, Clang users can run `build_clang.bat`, and CMake users can run `cmake -B build -G Ninja && cmake --build build`).*
-
-### 2. Run the Automated Test Suite (1-Click)
-Run the dedicated automated test runner from `cpp_suite\`:
-```cmd
-tests\run_tests.bat
-```
-*(To run pre-compiled test binaries without rebuilding, use: `tests\run_tests.bat --skip-build`).*
-
----
-
-## Automated Test Suite Architecture
-
-The test suite is located in `cpp_suite\tests\` and covers 100% of the core state management, bridge functionality, CLI commands, DSP/SIMD parity, all 5 line profile analysis methods, and performance limits:
-
-| Test Executable | Target File | Description | Assertions | Status |
-| :--- | :--- | :--- | :---: | :---: |
-| `test_suite_state.exe` | `test_suite_state.cpp` | Tests `AppState` mode transitions, in-flight collision prevention, thread safety, and auto-analyze bridge handoff | 26 / 26 | **PASS (100%)** |
-| `test_end_to_end_bridge.exe` | `test_end_to_end_bridge.cpp` | Full integration test: SDR virtual capture -> CS16 write -> sidecar creation -> bridge handoff -> offline pipeline -> 21cm line extraction & artifact verification | 40 / 40 | **PASS (100%)** |
-| `test_cli_commands.exe` | `test_cli_commands.cpp` | Validates `radio_suite_cli.exe` subcommands (`record`, `analyze`), flag parsing, error reporting, and mode auto-detection | 44 / 44 | **PASS (100%)** |
-| `test_performance_stress.exe` | `test_performance_stress.cpp` | Benchmarks disk write speed, streaming FFT throughput, astrophysical pass latency, and audits RSS memory | 5 / 5 | **PASS (100%)** |
-| `test_dsp_optimizations.exe` | `test_dsp_optimizations.cpp` | Unit tests for AVX2 `log10`/`exp10`/`exp`, CS16 window conversion, max-pool waterfall, ring-buffer wraparound, history resize, baseline solvers, all 5 H I line profile solvers (`GaussianLS`, `DoubleGaussian`, `VoigtProfile`, `GaussHermite`, `SpectralMoments`), AVX2 Stockham FFT parity, sidecar dedup & coherent dBFS | 79 / 79 | **PASS (100%)** |
-| **Overall Suite** | `run_tests.bat` | Complete automated 1-click test suite runner | **194 / 194** | **PASS (100%)** |
-
----
-
-## Performance Benchmark Summary
-
-Audited on Windows 11 with AVX2 + FMA hardware acceleration:
-
-| Benchmark Metric | Measured Result | Specification Requirement | Verification Status |
-| :--- | :--- | :--- | :---: |
-| **Sustained CS16 Disk Write Throughput** | **210.37 MB/s** (55.15 MSPS) | $\ge 20.0\text{ MB/s}$ | **PASS** (Zero dropped blocks) |
-| **Streaming DSP Analysis Throughput** | **1028.33 MB/s** (269.57 MSPS) | $\ge 40.0\text{ MB/s}$ (Real-time) | **PASS** (>25x faster than target) |
-| **Baseline Working Set (RSS Memory)** | **4.11 MB** | $< 50\text{ MB}$ | **PASS** |
-| **Peak Working Set (RSS Memory)** | **17.41 MB** | $< 50\text{ MB}$ | **PASS** (~3x below limit) |
-| **Memory Growth (50 Stress Passes)** | **2.14 MB** | $< 5.0\text{ MB}$ | **PASS** (Zero unmanaged leaks) |
-| **Scientific Pipeline Latency** | **1.20 ms** / full pass | $< 50\text{ ms}$ | **PASS** |
-
----
-
-## Headless CLI Usage Guide (`radio_suite_cli.exe`)
-
-### 1. Recording Mode
-Record real-time or synthetic observations to disk with automatic sidecars:
-```cmd
-# Record 60 seconds of live SDR data at 1420.5 MHz with 2.4 MSPS:
-bin\radio_suite_cli.exe record --fc 1420.5M --fs 2.4M --duration 60 -g 25.4 -o recordings/observation_001.cs16
-
-# Record using virtual SDR simulator mode (no hardware required):
-bin\radio_suite_cli.exe record --virtual --fc 1420.5M --fs 2.4M --duration 5 -o recordings/unified_test.cs16
+```bash
+cmake -S cpp_suite -B cpp_suite/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp_suite/build
+ctest --test-dir cpp_suite/build --output-on-failure
 ```
 
-### 2. Analysis Mode
-Run scientific analysis on any raw CS16 capture with configurable baseline and line-profile models:
-```cmd
-# Run analysis with automatic sidecar detection and default Gaussian L-M fit:
-bin\radio_suite_cli.exe analyze recordings/unified_test.cs16 -o output/
+This builds binaries in `cpp_suite/bin/`:
+- `cpp_suite/bin/radio_suite_cli` (or `radio_suite_cli.exe` on Windows)
+- `cpp_suite/bin/radio_suite.exe` (Windows only)
+- Test executables: `test_suite_state`, `test_end_to_end_bridge`, `test_cli_commands`, `test_performance_stress`, `test_dsp_optimizations`
 
-# Run 2-component Double Gaussian spiral-arm decomposition with Whittaker ALS baseline:
-bin\radio_suite_cli.exe analyze recordings/unified_test.cs16 --baseline als --line-method double_gaussian --tsys 100.0 -o output/
+## CLI Usage (`radio_suite_cli`)
 
-# Available --line-method options:
-#   gaussian | double_gaussian | voigt | gauss_hermite | moments
+### Record IQ Data
+```bash
+# Record 60s from RTL-SDR hardware
+./cpp_suite/bin/radio_suite_cli record --fc 1420.5M --fs 2.4M -d 60 -g 25.4 -o recordings/obs_001.cs16
+
+# Record 5s from internal virtual H I simulator
+./cpp_suite/bin/radio_suite_cli record --virtual --fc 1420.5M --fs 2.4M -d 5 -o recordings/sim_test.cs16
 ```
 
-### 3. Mode Auto-Detection
-The CLI automatically resolves intended modes without explicit subcommands:
-```cmd
-# Passing record flags automatically selects Record mode:
-bin\radio_suite_cli.exe --virtual --gain 25.4 --duration 10 -o recordings/auto_rec.cs16
+### Analyze IQ Data
+```bash
+# Default pipeline (Ripple baseline + Single Gaussian fit, reads .json/.txt sidecar automatically)
+./cpp_suite/bin/radio_suite_cli analyze recordings/sim_test.cs16 -o output/sim_test
 
-# Passing a .cs16 file automatically selects Analyze mode:
-bin\radio_suite_cli.exe recordings/auto_rec.cs16 -o output/
+# ALS baseline + Double Gaussian 2-arm decomposition
+./cpp_suite/bin/radio_suite_cli analyze recordings/sim_test.cs16 --baseline als --line-method double_gaussian --tsys 100 -o output/sim_test_2arm
+
+# Standing-Wave baseline + Triple Gaussian 3-arm decomposition with custom spin temperature
+./cpp_suite/bin/radio_suite_cli analyze recordings/sim_test.cs16 --baseline standing_wave --line-method triple_gaussian --spin-temp 135 -o output/sim_test_3arm
 ```
 
----
-
-## Repository Directory Structure
+## Repository Layout
 
 ```
-TVRadio/
-├── README.md                            # Top-level repository documentation
-└── cpp_suite/                           # Native C++17 SDR & Scientific Analysis Suite
-    ├── bin/                             # Compiled executables and runtime DLLs
-    │   ├── libusb-1.0.dll               # Hardware USB interface driver
-    │   ├── rtlsdr.dll                   # Hardware RTL-SDR driver
-    │   ├── radio_suite.exe              # Unified Desktop GUI application
-    │   └── radio_suite_cli.exe          # Unified Headless CLI application
-    ├── include/                         # Public Header Files
-    │   ├── app_gui.h                    # Unified Observatory Slate GUI coordinator
-    │   ├── app_state.h                  # Global AppState, mode switcher & collision guards
-    │   ├── astrophysics.h               # Kinematics, Doppler velocity & 5 line-profile solvers
-    │   ├── baseline_fitter.h            # Whittaker ALS, FFT ripple & poly baseline solvers
-    │   ├── config.h                     # Analysis configuration & LineAnalysisMethod enum
-    │   ├── constants.h                  # Physical, astronomical & Observatory Slate constants
-    │   ├── cs16_writer.h                # Lossless CS16 binary writer & sidecar generator
-    │   ├── dc_excision.h                # LO center DC spike excision
-    │   ├── dsp_pipeline.h               # Real-time KissFFT & coherent dBFS PSD averaging
-    │   ├── exporter.h                   # Parallel publication PNG and CSV/JSON/TXT exporter
-    │   ├── lockfree_ringbuffer.h        # SPSC atomic circular buffer
-    │   ├── plot_renderer.h              # Anti-aliased software chart renderer (PNG)
-    │   ├── rfi_filter.h                 # Modified Z-score median MAD filter
-    │   ├── sdr_controller.h             # Hardware tuning coalescing, dispatcher & device worker
-    │   ├── sdr_device.h                 # RTL-SDR hardware interface
-    │   ├── sidecar_reader.h             # Multi-format metadata sidecar parser
-    │   ├── simd_dsp.h                   # AVX2/FMA/SSE4.1 vectorized kernels
-    │   ├── streaming_processor.h        # Multi-threaded AVX2 Stockham FFT accumulator
-    │   ├── ui_analyze_panel.h           # Offline Analysis modular panel
-    │   ├── ui_observatory.h             # Observatory Slate theme, integer-snapped fonts & PlotViewport2D
-    │   ├── ui_record_panel.h            # Live SDR / Record modular panel
-    │   ├── virtual_sdr.h                # Astronomical signal simulator
-    │   └── waterfall.h                  # Rolling RGBA waterfall texture generator
-    ├── lib/                             # Embedded Third-Party Dependencies (ImGui, KissFFT, RTL-SDR, stb)
-    ├── src/                             # C++17 Source Implementations
-    ├── tests/                           # Dedicated 5-Suite Automated Test Harness
-    ├── build_mingw.bat                  # 1-click GCC/MinGW build script
-    ├── build_msvc.bat                   # 1-click Visual Studio build script
-    ├── build_clang.bat                  # 1-click Clang build script
-    ├── CMakeLists.txt                   # CMake build configuration with test targets
-    └── README.md                        # Suite documentation
+Radio/
+├── README.md
+└── cpp_suite/
+    ├── CMakeLists.txt
+    ├── bin/                # Windows RTL-SDR DLLs & build output directory
+    ├── include/            # Core C++17 headers & GUI panel interfaces
+    ├── lib/                # Vendored Dear ImGui, KissFFT, RTL-SDR headers, stb_image_write
+    ├── src/                # DSP, astrophysics, SDR I/O, plotting, CLI, and DX11 GUI sources
+    └── tests/              # State, E2E bridge, CLI, performance, and DSP/math unit tests
 ```

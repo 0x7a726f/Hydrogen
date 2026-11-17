@@ -1,6 +1,8 @@
 #include "cs16_writer.h"
 #include "simd_dsp.h"
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -10,12 +12,22 @@
 
 namespace fs = std::filesystem;
 
+#ifdef _WIN32
 static std::wstring to_wide(const std::string& str) {
     if (str.empty()) return std::wstring();
     int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
     std::wstring result(size, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &result[0], size);
     return result;
+}
+#endif
+
+static void safe_localtime(std::time_t tt, std::tm& out) {
+#ifdef _WIN32
+    localtime_s(&out, &tt);
+#else
+    localtime_r(&tt, &out);
+#endif
 }
 
 Cs16Writer::Cs16Writer(const std::string& output_dir)
@@ -31,8 +43,8 @@ Cs16Writer::~Cs16Writer() {
 static std::string format_iso_now() {
     auto now = std::chrono::system_clock::now();
     std::time_t tt = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_now;
-    localtime_s(&tm_now, &tt);
+    std::tm tm_now{};
+    safe_localtime(tt, tm_now);
     char buf[64];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm_now);
     return std::string(buf);
@@ -41,8 +53,8 @@ static std::string format_iso_now() {
 static std::string format_time_slug_now() {
     auto now = std::chrono::system_clock::now();
     std::time_t tt = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_now;
-    localtime_s(&tm_now, &tt);
+    std::tm tm_now{};
+    safe_localtime(tt, tm_now);
     char buf[64];
     std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_now);
     return std::string(buf);
@@ -88,7 +100,10 @@ std::string Cs16Writer::start_recording(
     }
 
     std::error_code ec;
-    fs::create_directories(fs::path(path_to_use).parent_path(), ec);
+    fs::path parent_dir = fs::path(path_to_use).parent_path();
+    if (!parent_dir.empty()) {
+        fs::create_directories(parent_dir, ec);
+    }
 
 #ifdef _WIN32
     file_handle_ = CreateFileW(
@@ -102,6 +117,13 @@ std::string Cs16Writer::start_recording(
     );
     if (file_handle_ == INVALID_HANDLE_VALUE) {
         return "";
+    }
+#else
+    {
+        std::ofstream probe(path_to_use, std::ios::binary | std::ios::trunc);
+        if (!probe.is_open()) {
+            return "";
+        }
     }
 #endif
 
@@ -313,6 +335,24 @@ void Cs16Writer::writer_worker() {
     is_recording_.store(false, std::memory_order_release);
 }
 
+static std::string escape_json_str(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (char c : input) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:   out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
 void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double duration_s) {
     double fc_hz = (double)center_freq_hz_;
     double fc_mhz = fc_hz / 1e6;
@@ -333,72 +373,58 @@ void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double durat
     double passband_max_mhz = (fc_hz + fs_hz / 2.0) / 1e6;
 
     std::string offset_desc;
-    if (std::abs(offset_khz) < 1.0) {
-        offset_desc = "DIRECT CENTERED (LO placed exactly on HI line; residual DC spike may affect line peak)";
-    } else if (offset_hz > 0) {
+    if (std::abs(offset_khz) < 50.0) {
         std::ostringstream ss;
-        ss << "+" << std::fixed << std::setprecision(2) << offset_khz
-           << " kHz ABOVE HI line (EXCELLENT: LO DC spike is safe and clear of the HI line)";
+        ss << std::showpos << std::fixed << std::setprecision(2) << offset_khz
+           << " kHz from HI rest (LO DC notch lies near the HI window)";
         offset_desc = ss.str();
     } else {
         std::ostringstream ss;
-        ss << std::fixed << std::setprecision(2) << offset_khz
-           << " kHz BELOW HI line (EXCELLENT: LO DC spike is safe and clear of the HI line)";
+        ss << std::showpos << std::fixed << std::setprecision(2) << offset_khz
+           << " kHz from HI rest (LO DC spike is clear of the HI rest window)";
         offset_desc = ss.str();
     }
 
     std::ofstream f(txt_path);
     if (!f.is_open()) return;
 
-    f << "================================================================================\n"
-      << "  HYDROGEN LINE (21cm) RADIO ASTRONOMY OBSERVATION PARAMETERS\n"
-      << "================================================================================\n"
+    f << "HYDROGEN LINE (21cm) OBSERVATION METADATA\n"
+      << "======================================================================\n"
       << "Recording File:             " << cs16_filename << "\n"
       << "Full Path:                  " << full_path << "\n"
       << "Capture Timestamp:          " << iso_start_timestamp_ << "\n"
       << "Receiver Hardware:          " << device_name_ << "\n\n"
-      << "1. OBSERVATIONAL FREQUENCIES & LO OFFSET\n"
-      << "--------------------------------------------------------------------------------\n"
-      << "Celestial Target Line:      Neutral Atomic Hydrogen (H I, 21 cm Spin-Flip)\n"
-      << "HI Rest Frequency:          1420.405752 MHz (1420405751.768 Hz)\n"
+      << "Frequencies & Offset\n"
+      << "----------------------------------------------------------------------\n"
+      << "HI Rest Frequency:          1420.405752 MHz\n"
       << std::fixed << std::setprecision(6)
       << "Tuned SDR Center LO:        " << fc_mhz << " MHz (" << (int64_t)fc_hz << " Hz)\n"
       << std::showpos << std::setprecision(3)
       << "LO Frequency Offset:        " << offset_khz << " kHz (" << (int64_t)offset_hz << " Hz)\n"
       << std::noshowpos
-      << "Offset Strategy:            " << offset_desc << "\n"
-      << std::setprecision(6)
-      << "DC Spike Excision Window:   Excise +/- 5.0 kHz around " << fc_mhz << " MHz\n\n"
-      << "2. SDR HARDWARE & RF CONFIGURATION\n"
-      << "--------------------------------------------------------------------------------\n"
+      << "Offset Assessment:          " << offset_desc << "\n\n"
+      << "SDR Configuration\n"
+      << "----------------------------------------------------------------------\n"
       << std::setprecision(3)
       << "Sampling Rate (Fs):         " << fs_msps << " MSPS (" << (int64_t)fs_hz << " Hz)\n"
-      << "Receiver Nyquist Bandwidth: " << fs_msps << " MHz (Coverage: " << passband_min_mhz << " to " << passband_max_mhz << " MHz)\n"
+      << "Passband Coverage:          " << passband_min_mhz << " to " << passband_max_mhz << " MHz\n"
       << std::setprecision(1)
-      << "Tuner LNA Gain:             " << gain_db_ << " dB\n"
-      << "Bias-Tee (4.5V LNA Power):  " << (bias_tee_ ? "Enabled (Powers external Sawbird+ H1 LNA)" : "Disabled") << "\n"
-      << "Data Format:                CS16 (Signed 16-bit Complex Integer, Little-Endian)\n"
-      << "Bytes Per Complex Sample:   4 bytes (2 bytes I + 2 bytes Q)\n"
-      << "Sample Interleaving:        [I0, Q0, I1, Q1, I2, Q2, ...]\n\n"
-      << "3. ACQUISITION RUNTIME METRICS\n"
-      << "--------------------------------------------------------------------------------\n"
+      << "RF Gain:                    " << gain_db_ << " dB\n"
+      << "Bias-Tee (4.5V):            " << (bias_tee_ ? "Enabled" : "Disabled") << "\n"
+      << "Data Format:                CS16 (Signed 16-bit Complex IQ, Little-Endian)\n\n"
+      << "Acquisition Summary\n"
+      << "----------------------------------------------------------------------\n"
       << std::setprecision(2)
-      << "Observation Duration:       " << duration_s << " seconds (" << dur_min << " minutes)\n"
-      << "Total Complex Samples:      " << samples_written_.load() << " samples\n"
+      << "Observation Duration:       " << duration_s << " s (" << dur_min << " min)\n"
+      << "Total Complex Samples:      " << samples_written_.load() << "\n"
       << "Total File Size:            " << bytes_written_.load() << " bytes (" << size_mb << " MB / "
       << std::setprecision(3) << size_gb << " GB)\n"
       << std::setprecision(2)
-      << "Average Data Rate:          " << ((fs_hz * 4.0) / (1024.0 * 1024.0)) << " MB/s\n\n"
-      << "4. OFFLINE ANALYSIS INSTRUCTIONS\n"
-      << "--------------------------------------------------------------------------------\n"
-      << "The Radio Astronomy Suite GUI & CLI automatically read this sidecar, or you can\n"
-      << "run offline analysis directly with the observed parameters:\n\n"
-      << "  [CLI Full Pipeline & 5-Panel PNG Export]\n"
+      << "Nominal Data Rate:          " << ((fs_hz * 4.0) / (1024.0 * 1024.0)) << " MB/s\n\n"
+      << "CLI Analysis Command\n"
+      << "----------------------------------------------------------------------\n"
       << std::fixed << std::setprecision(4)
-      << "  radio_suite_cli.exe analyze \"" << cs16_filename << "\" --fc " << fc_mhz << "M --fs " << fs_msps << "M --out output\n\n"
-      << "  [Interactive GUI Analyzer]\n"
-      << "  radio_suite.exe (Switch to Offline HI Analysis mode and select recording)\n"
-      << "================================================================================\n";
+      << "  radio_suite_cli analyze \"" << cs16_filename << "\" --fc " << fc_mhz << "M --fs " << fs_msps << "M -o output\n";
     f.flush();
     f.close();
 }
@@ -413,7 +439,9 @@ void Cs16Writer::write_sidecar_json(const std::string& json_path, double duratio
     std::string clean_path;
     {
         std::lock_guard<std::mutex> lock(path_mutex_);
-        clean_path = fs::absolute(current_filepath_).generic_string();
+        std::error_code ec;
+        clean_path = fs::absolute(current_filepath_, ec).generic_string();
+        if (clean_path.empty()) clean_path = current_filepath_;
     }
 
     f << "{\n"
@@ -426,16 +454,16 @@ void Cs16Writer::write_sidecar_json(const std::string& json_path, double duratio
       << std::fixed << std::setprecision(3)
       << "  \"lo_offset_hz\": " << offset_hz << ",\n"
       << "  \"lo_offset_khz\": " << offset_khz << ",\n"
-      << "  \"timestamp\": \"" << iso_start_timestamp_ << "\",\n"
+      << "  \"timestamp\": \"" << escape_json_str(iso_start_timestamp_) << "\",\n"
       << std::setprecision(2)
       << "  \"duration_seconds\": " << duration_s << ",\n"
       << "  \"total_samples\": " << samples_written_.load() << ",\n"
       << "  \"file_size_bytes\": " << bytes_written_.load() << ",\n"
-      << "  \"device\": \"" << device_name_ << "\",\n"
+      << "  \"device\": \"" << escape_json_str(device_name_) << "\",\n"
       << std::setprecision(1)
       << "  \"gain_db\": " << gain_db_ << ",\n"
       << "  \"bias_tee\": " << (bias_tee_ ? "true" : "false") << ",\n"
-      << "  \"file_path\": \"" << clean_path << "\"\n"
+      << "  \"file_path\": \"" << escape_json_str(clean_path) << "\"\n"
       << "}\n";
     f.flush();
     f.close();
@@ -477,18 +505,33 @@ RecordingStats Cs16Writer::get_stats() {
     }
     s.size_str = sz_buf;
 
-    // Free disk space via Windows API
+    uint64_t free_bytes = 0;
+    bool have_free = false;
+#ifdef _WIN32
     ULARGE_INTEGER free_bytes_avail, total_bytes, total_free_bytes;
     std::wstring dir_w = to_wide(output_dir_.empty() ? "." : output_dir_);
     if (GetDiskFreeSpaceExW(dir_w.c_str(), &free_bytes_avail, &total_bytes, &total_free_bytes)) {
-        s.free_space_gb = (double)free_bytes_avail.QuadPart / (1024.0 * 1024.0 * 1024.0);
+        free_bytes = free_bytes_avail.QuadPart;
+        have_free = true;
+    }
+#else
+    std::error_code space_ec;
+    auto si = fs::space(output_dir_.empty() ? "." : output_dir_, space_ec);
+    if (!space_ec) {
+        free_bytes = static_cast<uint64_t>(si.available);
+        have_free = true;
+    }
+#endif
+
+    if (have_free) {
+        s.free_space_gb = (double)free_bytes / (1024.0 * 1024.0 * 1024.0);
         char free_buf[32];
         snprintf(free_buf, sizeof(free_buf), "%.2f GB", s.free_space_gb);
         s.free_space_str = free_buf;
 
         uint64_t bytes_per_sec = (uint64_t)sample_rate_hz_ * 4ULL;
         if (bytes_per_sec > 0) {
-            uint64_t time_left_s = free_bytes_avail.QuadPart / bytes_per_sec;
+            uint64_t time_left_s = free_bytes / bytes_per_sec;
             int tl_days = (int)(time_left_s / 86400);
             int tl_hrs = (int)((time_left_s % 86400) / 3600);
             int tl_mins = (int)((time_left_s % 3600) / 60);

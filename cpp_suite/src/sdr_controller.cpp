@@ -95,6 +95,18 @@ bool SdrController::start_streaming() {
             device_ = std::move(vdev);
             is_simulated_ = true;
         }
+        device_->set_frequency(current_freq_.load());
+        device_->set_sample_rate(current_rate_.load());
+        device_->set_gain(current_gain_.load(), auto_gain_.load());
+        device_->set_bias_tee(bias_tee_.load());
+        device_->set_ppm(ppm_.load());
+
+        current_freq_.store(device_->get_frequency());
+        current_rate_.store(device_->get_sample_rate());
+        current_gain_.store(device_->get_gain());
+        auto_gain_.store(device_->is_auto_gain());
+        bias_tee_.store(device_->get_bias_tee());
+        ppm_.store(device_->get_ppm());
     }
 
     ring_buffer_.reset();

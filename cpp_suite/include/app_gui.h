@@ -48,7 +48,6 @@ private:
     astro::UiAnalyzePanel analyze_panel_;
 
     ID3D11Device* d3d_device_ = nullptr;
-    HWND owner_hwnd_ = nullptr;
 
     // Throttled status bar telemetry
     std::string cached_simd_name_;

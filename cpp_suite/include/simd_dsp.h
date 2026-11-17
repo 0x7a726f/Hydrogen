@@ -53,7 +53,7 @@ inline CpuSimdLevel detect_cpu_simd() {
             if (info[3] & (1 << 26)) return CpuSimdLevel::SSE2;
         }
 #endif
-        return CpuSimdLevel::AVX2; // Modern x86_64 default
+        return CpuSimdLevel::Scalar;
     }();
     return cached_level;
 }
@@ -260,12 +260,12 @@ inline __m256 fast_log2_avx2(__m256 x) {
                                       _mm256_set1_epi32(0x3F800000));
     __m256 m = _mm256_sub_ps(_mm256_castsi256_ps(mant_i), _mm256_set1_ps(1.0f)); // m in [0.0, 1.0)
 
-    // 4th-degree minimax polynomial for log2(1 + m):
+    // 4th-degree minimax polynomial for log2(1 + m) on [0, 1] with p(0)=0, p(1)=1:
     // p(m) = m * (c1 + m * (c2 + m * (c3 + m * c4)))
-    const __m256 c1 = _mm256_set1_ps(1.44269504f);
-    const __m256 c2 = _mm256_set1_ps(-0.72078604f);
-    const __m256 c3 = _mm256_set1_ps(0.44917631f);
-    const __m256 c4 = _mm256_set1_ps(-0.22238491f);
+    const __m256 c1 = _mm256_set1_ps(1.439991293f);
+    const __m256 c2 = _mm256_set1_ps(-0.681706836f);
+    const __m256 c3 = _mm256_set1_ps(0.324036323f);
+    const __m256 c4 = _mm256_set1_ps(-0.082320779f);
 
 #if SIMD_HAS_FMA
     __m256 p = _mm256_fmadd_ps(c4, m, c3);
@@ -532,10 +532,10 @@ inline float fast_10log10_scalar(float x) {
     u.i = (u.i & 0x007FFFFF) | 0x3F800000;
     float m = u.f - 1.0f;
 
-    // Polynomial
-    float p = -0.22238491f * m + 0.44917631f;
-    p = p * m - 0.72078604f;
-    p = p * m + 1.44269504f;
+    // Endpoint-continuous 4th-degree minimax polynomial matching fast_log2_avx2
+    float p = -0.082320779f * m + 0.324036323f;
+    p = p * m - 0.681706836f;
+    p = p * m + 1.439991293f;
     p = p * m;
 
     float val = 3.01029995664f * ((float)exp + p);

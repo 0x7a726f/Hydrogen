@@ -1,4 +1,8 @@
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <csignal>
+#endif
 #include <iostream>
 #include <iomanip>
 #include <cstdio>
@@ -24,6 +28,7 @@
 
 static std::atomic<bool> g_interrupted{false};
 
+#ifdef _WIN32
 static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_CLOSE_EVENT) {
         g_interrupted.store(true);
@@ -31,67 +36,39 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     }
     return FALSE;
 }
-
-static uint64_t parse_freq_or_rate(const std::string& str) {
-    std::string s = str;
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)::tolower(c); });
-    double mul = 1.0;
-    if (s.find("ghz") != std::string::npos || s.find("g") != std::string::npos) {
-        mul = 1e9;
-    } else if (s.find("mhz") != std::string::npos || s.find("msps") != std::string::npos || s.find("m") != std::string::npos) {
-        mul = 1e6;
-    } else if (s.find("khz") != std::string::npos || s.find("ksps") != std::string::npos || s.find("k") != std::string::npos) {
-        mul = 1e3;
-    }
-    double v = 0.0;
-    if (sscanf(s.c_str(), "%lf", &v) == 1) {
-        if (mul == 1.0 && v < 10000.0) {
-            v *= 1e6;
-        } else {
-            v *= mul;
-        }
-        return (uint64_t)v;
-    }
-    return 0;
+#else
+static void PosixSignalHandler(int) {
+    g_interrupted.store(true);
 }
-
-static void print_banner() {
-    std::cout << "\n======================================================================\n";
-    std::cout << "  HYDROGEN LINE UNIFIED SDR & ASTROPHYSICS SUITE (CLI)\n";
-    std::cout << "======================================================================\n";
-}
+#endif
 
 static void print_help(const char* prog) {
-    print_banner();
-    std::cout << "Usage:\n"
-              << "  " << prog << " record  [options]   Run headless real-time SDR CS16 recorder\n"
-              << "  " << prog << " analyze [options]   Run scientific radio astronomy offline analysis\n"
-              << "\n"
-              << "----------------------------------------------------------------------\n"
-              << "RECORD MODE OPTIONS (Subcommand: record):\n"
+    std::cout << "Hydrogen Line (21 cm) SDR & Astrophysics Suite CLI\n\n"
+              << "Usage:\n"
+              << "  " << prog << " record  [options]   Record raw CS16 IQ samples from SDR\n"
+              << "  " << prog << " analyze [options]   Analyze CS16 file and export calibrated outputs\n\n"
+              << "Record Options:\n"
               << "  --fc <freq>              Center LO frequency (e.g. 1420.5M, 1420500000)\n"
-              << "  --fs <rate>              Sample rate (e.g. 2.4M, 2400000)\n"
+              << "  --fs <rate>              Sample rate (e.g. 2.4M, 2.4, 2400000)\n"
               << "  -d, -t, --duration <sec> Capture duration in seconds (default: 60)\n"
-              << "  -g, --gain <dB>          Tuner LNA gain in dB (default: 25.4)\n"
+              << "  -g, --gain <dB>          Tuner gain in dB (default: 25.4)\n"
               << "  --bias-tee               Enable 4.5V LNA bias-tee\n"
               << "  -o, --output <path>      Output .cs16 file path\n"
-              << "  --virtual                Force Virtual SDR simulation mode\n"
-              << "\n"
-              << "ANALYZE MODE OPTIONS (Subcommand: analyze):\n"
-              << "  FILE, -f, --file PATH    Path to raw CS16 file (auto-discovered if omitted)\n"
+              << "  --virtual                Force Virtual SDR simulation mode\n\n"
+              << "Analyze Options:\n"
+              << "  FILE, -f, --file PATH    Input CS16 file (auto-discovered if omitted)\n"
               << "  --fc <freq>              Center LO frequency override\n"
               << "  --fs <rate>              Sample rate override\n"
-              << "  -n, --fft-size <bins>    FFT channel size (2048, 4096, 8192, 16384). Default: 8192\n"
+              << "  -n, --fft-size <bins>    FFT channels (even, >= 64; default: 8192)\n"
               << "  -t, --duration <sec>     Max duration in seconds to process (default: entire file)\n"
-              << "  --baseline <method>      Baseline model: 'ripple_filter', 'als', 'poly'\n"
-              << "  --line-method <method>   Line analysis: 'gaussian_ls', 'double_gaussian', 'voigt', 'gauss_hermite', 'moments'\n"
+              << "  --baseline <method>      Baseline model: ripple_filter, als, poly, savitzky_golay, standing_wave\n"
+              << "  --line-method <method>   Line model: gaussian_ls, double_gaussian, triple_gaussian, voigt, gauss_hermite, moments, busy_function\n"
               << "  --tsys <Kelvin>          Assumed system noise temperature (default: 100.0 K)\n"
-              << "  -o, --output-dir <dir>   Output directory for PNG plots and CSV (default: 'output')\n"
-              << "\n"
+              << "  --spin-temp <Kelvin>     Assumed H I spin temperature for optical depth (default: 150.0 K)\n"
+              << "  -o, --output-dir <dir>   Output directory for CSV, JSON, PNG, and summary (default: output)\n\n"
               << "Examples:\n"
               << "  " << prog << " record --fc 1420.5M --fs 2.4M --duration 60 -o capture.cs16\n"
-              << "  " << prog << " analyze capture.cs16 -o output/\n"
-              << "======================================================================\n";
+              << "  " << prog << " analyze capture.cs16 -o output\n";
 }
 
 int run_record(int argc, char* argv[], int start_idx) {
@@ -117,14 +94,24 @@ int run_record(int argc, char* argv[], int start_idx) {
             }
         } else if (arg == "--fc") {
             if (i + 1 < argc) {
-                center_freq_hz = parse_freq_or_rate(argv[++i]);
+                double parsed = astro::parse_frequency_or_rate(argv[++i], true);
+                if (parsed <= 0.0) {
+                    std::cerr << "Error: Invalid center frequency.\n";
+                    return 1;
+                }
+                center_freq_hz = static_cast<uint64_t>(parsed);
             } else {
                 std::cerr << "Error: Missing value for " << arg << "\n";
                 return 1;
             }
         } else if (arg == "--fs") {
             if (i + 1 < argc) {
-                sample_rate_hz = static_cast<uint32_t>(parse_freq_or_rate(argv[++i]));
+                double parsed = astro::parse_sample_rate(argv[++i]);
+                if (parsed <= 0.0 || parsed > 20e6) {
+                    std::cerr << "Error: Invalid sample rate.\n";
+                    return 1;
+                }
+                sample_rate_hz = static_cast<uint32_t>(parsed);
             } else {
                 std::cerr << "Error: Missing value for " << arg << "\n";
                 return 1;
@@ -154,19 +141,6 @@ int run_record(int argc, char* argv[], int start_idx) {
         }
     }
 
-    std::cout << "\n======================================================================\n"
-              << "  HYDROGEN LINE SDR CS16 HEADLESS RECORDER\n"
-              << "======================================================================\n"
-              << std::fixed << std::setprecision(3)
-              << "  Center Frequency:  " << (center_freq_hz / 1e6) << " MHz\n"
-              << std::setprecision(2)
-              << "  Sample Rate:       " << (sample_rate_hz / 1e6) << " MSPS\n"
-              << std::setprecision(1)
-              << "  Duration:          " << duration_s << " seconds\n"
-              << "  Gain:              " << gain_db << " dB\n"
-              << "  Bias-Tee (4.5V):   " << (bias_tee ? "Enabled" : "Disabled") << "\n"
-              << "----------------------------------------------------------------------\n";
-
     SdrController sdr;
     Cs16Writer writer("recordings");
 
@@ -175,20 +149,35 @@ int run_record(int argc, char* argv[], int start_idx) {
     });
 
     if (!sdr.initialize(force_virtual, 0)) {
-        std::cerr << "Failed to initialize SDR device!\n";
+        std::cerr << "Error: Failed to initialize SDR device.\n";
         return 1;
     }
 
-    sdr.request_frequency(center_freq_hz);
-    sdr.request_sample_rate(sample_rate_hz);
-    sdr.request_gain(gain_db, false);
-    if (bias_tee) sdr.request_bias_tee(true);
+    sdr.request_frequency(center_freq_hz).wait();
+    sdr.request_sample_rate(sample_rate_hz).wait();
+    sdr.request_gain(gain_db, false).wait();
+    if (bias_tee) sdr.request_bias_tee(true).wait();
+
+    uint64_t actual_fc = sdr.get_current_frequency();
+    uint32_t actual_fs = sdr.get_current_sample_rate();
+    float actual_gain = sdr.get_current_gain();
+    bool actual_bias_tee = sdr.is_bias_tee_enabled();
+
+    std::cout << "\nHydrogen Line SDR Recorder\n"
+              << std::fixed << std::setprecision(3)
+              << "  Center Frequency:  " << (actual_fc / 1e6) << " MHz\n"
+              << std::setprecision(2)
+              << "  Sample Rate:       " << (actual_fs / 1e6) << " MSPS\n"
+              << std::setprecision(1)
+              << "  Duration:          " << duration_s << " s\n"
+              << "  Gain:              " << actual_gain << " dB\n"
+              << "  Bias-Tee:          " << (actual_bias_tee ? "Enabled" : "Disabled") << "\n";
 
     std::string actual_file = writer.start_recording(
-        sample_rate_hz, center_freq_hz, sdr.get_device_name(), gain_db, bias_tee, output_path, duration_s
+        actual_fs, actual_fc, sdr.get_device_name(), actual_gain, actual_bias_tee, output_path, duration_s
     );
     if (actual_file.empty()) {
-        std::cerr << "Error: Failed to open output CS16 file for recording!\n";
+        std::cerr << "Error: Failed to open output CS16 file for recording.\n";
         sdr.shutdown();
         return 1;
     }
@@ -236,6 +225,7 @@ int run_analyze(int argc, char* argv[], int start_idx) {
     int fft_size = 8192;
     double duration_s = 0.0;
     double tsys = 100.0;
+    double tspin = DEFAULT_HI_SPIN_TEMP_K;
 
     for (int i = start_idx; i < argc; ++i) {
         std::string arg = argv[i];
@@ -298,6 +288,13 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 std::cerr << "Error: Missing value for " << arg << "\n";
                 return 1;
             }
+        } else if (arg == "--spin-temp" || arg == "--tspin") {
+            if (i + 1 < argc) {
+                tspin = std::stod(argv[++i]);
+            } else {
+                std::cerr << "Error: Missing value for " << arg << "\n";
+                return 1;
+            }
         } else if (arg == "-o" || arg == "--output-dir") {
             if (i + 1 < argc) {
                 out_dir = argv[++i];
@@ -352,10 +349,24 @@ int run_analyze(int argc, char* argv[], int start_idx) {
         }
     }
 
+    if (fft_size < 64 || (fft_size % 2) != 0) {
+        std::cerr << "Error: --fft-size must be an even integer >= 64.\n";
+        return 1;
+    }
+    if (tsys <= 0.0) {
+        std::cerr << "Error: --tsys must be > 0 K.\n";
+        return 1;
+    }
+    if (tspin <= 0.0) {
+        std::cerr << "Error: --spin-temp must be > 0 K.\n";
+        return 1;
+    }
+
     AstroConfig config;
     config.fft_size = fft_size;
     config.max_duration_s = duration_s;
     config.system_temp_k = tsys;
+    config.spin_temp_k = tspin;
     config.output_dir = out_dir;
 
     if (!baseline_str.empty()) {
@@ -375,17 +386,21 @@ int run_analyze(int argc, char* argv[], int start_idx) {
     }
 
     if (!fc_str.empty()) config.center_freq_hz = parse_frequency_or_rate(fc_str, true);
-    if (!fs_str.empty()) config.sample_rate_hz = parse_frequency_or_rate(fs_str, false);
+    if (!fs_str.empty()) config.sample_rate_hz = parse_sample_rate(fs_str);
+    if (config.center_freq_hz <= 0.0 || config.sample_rate_hz <= 0.0) {
+        std::cerr << "Error: Center frequency and sample rate must be positive.\n";
+        return 1;
+    }
 
-    std::cout << "\n======================================================================\n"
-              << "  ASTROPHYSICAL DSP ANALYSIS PIPELINE\n"
-              << "======================================================================\n"
+    std::cout << "\nAstrophysical DSP Analysis Pipeline\n"
               << "  Target CS16:       " << filepath << "\n"
               << "  Center LO:         " << (config.center_freq_hz / 1e6) << " MHz\n"
               << "  Sample Rate:       " << (config.sample_rate_hz / 1e6) << " MSPS\n"
               << "  FFT Channels:      " << config.fft_size << "\n"
               << "  Baseline Method:   " << baseline_method_to_string(config.baseline_method) << "\n"
+              << "  Line Model:        " << line_analysis_method_to_string(config.line_method) << "\n"
               << "  System Temp Tsys:  " << config.system_temp_k << " K\n"
+              << "  Spin Temp Tspin:   " << config.spin_temp_k << " K\n"
               << "  Output Directory:  " << config.output_dir << "\n"
               << "----------------------------------------------------------------------\n";
 
@@ -431,14 +446,14 @@ int run_analyze(int argc, char* argv[], int start_idx) {
     double slope = 0.0, intercept = 0.0;
     BaselineFitter::refine_local(v_kms, cal_k, cal_db, config, slope, intercept);
 
-    // 6. Astrophysics Metrics & Gaussian Curve Fit
-    std::cout << "--> Computing astrophysical metrics and Levenberg-Marquardt fit...\n";
+    // 6. Astrophysics Metrics & Line Curve Fit
+    std::cout << "--> Computing astrophysical metrics and line model (" << line_analysis_method_to_string(config.line_method) << ")...\n";
     AstrophysicalMetrics metrics = Astrophysics::calculate_metrics(
         stream.freq_mhz, v_kms, cal_k, cal_db, config
     );
 
     // 7. Structured Export
-    std::cout << "--> Rendering publication-grade PNGs and CSV exports...\n";
+    std::cout << "--> Exporting analysis results...\n";
     FileMetadata meta;
     meta.filepath = filepath;
     meta.filesize = stream.file_size_bytes;
@@ -453,9 +468,7 @@ int run_analyze(int argc, char* argv[], int start_idx) {
     );
 
     // 8. Print Executive Summary
-    std::cout << "\n======================================================================\n"
-              << "  ASTROPHYSICAL EXECUTIVE REPORT\n"
-              << "======================================================================\n"
+    std::cout << "\nAstrophysical Results Summary\n"
               << std::fixed << std::setprecision(4)
               << "  Peak Frequency:         " << metrics.peak_freq_mhz << " MHz\n"
               << std::setprecision(2)
@@ -464,18 +477,27 @@ int run_analyze(int argc, char* argv[], int start_idx) {
               << "  Noise Floor RMS:        " << metrics.noise_std_k << " K\n"
               << "  Detection SNR:          " << metrics.snr << " sigma\n"
               << "  Line FWHM Width:        " << metrics.fwhm_kms << " km/s\n"
+              << "  Profile Widths W50/W20: " << metrics.w50_kms << " / " << metrics.w20_kms << " km/s\n"
+              << "  Equivalent Width W_eq:  " << metrics.equivalent_width_kms << " km/s\n"
+              << "  Max Kinetic Temp T_k:   " << std::setprecision(0) << metrics.doppler_temp_max_k << " K\n"
+              << "  Peak Optical Depth tau: " << std::setprecision(4) << metrics.peak_optical_depth << "\n"
+              << std::setprecision(2)
               << "  Integrated Flux Area:   " << metrics.integrated_flux_k_kms << " K*km/s\n"
-              << "  H I Column Density:     " << std::scientific << metrics.column_density_cm2 << " atoms/cm^2\n"
+              << "  H I Column Density:     " << std::scientific << metrics.column_density_cm2 << " atoms/cm^2 (optically thin)\n"
+              << "  H I Column (Thick):     " << std::scientific << metrics.column_density_thick_cm2 << " atoms/cm^2\n"
               << std::fixed
-              << "----------------------------------------------------------------------\n"
-              << "  All artifacts successfully written to: " << config.output_dir << "/\n"
-              << "======================================================================\n";
+              << "  Output written to:      " << config.output_dir << "/\n";
 
     return 0;
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#else
+    std::signal(SIGINT, PosixSignalHandler);
+    std::signal(SIGTERM, PosixSignalHandler);
+#endif
 
     if (argc < 2) {
         print_help(argv[0]);
@@ -503,15 +525,33 @@ int main(int argc, char* argv[]) {
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "-o" || arg == "--output" || arg == "--output-dir") {
-                // Skip output path parameter so an output .cs16 is not confused with an input file to analyze
-                i++;
+                ++i;
                 continue;
             }
-            if (arg == "--gain" || arg == "-g" || arg == "--bias-tee" || arg == "--virtual") {
-                has_record_flag = true;
-            }
-            if (arg == "--baseline" || arg == "--tsys" || arg == "-n" || arg == "--fft-size") {
+            if (arg == "-f" || arg == "--file") {
                 has_analyze_flag = true;
+                ++i;
+                continue;
+            }
+            if (arg == "--baseline" || arg == "--tsys" || arg == "--spin-temp" || arg == "--tspin" ||
+                arg == "-n" || arg == "--fft-size" || arg == "--line-method" || arg == "--fit") {
+                has_analyze_flag = true;
+                ++i;
+                continue;
+            }
+            if (arg == "--gain" || arg == "-g") {
+                has_record_flag = true;
+                ++i;
+                continue;
+            }
+            if (arg == "--bias-tee" || arg == "--virtual") {
+                has_record_flag = true;
+                continue;
+            }
+            if (arg == "--fc" || arg == "--center-freq" || arg == "--fs" || arg == "--sample-rate" ||
+                arg == "-d" || arg == "-t" || arg == "--duration") {
+                ++i;
+                continue;
             }
             if (arg.size() >= 5 && arg.substr(arg.size() - 5) == ".cs16") {
                 is_cs16_file = true;
@@ -523,7 +563,7 @@ int main(int argc, char* argv[]) {
             return run_record(argc, argv, 1);
         } else if (is_cs16_file || has_analyze_flag || std::filesystem::exists(argv[1], cli_ec)) {
             return run_analyze(argc, argv, 1);
-        } else if (cmd.rfind("--fc", 0) == 0 || cmd.rfind("-d", 0) == 0 || cmd.rfind("-t", 0) == 0) {
+        } else if (cmd.rfind("--fc", 0) == 0 || cmd.rfind("-d", 0) == 0 || cmd.rfind("-t", 0) == 0 || cmd.rfind("--fs", 0) == 0) {
             return run_record(argc, argv, 1);
         } else {
             std::cerr << "Error: Unknown subcommand or file '" << argv[1] << "'.\n";

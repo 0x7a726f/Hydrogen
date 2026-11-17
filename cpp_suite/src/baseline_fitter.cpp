@@ -459,73 +459,157 @@ std::vector<double> BaselineFitter::fit_als(
     const AstroConfig& config
 ) {
     (void)freqs_mhz;
-    int n = static_cast<int>(p_db.size());
+    const int n = static_cast<int>(p_db.size());
     if (n < 4) return p_db;
 
-    thread_local std::vector<double> w, s_diag, A_diag, A_sub1, A_sub2, rhs, z, clean_residuals;
-    w.resize(n);
-    s_diag.resize(n);
-    A_diag.resize(n);
-    A_sub1.resize(n - 1);
-    A_sub2.resize(n - 2);
-    rhs.resize(n);
-    z.assign(n, 0.0);
+    // Solve ALS on at most 256 macro-bins so als_lambda (tuned for ~256 points) maintains a
+    // consistent fractional passband smoothing scale and well-conditioned LDL^T factorization
+    // across large FFT sizes (e.g. 8192..65536).
+    const int m = (n <= 256) ? n : 256;
+    std::vector<double> m_y(m, 0.0);
+    std::vector<double> m_center(m, 0.0);
+    std::vector<uint8_t> m_pass(m, 1);
+    std::vector<uint8_t> m_hi(m, 0);
 
-    for (int i = 0; i < n; ++i) {
+    if (m == n) {
+        for (int i = 0; i < n; ++i) {
+            m_y[i] = p_db[i];
+            m_center[i] = static_cast<double>(i);
+            m_pass[i] = passband_mask[i];
+            m_hi[i] = hi_window[i];
+        }
+    } else {
+        for (int b = 0; b < m; ++b) {
+            const int i0 = static_cast<int>((static_cast<int64_t>(b) * n) / m);
+            const int i1 = static_cast<int>((static_cast<int64_t>(b + 1) * n) / m);
+            m_center[b] = 0.5 * static_cast<double>(i0 + i1 - 1);
+
+            double sum_clean = 0.0;
+            int cnt_clean = 0;
+            double sum_pass = 0.0;
+            int cnt_pass = 0;
+            double sum_all = 0.0;
+            int cnt_all = 0;
+            int cnt_hi = 0;
+            int cnt_out_pass = 0;
+
+            for (int i = i0; i < i1; ++i) {
+                sum_all += p_db[i];
+                ++cnt_all;
+                if (passband_mask[i]) {
+                    sum_pass += p_db[i];
+                    ++cnt_pass;
+                    if (!hi_window[i]) {
+                        sum_clean += p_db[i];
+                        ++cnt_clean;
+                    }
+                } else {
+                    ++cnt_out_pass;
+                }
+                if (hi_window[i]) ++cnt_hi;
+            }
+
+            if (cnt_clean > 0) {
+                m_y[b] = sum_clean / static_cast<double>(cnt_clean);
+                m_pass[b] = 1;
+                m_hi[b] = (cnt_hi > cnt_all / 2) ? 1 : 0;
+            } else if (cnt_pass > 0) {
+                // Entire macro-bin is inside H I window
+                m_y[b] = sum_pass / static_cast<double>(cnt_pass);
+                m_pass[b] = 1;
+                m_hi[b] = 1;
+            } else {
+                // Outer skirt macro-bin
+                m_y[b] = (cnt_all > 0) ? (sum_all / static_cast<double>(cnt_all)) : 0.0;
+                m_pass[b] = (cnt_out_pass > 0) ? 0 : 1;
+                m_hi[b] = (cnt_hi > 0) ? 1 : 0;
+            }
+        }
+    }
+
+    thread_local std::vector<double> w, s_diag, A_diag, A_sub1, A_sub2, rhs, z, clean_residuals;
+    w.resize(m);
+    s_diag.resize(m);
+    A_diag.resize(m);
+    A_sub1.resize(m - 1);
+    A_sub2.resize(m - 2);
+    rhs.resize(m);
+    z.assign(m, 0.0);
+
+    for (int i = 0; i < m; ++i) {
         double wi = 1.0;
-        if (!passband_mask[i]) wi = 0.02;
-        if (hi_window[i]) wi = 1e-9;
+        if (!m_pass[i]) wi = 0.02;
+        if (m_hi[i]) wi = 1e-9;
         w[i] = wi;
     }
 
-    const double lam = config.als_lambda;
-    const double p = config.als_p;
+    const double lam = std::max(1.0, config.als_lambda);
+    const double p = std::clamp(config.als_p, 1e-4, 0.9999);
 
     // Second difference operator D has D^T D entries:
     // S_diag: [1, 5, 6, 6, ..., 6, 5, 1]
     // S_sub1: [-2, -4, -4, ..., -4, -2]
     // S_sub2: [1, 1, ..., 1]
-    std::fill_n(s_diag.data(), n, 6.0);
+    std::fill_n(s_diag.data(), m, 6.0);
     s_diag[0] = 1.0;
     s_diag[1] = 5.0;
-    s_diag[n - 2] = 5.0;
-    s_diag[n - 1] = 1.0;
+    s_diag[m - 2] = 5.0;
+    s_diag[m - 1] = 1.0;
 
-    std::fill_n(A_sub1.data(), n - 1, lam * -4.0);
+    std::fill_n(A_sub1.data(), m - 1, lam * -4.0);
     A_sub1[0] = lam * -2.0;
-    A_sub1[n - 2] = lam * -2.0;
-    std::fill_n(A_sub2.data(), n - 2, lam);
+    A_sub1[m - 2] = lam * -2.0;
+    std::fill_n(A_sub2.data(), m - 2, lam);
 
     const int iterations = 8;
     for (int iter = 0; iter < iterations; ++iter) {
-        for (int i = 0; i < n; ++i) {
+        for (int i = 0; i < m; ++i) {
             A_diag[i] = w[i] + lam * s_diag[i];
-            rhs[i] = w[i] * p_db[i];
+            rhs[i] = w[i] * m_y[i];
         }
 
-        solve_pentadiagonal_symmetric(n, A_diag.data(), A_sub1.data(), A_sub2.data(), rhs.data(), z.data());
+        solve_pentadiagonal_symmetric(m, A_diag.data(), A_sub1.data(), A_sub2.data(), rhs.data(), z.data());
 
-        for (int i = 0; i < n; ++i) {
-            double wi = (p_db[i] > z[i]) ? p : (1.0 - p);
-            if (!passband_mask[i]) wi = 0.02;
-            if (hi_window[i]) wi = 1e-9;
+        for (int i = 0; i < m; ++i) {
+            double wi = (m_y[i] > z[i]) ? p : (1.0 - p);
+            if (!m_pass[i]) wi = 0.02;
+            if (m_hi[i]) wi = 1e-9;
             w[i] = wi;
         }
     }
 
-    // Center baseline on the median of clean passband noise residuals
+    std::vector<double> baseline_db(n);
+    if (m == n) {
+        for (int i = 0; i < n; ++i) baseline_db[i] = z[i];
+    } else {
+        int b = 0;
+        for (int i = 0; i < n; ++i) {
+            const double x = static_cast<double>(i);
+            while (b + 1 < m - 1 && x > m_center[b + 1]) ++b;
+            if (x <= m_center[0]) {
+                baseline_db[i] = z[0];
+            } else if (x >= m_center[m - 1]) {
+                baseline_db[i] = z[m - 1];
+            } else {
+                const double span = std::max(1e-9, m_center[b + 1] - m_center[b]);
+                const double t = (x - m_center[b]) / span;
+                baseline_db[i] = z[b] + t * (z[b + 1] - z[b]);
+            }
+        }
+    }
+
+    // Center baseline on the median of clean passband noise residuals at full resolution
     clean_residuals.clear();
     if (clean_residuals.capacity() < static_cast<size_t>(n)) clean_residuals.reserve(n);
     for (int i = 0; i < n; ++i) {
         if (passband_mask[i] && !hi_window[i]) {
-            clean_residuals.push_back(p_db[i] - z[i]);
+            clean_residuals.push_back(p_db[i] - baseline_db[i]);
         }
     }
 
     double noise_offset = median_of_inplace(clean_residuals);
-    std::vector<double> baseline_db(n);
     for (int i = 0; i < n; ++i) {
-        baseline_db[i] = z[i] + noise_offset;
+        baseline_db[i] += noise_offset;
     }
     return baseline_db;
 }
@@ -577,8 +661,6 @@ std::vector<double> BaselineFitter::fit_poly(
     }
 
     double coeffs[16] = {0.0};
-    scratch_res = p_db;
-    coeffs[0] = median_of_inplace(scratch_res); // Safe initial baseline level
     if (scratch_res.capacity() < static_cast<size_t>(n)) scratch_res.reserve(n);
 
     const int max_mom = 2 * deg; // <= 28
@@ -694,7 +776,7 @@ std::vector<double> BaselineFitter::fit_poly(
             }
         }
 
-        // Vectorized Horner residual evaluation across full grid (no duplicate diffs copy)
+        // Vectorized Horner residual evaluation across full grid
         int eval_i = 0;
 #if defined(__AVX2__)
         const __m256d c_top = _mm256_set1_pd(coeffs[m - 1]);
@@ -737,7 +819,7 @@ std::vector<double> BaselineFitter::fit_poly(
         const double lo_thresh = -3.0 * std_r;
         for (int idx = 0; idx < n; ++idx) {
             if (passband_mask[idx] && !hi_window[idx]) {
-                double diff = tl_res[idx];
+                double diff = tl_res[idx] - med_r;
                 weights[idx] = (diff < hi_thresh && diff > lo_thresh) ? 1.0 : 0.0;
             }
         }
@@ -814,36 +896,51 @@ std::vector<double> BaselineFitter::fit_filter(
     }
     if (valid_count < 2) return p_db;
 
+    auto local_valid_median = [&](int center, int half_span) {
+        std::vector<double> vals;
+        vals.reserve(static_cast<size_t>(2 * half_span + 1));
+        const int lo = std::max(0, center - half_span);
+        const int hi = std::min(n - 1, center + half_span);
+        for (int idx = lo; idx <= hi; ++idx) {
+            if (passband_mask[idx] && !hi_window[idx]) {
+                vals.push_back(p_db[idx]);
+            }
+        }
+        if (vals.empty()) return p_db[center];
+        return median_of_inplace(vals);
+    };
+
+    const int anchor_span = std::clamp(n / 128, 3, 24);
     thread_local std::vector<double> interpolated;
     interpolated.resize(n);
     double* dst = interpolated.data();
 
-    // Left edge clamp
-    std::fill_n(dst, first_valid, p_db[first_valid]);
+    const double left_anchor = local_valid_median(first_valid, anchor_span);
+    const double right_anchor = local_valid_median(last_valid, anchor_span);
+    std::fill_n(dst, first_valid, left_anchor);
     dst[first_valid] = p_db[first_valid];
 
     int prev_i = first_valid;
-    double prev_y = p_db[first_valid];
     for (int i = first_valid + 1; i <= last_valid; ++i) {
         if (passband_mask[i] && !hi_window[i]) {
-            double cur_y = p_db[i];
             int gap = i - prev_i;
             if (gap == 1) {
-                dst[i] = cur_y;
+                dst[i] = p_db[i];
             } else {
-                double step = (cur_y - prev_y) / static_cast<double>(gap);
+                const double y0 = local_valid_median(prev_i, anchor_span);
+                const double y1 = local_valid_median(i, anchor_span);
+                const double step = (y1 - y0) / static_cast<double>(gap);
                 for (int j = 1; j < gap; ++j) {
-                    dst[prev_i + j] = prev_y + static_cast<double>(j) * step;
+                    dst[prev_i + j] = y0 + static_cast<double>(j) * step;
                 }
-                dst[i] = cur_y;
+                dst[i] = p_db[i];
             }
             prev_i = i;
-            prev_y = cur_y;
         }
     }
     // Right edge clamp
     if (last_valid + 1 < n) {
-        std::fill_n(dst + last_valid + 1, n - (last_valid + 1), p_db[last_valid]);
+        std::fill_n(dst + last_valid + 1, n - (last_valid + 1), right_anchor);
     }
 
     double bin_res_hz = config.sample_rate_hz / static_cast<double>(n);
@@ -863,6 +960,312 @@ std::vector<double> BaselineFitter::fit_filter(
     return smoothed;
 }
 
+// Moment-preserving degree-2 Savitzky-Golay passband baseline filter
+// Exact analytical weights: h[k] = 3 * (3*H^2 + 3*H - 1 - 5*k^2) / ((2*H - 1)*(2*H + 1)*(2*H + 3))
+// Preserves 0th, 1st, and 2nd passband moments (quadratic curvature) with zero attenuation.
+std::vector<double> BaselineFitter::fit_savgol(
+    const std::vector<double>& p_db,
+    const std::vector<double>& freqs_mhz,
+    const std::vector<uint8_t>& passband_mask,
+    const std::vector<uint8_t>& hi_window,
+    const AstroConfig& config
+) {
+    (void)freqs_mhz;
+    const int n = static_cast<int>(p_db.size());
+    if (n < 8) return p_db;
+
+    int first_valid = -1;
+    int last_valid = -1;
+    int valid_count = 0;
+    for (int i = 0; i < n; ++i) {
+        if (passband_mask[i] && !hi_window[i]) {
+            if (first_valid < 0) first_valid = i;
+            last_valid = i;
+            ++valid_count;
+        }
+    }
+    if (valid_count < 4) return p_db;
+
+    // Anchor gap interpolation using robust local medians around gap boundaries so single boundary
+    // noise spikes do not tilt the H I window bridge.
+    auto local_valid_median = [&](int center, int half_span) {
+        std::vector<double> vals;
+        vals.reserve(static_cast<size_t>(2 * half_span + 1));
+        const int lo = std::max(0, center - half_span);
+        const int hi = std::min(n - 1, center + half_span);
+        for (int idx = lo; idx <= hi; ++idx) {
+            if (passband_mask[idx] && !hi_window[idx]) {
+                vals.push_back(p_db[idx]);
+            }
+        }
+        if (vals.empty()) return p_db[center];
+        return median_of_inplace(vals);
+    };
+
+    const int anchor_span = std::clamp(n / 128, 3, 24);
+    std::vector<double> work(n);
+    const double left_anchor = local_valid_median(first_valid, anchor_span);
+    const double right_anchor = local_valid_median(last_valid, anchor_span);
+    std::fill_n(work.data(), first_valid + 1, left_anchor);
+
+    int prev_i = first_valid;
+    for (int i = first_valid + 1; i <= last_valid; ++i) {
+        if (passband_mask[i] && !hi_window[i]) {
+            const int gap = i - prev_i;
+            if (gap == 1) {
+                work[i] = p_db[i];
+            } else {
+                const double y0 = local_valid_median(prev_i, anchor_span);
+                const double y1 = local_valid_median(i, anchor_span);
+                const double step = (y1 - y0) / static_cast<double>(gap);
+                for (int j = 0; j <= gap; ++j) {
+                    work[prev_i + j] = y0 + static_cast<double>(j) * step;
+                }
+            }
+            prev_i = i;
+        }
+    }
+    if (last_valid + 1 < n) {
+        std::fill_n(work.data() + last_valid + 1, n - (last_valid + 1), right_anchor);
+    }
+
+    const double bin_res_hz = config.sample_rate_hz / static_cast<double>(n);
+    const double sigma_bins = std::max(3.0, (config.filter_smoothing_sigma_khz * 1e3) / bin_res_hz);
+    const int H = std::clamp(static_cast<int>(std::round(1.8 * sigma_bins)), 5, std::max(5, n / 6));
+
+    const double hd = static_cast<double>(H);
+    const double denom = (2.0 * hd - 1.0) * (2.0 * hd + 1.0) * (2.0 * hd + 3.0);
+    std::vector<double> hk(static_cast<size_t>(H) + 1);
+    for (int k = 0; k <= H; ++k) {
+        const double kd = static_cast<double>(k);
+        hk[static_cast<size_t>(k)] = 3.0 * (3.0 * hd * hd + 3.0 * hd - 1.0 - 5.0 * kd * kd) / denom;
+    }
+
+    auto apply_sg = [&](const std::vector<double>& in_vec) {
+        std::vector<double> out_vec(n);
+        const double fv = in_vec.front();
+        const double lv = in_vec.back();
+        for (int i = 0; i < n; ++i) {
+            double acc = hk[0] * in_vec[static_cast<size_t>(i)];
+            for (int k = 1; k <= H; ++k) {
+                const double vl = (i - k >= 0) ? in_vec[static_cast<size_t>(i - k)] : fv;
+                const double vr = (i + k < n) ? in_vec[static_cast<size_t>(i + k)] : lv;
+                acc += hk[static_cast<size_t>(k)] * (vl + vr);
+            }
+            out_vec[static_cast<size_t>(i)] = acc;
+        }
+        return out_vec;
+    };
+
+    // Pass 1 Savitzky-Golay + outlier clipping on clean passband
+    std::vector<double> smoothed = apply_sg(work);
+    std::vector<double> clean_res;
+    clean_res.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        if (passband_mask[i] && !hi_window[i]) {
+            clean_res.push_back(p_db[i] - smoothed[i]);
+        }
+    }
+    const double med_r = median_of_inplace(clean_res);
+    for (double& r : clean_res) r = std::abs(r - med_r);
+    const double mad_sigma = std::max(1e-4, 1.4826 * median_of_inplace(clean_res));
+    for (int i = 0; i < n; ++i) {
+        if (passband_mask[i] && !hi_window[i]) {
+            if (std::abs((p_db[i] - smoothed[i]) - med_r) > 2.2 * mad_sigma) {
+                work[i] = smoothed[i] + med_r;
+            }
+        } else {
+            work[i] = smoothed[i] + med_r;
+        }
+    }
+
+    // Pass 2 Savitzky-Golay on outlier-cleaned continuum
+    smoothed = apply_sg(work);
+
+    clean_res.clear();
+    for (int i = 0; i < n; ++i) {
+        if (passband_mask[i] && !hi_window[i]) {
+            clean_res.push_back(p_db[i] - smoothed[i]);
+        }
+    }
+    const double offset = median_of_inplace(clean_res);
+    for (int i = 0; i < n; ++i) smoothed[i] += offset;
+    return smoothed;
+}
+
+// Coaxial Standing-Wave Reflection Sinusoid + Continuum Solver:
+// 1. Estimates broadband continuum B0(f) via smooth gap-interpolated filter.
+// 2. Transforms line-free passband residuals into the cable-delay (lag) domain via DoubleFftPlan.
+// 3. Identifies the top K <= 2 standing-wave ripple frequencies and solves their sinusoidal
+//    amplitudes (cos/sin) strictly on line-free channels (!hi_window) via linear least squares,
+//    analytically bridging across the 21-cm H I window with zero line absorption.
+std::vector<double> BaselineFitter::fit_standing_wave(
+    const std::vector<double>& p_db,
+    const std::vector<double>& freqs_mhz,
+    const std::vector<uint8_t>& passband_mask,
+    const std::vector<uint8_t>& hi_window,
+    const AstroConfig& config
+) {
+    const int n = static_cast<int>(p_db.size());
+    if (n < 16) return p_db;
+
+    // 1. Broad continuum baseline B0(f) via degree-4 Chebyshev polynomial on line-free channels
+    AstroConfig poly_cfg = config;
+    poly_cfg.poly_degree = std::clamp(config.poly_degree, 3, 4);
+    std::vector<double> base_db = fit_poly(p_db, freqs_mhz, passband_mask, hi_window, poly_cfg);
+
+    // 2. 4x zero-padded delay-domain FFT of line-free residuals to detect dominant standing-wave frequencies
+    int n_pow2 = 64;
+    while (n_pow2 < n) n_pow2 <<= 1;
+    const int nfft_sw = n_pow2 * 4;
+
+    thread_local DoubleFftPlan sw_plan;
+    sw_plan.prepare(nfft_sw);
+    std::vector<double> in_re(static_cast<size_t>(nfft_sw), 0.0);
+    std::vector<double> in_im(static_cast<size_t>(nfft_sw), 0.0);
+    std::vector<double> out_re(static_cast<size_t>(nfft_sw), 0.0);
+    std::vector<double> out_im(static_cast<size_t>(nfft_sw), 0.0);
+
+    int valid_cnt = 0;
+    for (int i = 0; i < n; ++i) {
+        if (passband_mask[i] && !hi_window[i]) {
+            const double w_hann = 0.5 * (1.0 - std::cos(6.28318530717958647692 * static_cast<double>(i) / static_cast<double>(std::max(1, n - 1))));
+            in_re[static_cast<size_t>(i)] = (p_db[i] - base_db[i]) * w_hann;
+            ++valid_cnt;
+        }
+    }
+    if (valid_cnt < 16) return base_db;
+
+    sw_plan.run(in_re.data(), in_im.data(), out_re.data(), out_im.data(), false);
+
+    // Search fundamental ripple cycles 2 .. min(n/8, 96) in 4x oversampled bins
+    const int min_bin = 8;
+    const int max_bin = std::min(nfft_sw / 8, 96 * 4);
+    if (max_bin <= min_bin + 4) return base_db;
+
+    std::vector<double> mag_sq(static_cast<size_t>(max_bin + 1), 0.0);
+    for (int m = min_bin; m <= max_bin; ++m) {
+        const double r = out_re[static_cast<size_t>(m)];
+        const double im = out_im[static_cast<size_t>(m)];
+        mag_sq[static_cast<size_t>(m)] = r * r + im * im;
+    }
+
+    // Pick top 2 well-separated delay peaks with sub-bin parabolic frequency refinement
+    int m1 = min_bin;
+    for (int m = min_bin + 1; m <= max_bin; ++m) {
+        if (mag_sq[static_cast<size_t>(m)] > mag_sq[static_cast<size_t>(m1)]) m1 = m;
+    }
+    int m2 = -1;
+    double best_m2 = -1.0;
+    for (int m = min_bin; m <= max_bin; ++m) {
+        if (std::abs(m - m1) <= 8) continue;
+        if (mag_sq[static_cast<size_t>(m)] > best_m2) {
+            best_m2 = mag_sq[static_cast<size_t>(m)];
+            m2 = m;
+        }
+    }
+
+    auto refine_freq = [&](int m_bin) {
+        double delta = 0.0;
+        if (m_bin > min_bin && m_bin < max_bin) {
+            const double y_l = std::sqrt(mag_sq[static_cast<size_t>(m_bin - 1)]);
+            const double y_0 = std::sqrt(mag_sq[static_cast<size_t>(m_bin)]);
+            const double y_r = std::sqrt(mag_sq[static_cast<size_t>(m_bin + 1)]);
+            const double den = y_l - 2.0 * y_0 + y_r;
+            if (std::abs(den) > 1e-12) {
+                delta = std::clamp(0.5 * (y_l - y_r) / den, -0.5, 0.5);
+            }
+        }
+        return 6.28318530717958647692 * (static_cast<double>(m_bin) + delta) / static_cast<double>(nfft_sw);
+    };
+
+    const double w1 = refine_freq(m1);
+    const double w2 = (m2 > 0) ? refine_freq(m2) : (2.0 * w1);
+
+    // 3. Solve joint 8x8 normal equations on line-free channels:
+    //    [1, u, u^2, u^3, cos(w1*i), sin(w1*i), cos(w2*i), sin(w2*i)]
+    constexpr int K = 8;
+    double ATA[K][K] = {};
+    double ATb[K] = {};
+    const double inv_half_n = 2.0 / static_cast<double>(std::max(1, n - 1));
+    for (int i = 0; i < n; ++i) {
+        if (!passband_mask[i] || hi_window[i]) continue;
+        const double x = static_cast<double>(i);
+        const double u = x * inv_half_n - 1.0;
+        const double u2 = u * u;
+        const double phi[K] = {
+            1.0,
+            u,
+            u2,
+            u2 * u,
+            std::cos(w1 * x),
+            std::sin(w1 * x),
+            std::cos(w2 * x),
+            std::sin(w2 * x)
+        };
+        const double y = p_db[i] - base_db[i];
+        for (int r = 0; r < K; ++r) {
+            ATb[r] += phi[r] * y;
+            for (int c = r; c < K; ++c) {
+                ATA[r][c] += phi[r] * phi[c];
+            }
+        }
+    }
+    for (int r = 0; r < K; ++r) {
+        for (int c = 0; c < r; ++c) ATA[r][c] = ATA[c][r];
+        ATA[r][r] += 1e-8 * (1.0 + ATA[r][r]); // Mild Tikhonov regularization
+    }
+
+    // Gaussian elimination with partial pivoting (8x8)
+    double M[K][K + 1] = {};
+    for (int r = 0; r < K; ++r) {
+        for (int c = 0; c < K; ++c) M[r][c] = ATA[r][c];
+        M[r][K] = ATb[r];
+    }
+    bool ok = true;
+    for (int col = 0; col < K; ++col) {
+        int piv = col;
+        for (int r = col + 1; r < K; ++r) {
+            if (std::abs(M[r][col]) > std::abs(M[piv][col])) piv = r;
+        }
+        if (std::abs(M[piv][col]) < 1e-12) { ok = false; break; }
+        if (piv != col) {
+            for (int c = col; c <= K; ++c) std::swap(M[col][c], M[piv][c]);
+        }
+        for (int r = col + 1; r < K; ++r) {
+            const double f = M[r][col] / M[col][col];
+            for (int c = col; c <= K; ++c) M[r][c] -= f * M[col][c];
+        }
+    }
+    double coeff[K] = {};
+    if (ok) {
+        for (int r = K - 1; r >= 0; --r) {
+            double s = M[r][K];
+            for (int c = r + 1; c < K; ++c) s -= M[r][c] * coeff[c];
+            coeff[r] = s / M[r][r];
+        }
+        for (int i = 0; i < n; ++i) {
+            const double x = static_cast<double>(i);
+            const double u = x * inv_half_n - 1.0;
+            const double u2 = u * u;
+            base_db[i] += coeff[0] + coeff[1] * u + coeff[2] * u2 + coeff[3] * (u2 * u)
+                        + coeff[4] * std::cos(w1 * x) + coeff[5] * std::sin(w1 * x)
+                        + coeff[6] * std::cos(w2 * x) + coeff[7] * std::sin(w2 * x);
+        }
+    }
+
+    std::vector<double> clean_res;
+    clean_res.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        if (passband_mask[i] && !hi_window[i]) {
+            clean_res.push_back(p_db[i] - base_db[i]);
+        }
+    }
+    const double offset = median_of_inplace(clean_res);
+    for (int i = 0; i < n; ++i) base_db[i] += offset;
+    return base_db;
+}
+
 BaselineResults BaselineFitter::fit(
     const std::vector<double>& power,
     const std::vector<double>& freqs_mhz,
@@ -876,7 +1279,7 @@ BaselineResults BaselineFitter::fit(
     if (nfft == 0) return res;
 
     // 1. Passband mask (inner ~87%)
-    int edge_bins = static_cast<int>(nfft * config.passband_edge_fraction);
+    int edge_bins = static_cast<int>(nfft * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
     std::vector<uint8_t> passband_mask(nfft, 1);
     for (int i = 0; i < edge_bins; ++i) passband_mask[i] = 0;
     for (int i = nfft - edge_bins; i < nfft; ++i) passband_mask[i] = 0;
@@ -899,6 +1302,10 @@ BaselineResults BaselineFitter::fit(
         res.baseline_db = fit_poly(p_db, freqs_mhz, passband_mask, hi_window, config);
     } else if (config.baseline_method == BaselineMethod::ALS) {
         res.baseline_db = fit_als(p_db, freqs_mhz, passband_mask, hi_window, config);
+    } else if (config.baseline_method == BaselineMethod::SavitzkyGolay) {
+        res.baseline_db = fit_savgol(p_db, freqs_mhz, passband_mask, hi_window, config);
+    } else if (config.baseline_method == BaselineMethod::StandingWave) {
+        res.baseline_db = fit_standing_wave(p_db, freqs_mhz, passband_mask, hi_window, config);
     } else {
         res.baseline_db = fit_filter(p_db, freqs_mhz, passband_mask, hi_window, config);
     }
@@ -933,7 +1340,8 @@ void BaselineFitter::refine_local(
     for (size_t i = edge_bins; i + edge_bins < n; ++i) {
         const double v = vel_kms[i];
         if (v >= -200.0 && v <= 200.0 && std::abs(v) >= v_thresh) {
-            const double y = calibrated_db[i];
+            // Fit in linear Kelvin space to keep E[T_A] = 0 without log/Jensen bias
+            const double y = calibrated_k[i];
             sum_x += v;
             sum_y += y;
             sum_xx += v * v;
@@ -949,40 +1357,40 @@ void BaselineFitter::refine_local(
             out_intercept = (sum_y - out_slope * sum_x) / static_cast<double>(m);
         }
 
-        const double t_sys = config.system_temp_k;
+        const double inv_tsys = 1.0 / std::max(1.0, config.system_temp_k);
+        thread_local std::vector<double> tl_ratio;
+        tl_ratio.resize(n);
+
         size_t i = 0;
 #if defined(__AVX2__)
         const __m256d v_slope = _mm256_set1_pd(out_slope);
         const __m256d v_inter = _mm256_set1_pd(out_intercept);
+        const __m256d v_inv_t = _mm256_set1_pd(inv_tsys);
+        const __m256d v_one   = _mm256_set1_pd(1.0);
+        const __m256d v_min_r = _mm256_set1_pd(1e-6);
         for (; i + 4 <= n; i += 4) {
             __m256d v = _mm256_loadu_pd(vel_kms.data() + i);
-            __m256d db = _mm256_loadu_pd(calibrated_db.data() + i);
+            __m256d tk = _mm256_loadu_pd(calibrated_k.data() + i);
 #if SIMD_HAS_FMA
             __m256d corr = _mm256_fmadd_pd(v_slope, v, v_inter);
+            __m256d tk_clean = _mm256_sub_pd(tk, corr);
+            __m256d ratio = _mm256_fmadd_pd(tk_clean, v_inv_t, v_one);
 #else
             __m256d corr = _mm256_add_pd(_mm256_mul_pd(v_slope, v), v_inter);
+            __m256d tk_clean = _mm256_sub_pd(tk, corr);
+            __m256d ratio = _mm256_add_pd(_mm256_mul_pd(tk_clean, v_inv_t), v_one);
 #endif
-            _mm256_storeu_pd(calibrated_db.data() + i, _mm256_sub_pd(db, corr));
+            _mm256_storeu_pd(calibrated_k.data() + i, tk_clean);
+            _mm256_storeu_pd(tl_ratio.data() + i, _mm256_max_pd(v_min_r, ratio));
         }
 #endif
         for (; i < n; ++i) {
-            calibrated_db[i] -= (out_slope * vel_kms[i] + out_intercept);
+            double tk_clean = calibrated_k[i] - (out_slope * vel_kms[i] + out_intercept);
+            calibrated_k[i] = tk_clean;
+            tl_ratio[i] = std::max(1e-6, 1.0 + tk_clean * inv_tsys);
         }
 
-        // Vectorized conversion to antenna temperature Kelvin
-        SimdDsp::db_to_power_f64(calibrated_db.data(), calibrated_k.data(), n);
-        i = 0;
-#if defined(__AVX2__)
-        const __m256d v_tsys = _mm256_set1_pd(t_sys);
-        const __m256d v_one = _mm256_set1_pd(1.0);
-        for (; i + 4 <= n; i += 4) {
-            __m256d p = _mm256_loadu_pd(calibrated_k.data() + i);
-            _mm256_storeu_pd(calibrated_k.data() + i, _mm256_mul_pd(v_tsys, _mm256_sub_pd(p, v_one)));
-        }
-#endif
-        for (; i < n; ++i) {
-            calibrated_k[i] = t_sys * (calibrated_k[i] - 1.0);
-        }
+        SimdDsp::power_to_db_f64(tl_ratio.data(), calibrated_db.data(), n, 1e-6);
     }
 }
 

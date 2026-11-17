@@ -3,6 +3,7 @@
 #include "simd_dsp.h"
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -75,6 +76,28 @@ bool Exporter::export_csv(
     return f.good();
 }
 
+static std::string escape_json_str(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (char c : input) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:   out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+static inline double safe_num(double v) {
+    return std::isfinite(v) ? v : 0.0;
+}
+
 bool Exporter::export_json(
     const AstrophysicalMetrics& metrics,
     const AstroConfig& config,
@@ -96,50 +119,68 @@ bool Exporter::export_json(
 
     f << "{\n"
       << "  \"metadata\": {\n"
-      << "    \"source_file\": \"" << clean_source << "\",\n"
+      << "    \"source_file\": \"" << escape_json_str(clean_source) << "\",\n"
       << "    \"filesize_bytes\": " << meta.filesize << ",\n"
       << "    \"total_samples\": " << meta.total_samples << ",\n"
-      << "    \"duration_seconds\": " << std::fixed << std::setprecision(6) << meta.duration_s << ",\n"
-      << "    \"processing_time_seconds\": " << std::fixed << std::setprecision(6) << meta.processing_time_s << ",\n"
-      << "    \"throughput_mb_s\": " << std::fixed << std::setprecision(2) << meta.throughput_mb_s << "\n"
+      << "    \"duration_seconds\": " << std::fixed << std::setprecision(6) << safe_num(meta.duration_s) << ",\n"
+      << "    \"processing_time_seconds\": " << std::fixed << std::setprecision(6) << safe_num(meta.processing_time_s) << ",\n"
+      << "    \"throughput_mb_s\": " << std::fixed << std::setprecision(2) << safe_num(meta.throughput_mb_s) << "\n"
       << "  },\n"
       << "  \"sdr_settings\": {\n"
-      << "    \"center_frequency_hz\": " << std::fixed << std::setprecision(1) << config.center_freq_hz << ",\n"
-      << "    \"center_frequency_mhz\": " << std::setprecision(4) << config.center_freq_hz / 1e6 << ",\n"
-      << "    \"sample_rate_hz\": " << std::setprecision(1) << config.sample_rate_hz << ",\n"
-      << "    \"sample_rate_msps\": " << std::setprecision(3) << config.sample_rate_hz / 1e6 << ",\n"
-      << "    \"system_temp_k\": " << std::setprecision(1) << config.system_temp_k << ",\n"
+      << "    \"center_frequency_hz\": " << std::fixed << std::setprecision(1) << safe_num(config.center_freq_hz) << ",\n"
+      << "    \"center_frequency_mhz\": " << std::setprecision(4) << safe_num(config.center_freq_hz / 1e6) << ",\n"
+      << "    \"sample_rate_hz\": " << std::setprecision(1) << safe_num(config.sample_rate_hz) << ",\n"
+      << "    \"sample_rate_msps\": " << std::setprecision(3) << safe_num(config.sample_rate_hz / 1e6) << ",\n"
+      << "    \"system_temp_k\": " << std::setprecision(1) << safe_num(config.system_temp_k) << ",\n"
+      << "    \"spin_temp_k\": " << std::setprecision(1) << safe_num(config.spin_temp_k) << ",\n"
       << "    \"fft_size\": " << config.fft_size << ",\n"
-      << "    \"bin_resolution_hz\": " << std::setprecision(3) << config.sample_rate_hz / config.fft_size << ",\n"
+      << "    \"bin_resolution_hz\": " << std::setprecision(3) << safe_num(config.sample_rate_hz / config.fft_size) << ",\n"
       << "    \"window\": \"" << window_type_to_string(config.window) << "\",\n"
-      << "    \"dc_spike_cleared_hz\": " << std::setprecision(1) << config.dc_clear_hz << "\n"
+      << "    \"baseline_method\": \"" << baseline_method_to_string(config.baseline_method) << "\",\n"
+      << "    \"dc_spike_cleared_hz\": " << std::setprecision(1) << safe_num(config.dc_clear_hz) << "\n"
       << "  },\n"
       << "  \"hydrogen_line_detection\": {\n"
       << "    \"target_line\": \"Neutral Hydrogen (H I 21cm, 1S F=1 -> F=0)\",\n"
       << "    \"line_analysis_method\": \"" << line_analysis_method_to_string(config.line_method) << "\",\n"
       << "    \"rest_frequency_mhz\": " << std::setprecision(6) << HYDROGEN_REST_FREQ_MHZ << ",\n"
-      << "    \"observed_peak_frequency_mhz\": " << std::setprecision(6) << metrics.peak_freq_mhz << ",\n"
-      << "    \"doppler_recession_velocity_kms\": " << std::setprecision(3) << metrics.peak_vel_kms << ",\n"
-      << "    \"peak_antenna_temperature_k\": " << std::setprecision(3) << metrics.peak_temp_k << ",\n"
-      << "    \"peak_power_above_baseline_db\": " << std::setprecision(4) << metrics.peak_power_db << ",\n"
-      << "    \"noise_floor_rms_k\": " << std::setprecision(3) << metrics.noise_std_k << ",\n"
-      << "    \"noise_floor_rms_db\": " << std::setprecision(4) << metrics.noise_std_db << ",\n"
-      << "    \"signal_to_noise_ratio_snr\": " << std::setprecision(2) << metrics.snr << ",\n"
-      << "    \"line_fwhm_kms\": " << std::setprecision(2) << metrics.fwhm_kms << ",\n"
-      << "    \"velocity_dispersion_sigma_kms\": " << std::setprecision(2) << metrics.sigma_kms << ",\n"
-      << "    \"fit_rmse_k\": " << std::setprecision(4) << metrics.gauss_fit.rmse_k << ",\n"
+      << "    \"observed_peak_frequency_mhz\": " << std::setprecision(6) << safe_num(metrics.peak_freq_mhz) << ",\n"
+      << "    \"doppler_recession_velocity_kms\": " << std::setprecision(3) << safe_num(metrics.peak_vel_kms) << ",\n"
+      << "    \"peak_antenna_temperature_k\": " << std::setprecision(3) << safe_num(metrics.peak_temp_k) << ",\n"
+      << "    \"peak_power_above_baseline_db\": " << std::setprecision(4) << safe_num(metrics.peak_power_db) << ",\n"
+      << "    \"noise_floor_rms_k\": " << std::setprecision(3) << safe_num(metrics.noise_std_k) << ",\n"
+      << "    \"noise_floor_rms_db\": " << std::setprecision(4) << safe_num(metrics.noise_std_db) << ",\n"
+      << "    \"signal_to_noise_ratio_snr\": " << std::setprecision(2) << safe_num(metrics.snr) << ",\n"
+      << "    \"line_fwhm_kms\": " << std::setprecision(2) << safe_num(metrics.fwhm_kms) << ",\n"
+      << "    \"velocity_dispersion_sigma_kms\": " << std::setprecision(2) << safe_num(metrics.sigma_kms) << ",\n"
+      << "    \"w50_kms\": " << std::setprecision(2) << safe_num(metrics.w50_kms) << ",\n"
+      << "    \"w20_kms\": " << std::setprecision(2) << safe_num(metrics.w20_kms) << ",\n"
+      << "    \"equivalent_width_kms\": " << std::setprecision(2) << safe_num(metrics.equivalent_width_kms) << ",\n"
+      << "    \"doppler_temp_max_k\": " << std::setprecision(1) << safe_num(metrics.doppler_temp_max_k) << ",\n"
+      << "    \"peak_optical_depth\": " << std::setprecision(5) << safe_num(metrics.peak_optical_depth) << ",\n"
+      << "    \"fit_rmse_k\": " << std::setprecision(4) << safe_num(metrics.gauss_fit.rmse_k) << ",\n"
       << "    \"secondary_component_detected\": " << (metrics.gauss_fit.has_secondary ? "true" : "false") << ",\n"
-      << "    \"secondary_amplitude_k\": " << std::setprecision(3) << metrics.gauss_fit.amp2_k << ",\n"
-      << "    \"secondary_velocity_kms\": " << std::setprecision(3) << metrics.gauss_fit.v2_center_kms << ",\n"
-      << "    \"secondary_fwhm_kms\": " << std::setprecision(2) << metrics.gauss_fit.fwhm2_kms << ",\n"
-      << "    \"voigt_eta\": " << std::setprecision(4) << metrics.gauss_fit.voigt_eta << ",\n"
-      << "    \"gauss_hermite_h3\": " << std::setprecision(4) << metrics.gauss_fit.gh_h3 << ",\n"
-      << "    \"gauss_hermite_h4\": " << std::setprecision(4) << metrics.gauss_fit.gh_h4 << ",\n"
-      << "    \"moment1_centroid_kms\": " << std::setprecision(3) << metrics.gauss_fit.moment1_kms << ",\n"
-      << "    \"moment2_dispersion_kms\": " << std::setprecision(3) << metrics.gauss_fit.moment2_sigma_kms << ",\n"
-      << "    \"integrated_flux_k_kms\": " << std::setprecision(2) << metrics.integrated_flux_k_kms << ",\n"
-      << "    \"neutral_hydrogen_column_density_cm2\": " << std::scientific << std::setprecision(3) << metrics.column_density_cm2 << ",\n"
-      << "    \"lo_dc_offset_khz\": " << std::fixed << std::setprecision(3) << metrics.lo_offset_khz << ",\n"
+      << "    \"secondary_amplitude_k\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.amp2_k) << ",\n"
+      << "    \"secondary_velocity_kms\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.v2_center_kms) << ",\n"
+      << "    \"secondary_fwhm_kms\": " << std::setprecision(2) << safe_num(metrics.gauss_fit.fwhm2_kms) << ",\n"
+      << "    \"tertiary_component_detected\": " << (metrics.gauss_fit.has_tertiary ? "true" : "false") << ",\n"
+      << "    \"tertiary_amplitude_k\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.amp3_k) << ",\n"
+      << "    \"tertiary_velocity_kms\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.v3_center_kms) << ",\n"
+      << "    \"tertiary_fwhm_kms\": " << std::setprecision(2) << safe_num(metrics.gauss_fit.fwhm3_kms) << ",\n"
+      << "    \"voigt_eta\": " << std::setprecision(4) << safe_num(metrics.gauss_fit.voigt_eta) << ",\n"
+      << "    \"voigt_lorentz_gamma_kms\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.lorentz_gamma_kms) << ",\n"
+      << "    \"gauss_hermite_h3\": " << std::setprecision(4) << safe_num(metrics.gauss_fit.gh_h3) << ",\n"
+      << "    \"gauss_hermite_h4\": " << std::setprecision(4) << safe_num(metrics.gauss_fit.gh_h4) << ",\n"
+      << "    \"busy_half_width_kms\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.busy_half_width_kms) << ",\n"
+      << "    \"busy_flank_b1\": " << std::setprecision(4) << safe_num(metrics.gauss_fit.busy_flank_b1) << ",\n"
+      << "    \"busy_flank_b2\": " << std::setprecision(4) << safe_num(metrics.gauss_fit.busy_flank_b2) << ",\n"
+      << "    \"busy_trough_c\": " << std::setprecision(6) << safe_num(metrics.gauss_fit.busy_trough_c) << ",\n"
+      << "    \"moment0_k_kms\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.moment0_k_kms) << ",\n"
+      << "    \"moment1_centroid_kms\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.moment1_kms) << ",\n"
+      << "    \"moment2_dispersion_kms\": " << std::setprecision(3) << safe_num(metrics.gauss_fit.moment2_sigma_kms) << ",\n"
+      << "    \"integrated_flux_k_kms\": " << std::setprecision(2) << safe_num(metrics.integrated_flux_k_kms) << ",\n"
+      << "    \"neutral_hydrogen_column_density_cm2\": " << std::scientific << std::setprecision(3) << safe_num(metrics.column_density_cm2) << ",\n"
+      << "    \"neutral_hydrogen_column_density_thick_cm2\": " << std::scientific << std::setprecision(3) << safe_num(metrics.column_density_thick_cm2) << ",\n"
+      << "    \"lo_dc_offset_khz\": " << std::fixed << std::setprecision(3) << safe_num(metrics.lo_offset_khz) << ",\n"
       << "    \"bins_from_dc_to_hi\": " << metrics.bin_separation << "\n"
       << "  }\n"
       << "}\n";
@@ -170,21 +211,37 @@ bool Exporter::export_summary_text(
     double bin_res_hz = config.sample_rate_hz / config.fft_size;
     double bin_res_kms = SPEED_OF_LIGHT_KMS * (bin_res_hz / HYDROGEN_REST_FREQ_HZ);
 
-    f << "================================================================================\n"
-      << "          RADIO TELESCOPE HYDROGEN LINE (HI 21cm) ANALYSIS REPORT\n"
-      << "================================================================================\n\n"
-      << "1. OBSERVATION & FILE METADATA\n"
-      << "--------------------------------------------------------------------------------\n"
+    const char* snr_label = "No clear detection (<3 sigma)";
+    if (metrics.snr >= 5.0) {
+        snr_label = "High-confidence detection (>=5 sigma)";
+    } else if (metrics.snr >= 3.0) {
+        snr_label = "Marginal detection (3-5 sigma)";
+    }
+
+    std::string dc_assessment;
+    if (std::abs(metrics.lo_offset_khz) < 50.0) {
+        dc_assessment = "WARNING: LO DC notch lies within +/-50 kHz of H I rest frequency; line profile may be affected.";
+    } else {
+        std::ostringstream dss;
+        dss << "LO tuned " << std::fixed << std::setprecision(1) << std::abs(metrics.lo_offset_khz)
+            << " kHz from H I rest frequency (clear of DC excision notch).";
+        dc_assessment = dss.str();
+    }
+
+    f << "HYDROGEN LINE (H I 21cm) ANALYSIS REPORT\n"
+      << "======================================================================\n\n"
+      << "1. Observation Metadata\n"
+      << "----------------------------------------------------------------------\n"
       << "Source IQ File:             " << std::filesystem::path(meta.filepath).filename().string() << "\n"
       << "File Location:              " << meta.filepath << "\n"
       << "File Size:                  " << std::fixed << std::setprecision(2) << meta.filesize / (1024.0 * 1024.0 * 1024.0)
       << " GB (" << std::setprecision(1) << meta.filesize / (1024.0 * 1024.0) << " MB)\n"
       << "Data Format:                CS16 (Interleaved 16-bit Signed Integer I/Q)\n"
-      << "Observation Duration:       " << std::setprecision(2) << dur_s << " seconds (" << dur_min << " minutes)\n"
-      << "Processing Speed:           " << std::setprecision(1) << meta.throughput_mb_s << " MB/s (Completed in "
+      << "Observation Duration:       " << std::setprecision(2) << dur_s << " s (" << dur_min << " min)\n"
+      << "Processing Throughput:      " << std::setprecision(1) << meta.throughput_mb_s << " MB/s ("
       << std::setprecision(2) << meta.processing_time_s << " s)\n\n"
-      << "2. SDR RECEIVER & DSP CONFIGURATION\n"
-      << "--------------------------------------------------------------------------------\n"
+      << "2. SDR & DSP Configuration\n"
+      << "----------------------------------------------------------------------\n"
       << "SDR Center Frequency (LO):  " << std::setprecision(6) << fc_mhz << " MHz\n"
       << "SDR Sample Rate:            " << std::setprecision(3) << fs_msps << " MSPS ("
       << static_cast<uint64_t>(config.sample_rate_hz) << " Hz)\n"
@@ -192,51 +249,47 @@ bool Exporter::export_summary_text(
       << "Spectral Window:            " << window_type_to_string(config.window) << "\n"
       << "Channel Width (Frequency):  " << std::setprecision(2) << bin_res_hz << " Hz\n"
       << "Channel Width (Velocity):   " << std::setprecision(3) << bin_res_kms << " km/s\n"
-      << "Assumed System Noise Temp:  " << std::setprecision(1) << config.system_temp_k << " K\n"
-      << "Baseline Modeling Method:   " << baseline_method_to_string(config.baseline_method) << "\n"
+      << "Assumed System Temp (Tsys): " << std::setprecision(1) << config.system_temp_k << " K\n"
+      << "Assumed Spin Temp (Tspin):  " << std::setprecision(1) << config.spin_temp_k << " K\n"
+      << "Baseline Modeling Method:   " << baseline_method_display_name(config.baseline_method)
+      << " (" << baseline_method_to_string(config.baseline_method) << ")\n"
       << "Line Profile Analysis:      " << line_analysis_method_display_name(config.line_method) << "\n"
-      << "DC Spike Excision:          Excised " << std::setprecision(0) << config.dc_clear_hz << " Hz centered at LO "
+      << "DC Spike Excision:          " << std::setprecision(0) << config.dc_clear_hz << " Hz centered at LO "
       << std::setprecision(4) << fc_mhz << " MHz\n\n"
-      << "3. DC SPIKE COMBAT & LO OFF-CENTERING VERIFICATION\n"
-      << "--------------------------------------------------------------------------------\n"
-      << "Astronomical HI Rest Freq:  " << std::setprecision(6) << HYDROGEN_REST_FREQ_MHZ << " MHz\n"
-      << "SDR Tuned Center Frequency: " << std::setprecision(6) << fc_mhz << " MHz\n"
+      << "3. LO Offset & DC Excision Check\n"
+      << "----------------------------------------------------------------------\n"
+      << "Astronomical H I Rest Freq: " << std::setprecision(6) << HYDROGEN_REST_FREQ_MHZ << " MHz\n"
       << "LO Frequency Offset:        " << std::showpos << std::setprecision(2) << metrics.lo_offset_khz << " kHz\n"
-      << "Bin Separation:             " << std::noshowpos << metrics.bin_separation << " FFT bins between DC spike and HI line\n"
-      << "DC Offset Assessment:       SUCCESSFUL! The SDR center LO DC leakage spike was\n"
-      << "                            tuned " << std::abs(metrics.lo_offset_khz) << " kHz away from the Hydrogen Line.\n"
-      << "                            The line emission was completely protected from DC distortion.\n\n"
-      << "4. ASTROPHYSICAL HYDROGEN LINE (HI) DETECTION RESULTS\n"
-      << "--------------------------------------------------------------------------------\n"
-      << "Target Emission:            Neutral Atomic Hydrogen (H I, 21 cm Spin-Flip)\n"
+      << "Bin Separation:             " << std::noshowpos << metrics.bin_separation << " FFT bins\n"
+      << "Assessment:                 " << dc_assessment << "\n\n"
+      << "4. Measured Line Parameters (Topocentric Frame)\n"
+      << "----------------------------------------------------------------------\n"
       << "Observed Peak Frequency:    " << std::setprecision(6) << metrics.peak_freq_mhz << " MHz\n"
       << "Doppler Radial Velocity:    " << std::showpos << std::setprecision(2) << metrics.peak_vel_kms << " km/s (Topocentric)\n"
-      << "Kinematic Classification:   " << (metrics.peak_vel_kms > 0 ? "Receding (Redshifted)" : "Approaching (Blueshifted)")
-      << " relative to Solar System\n"
-      << "Peak Antenna Temperature:   " << std::noshowpos << std::setprecision(2) << metrics.peak_temp_k << " Kelvin (above baseline)\n"
+      << "Velocity Sign:              " << (metrics.peak_vel_kms >= 0.0 ? "Receding (Redshifted)" : "Approaching (Blueshifted)")
+      << " relative to the receiver (topocentric)\n"
+      << "Peak Antenna Temperature:   " << std::noshowpos << std::setprecision(2) << metrics.peak_temp_k << " K\n"
       << "Peak Relative Power:        " << std::showpos << std::setprecision(3) << metrics.peak_power_db << " dB\n"
-      << "Noise Floor RMS:            " << std::noshowpos << std::setprecision(3) << metrics.noise_std_k << " Kelvin ("
+      << "Line-Free Noise RMS:        " << std::noshowpos << std::setprecision(3) << metrics.noise_std_k << " K ("
       << std::setprecision(4) << metrics.noise_std_db << " dB)\n"
-      << "Signal-to-Noise Ratio (SNR):" << std::setprecision(1) << metrics.snr << " sigma (Statistically Definitive Detection)\n"
-      << "Line FWHM (Velocity Width): " << std::setprecision(2) << metrics.fwhm_kms << " km/s ("
+      << "Signal-to-Noise Ratio:      " << std::setprecision(1) << metrics.snr << " sigma (" << snr_label << ")\n"
+      << "Line FWHM:                  " << std::setprecision(2) << metrics.fwhm_kms << " km/s ("
       << std::setprecision(2) << metrics.fwhm_kms / SPEED_OF_LIGHT_KMS * HYDROGEN_REST_FREQ_MHZ * 1e3 << " kHz)\n"
+      << "Profile Widths W50 / W20:   " << std::setprecision(2) << metrics.w50_kms << " / " << metrics.w20_kms << " km/s\n"
+      << "Equivalent Width (W_eq):    " << std::setprecision(2) << metrics.equivalent_width_kms << " km/s\n"
       << "Velocity Dispersion (sigma):" << std::setprecision(2) << metrics.sigma_kms << " km/s\n"
-      << "Integrated Line Flux (W):   " << std::setprecision(2) << metrics.integrated_flux_k_kms << " K * km/s\n"
-      << "Neutral Hydrogen Column (N):" << std::scientific << std::setprecision(3) << metrics.column_density_cm2
-      << " atoms / cm^2 (Optically thin model)\n\n"
-      << "5. SCIENTIFIC INTERPRETATION\n"
-      << "--------------------------------------------------------------------------------\n"
-      << "- Signal Source: Neutral atomic hydrogen clouds in the interstellar medium (ISM) of the\n"
-      << "  Milky Way Galaxy.\n"
-      << "- Doppler Shift: The observed radial velocity of " << std::showpos << std::fixed << std::setprecision(2)
-      << metrics.peak_vel_kms << " km/s reflects the\n"
-      << "  combined motion of the Earth's orbit and the differential galactic rotation of the\n"
-      << "  Milky Way spiral arms in the antenna's pointing direction.\n"
-      << "- Temporal Waterfall: The time-frequency waterfall proves continuous, steady emission\n"
-      << "  throughout the entire observation period, confirming an authentic cosmic source.\n\n"
-      << "================================================================================\n"
-      << "Generated by C++ Offline 21cm Hydrogen Line Analysis Pipeline\n"
-      << "================================================================================\n";
+      << "Max Kinetic Temp (T_k,max): " << std::setprecision(0) << metrics.doppler_temp_max_k << " K\n"
+      << "Peak Optical Depth (tau):   " << std::setprecision(4) << metrics.peak_optical_depth
+      << " (at T_spin = " << std::setprecision(0) << config.spin_temp_k << " K)\n"
+      << "Integrated Flux (W):        " << std::setprecision(2) << metrics.integrated_flux_k_kms << " K * km/s\n"
+      << "H I Column Density (thin):  " << std::scientific << std::setprecision(3) << metrics.column_density_cm2
+      << " atoms/cm^2\n"
+      << "H I Column Density (thick): " << std::scientific << std::setprecision(3) << metrics.column_density_thick_cm2
+      << " atoms/cm^2\n\n"
+      << "Notes\n"
+      << "----------------------------------------------------------------------\n"
+      << "- Velocities are topocentric (Earth-fixed); LSR correction is not applied automatically.\n"
+      << "- Temperatures scale linearly with the assumed system temperature T_sys.\n";
 
     f.flush();
     return f.good();

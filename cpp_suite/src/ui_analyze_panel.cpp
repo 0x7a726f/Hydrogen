@@ -395,7 +395,13 @@ bool UiAnalyzePanel::validate_inputs_cached(std::string& out_error) const {
         out_error = "File is currently being written by Live Recorder.";
         return false;
     }
+#ifdef _WIN32
     const uint64_t now_ms = GetTickCount64();
+#else
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
     if (target != val_cache_path_ || (now_ms - val_cache_tick_ms_) >= 500ULL) {
         std::error_code ec;
         val_cache_file_ok_ = fs::exists(target, ec) && !fs::is_directory(target, ec);
@@ -455,17 +461,24 @@ void UiAnalyzePanel::start_analysis() {
     run_cfg.als_p = static_cast<double>(ui_als_p_);
     run_cfg.poly_degree = std::clamp(ui_poly_deg_, 2, 20);
     run_cfg.verbose = false;
-    run_cfg.baseline_method = (ui_baseline_idx_ == 1) ? BaselineMethod::ALS
-                            : (ui_baseline_idx_ == 2) ? BaselineMethod::Poly
-                                                      : BaselineMethod::RippleFilter;
+    static constexpr BaselineMethod kBaseMethods[] = {
+        BaselineMethod::RippleFilter,
+        BaselineMethod::ALS,
+        BaselineMethod::Poly,
+        BaselineMethod::SavitzkyGolay,
+        BaselineMethod::StandingWave
+    };
+    run_cfg.baseline_method = kBaseMethods[std::clamp(ui_baseline_idx_, 0, 4)];
     static constexpr LineAnalysisMethod kLineMethods[] = {
         LineAnalysisMethod::GaussianLS,
         LineAnalysisMethod::DoubleGaussian,
+        LineAnalysisMethod::TripleGaussian,
         LineAnalysisMethod::VoigtProfile,
         LineAnalysisMethod::GaussHermite,
-        LineAnalysisMethod::SpectralMoments
+        LineAnalysisMethod::SpectralMoments,
+        LineAnalysisMethod::BusyFunction
     };
-    run_cfg.line_method = kLineMethods[std::clamp(ui_line_method_idx_, 0, 4)];
+    run_cfg.line_method = kLineMethods[std::clamp(ui_line_method_idx_, 0, 6)];
 
     const std::string target_file = custom_file_path_;
     const AnalyzeParamsSig run_sig = current_signature();
@@ -1208,10 +1221,16 @@ void UiAnalyzePanel::render_sidebar_controls(float width, float height, const st
         }
         param_gap();
 
-        static const char* base_labels[] = {"Ripple Filter (Gaussian)", "Asymmetric Least Squares", "Sigma-Clipped Polynomial"};
+        static const char* base_labels[] = {
+            "Ripple Filter (Gaussian)",
+            "Asymmetric Least Squares",
+            "Sigma-Clipped Polynomial",
+            "Savitzky-Golay (Deg-2)",
+            "Standing-Wave (Fourier)"
+        };
         param_label("Baseline Removal Method");
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::Combo("##AnaBase", &ui_baseline_idx_, base_labels, 3);
+        ImGui::Combo("##AnaBase", &ui_baseline_idx_, base_labels, 5);
 
         if (ui_baseline_idx_ == 1) {
             param_gap();
@@ -1239,13 +1258,15 @@ void UiAnalyzePanel::render_sidebar_controls(float width, float height, const st
         static const char* line_method_labels[] = {
             "Single Gaussian (L-M)",
             "Double Gaussian (2-Arm)",
+            "Triple Gaussian (3-Arm)",
             "Voigt Profile (Core+Wings)",
             "Gauss-Hermite (h3/h4 Asym)",
-            "Spectral Moments (M0/M1/M2)"
+            "Spectral Moments (M0/M1/M2)",
+            "Busy Function (Westmeier)"
         };
         param_label("Line Profile Analysis");
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::Combo("##AnaLineMethod", &ui_line_method_idx_, line_method_labels, 5);
+        ImGui::Combo("##AnaLineMethod", &ui_line_method_idx_, line_method_labels, 7);
 
         ImGui::PopStyleVar(2);
         ImGui::EndDisabled();
@@ -1406,7 +1427,11 @@ void UiAnalyzePanel::render_kpi_strip(float width, const AstrophysicalMetrics& m
     std::snprintf(val, sizeof(val), "%.2f", m.fwhm_kms);
     if (!m.gauss_fit.success) {
         std::snprintf(sub, sizeof(sub), "Raw estimate");
-    } else if (m.gauss_fit.method == LineAnalysisMethod::DoubleGaussian && m.gauss_fit.has_secondary) {
+    } else if (m.gauss_fit.method == LineAnalysisMethod::TripleGaussian && m.gauss_fit.has_tertiary) {
+        std::snprintf(sub, sizeof(sub), "3-Arm: %+.0f/%+.0f/%+.0f",
+                      m.gauss_fit.v_center_kms, m.gauss_fit.v2_center_kms, m.gauss_fit.v3_center_kms);
+    } else if ((m.gauss_fit.method == LineAnalysisMethod::DoubleGaussian ||
+                m.gauss_fit.method == LineAnalysisMethod::TripleGaussian) && m.gauss_fit.has_secondary) {
         std::snprintf(sub, sizeof(sub), "2-Arm: %+.1f / %+.1f", m.gauss_fit.v_center_kms, m.gauss_fit.v2_center_kms);
     } else if (m.gauss_fit.method == LineAnalysisMethod::VoigtProfile) {
         std::snprintf(sub, sizeof(sub), "Voigt eta: %.2f | sig %.1f", m.gauss_fit.voigt_eta, m.sigma_kms);
@@ -1414,14 +1439,16 @@ void UiAnalyzePanel::render_kpi_strip(float width, const AstrophysicalMetrics& m
         std::snprintf(sub, sizeof(sub), "h3:%+.2f h4:%+.2f", m.gauss_fit.gh_h3, m.gauss_fit.gh_h4);
     } else if (m.gauss_fit.method == LineAnalysisMethod::SpectralMoments) {
         std::snprintf(sub, sizeof(sub), "M2 sig: %.2f | M1 %+.1f", m.gauss_fit.moment2_sigma_kms, m.gauss_fit.moment1_kms);
+    } else if (m.gauss_fit.method == LineAnalysisMethod::BusyFunction) {
+        std::snprintf(sub, sizeof(sub), "w:%.1f c:%.4f", m.gauss_fit.busy_half_width_kms, m.gauss_fit.busy_trough_c);
     } else {
-        std::snprintf(sub, sizeof(sub), "sigma: %.2f | Fit OK", m.sigma_kms);
+        std::snprintf(sub, sizeof(sub), "W20: %.1f | Tk %.0fK", m.w20_kms, m.doppler_temp_max_k);
     }
     kpi_card(4, "##KpiFwhm", "LINE FWHM", val, "km/s", sub, ui_obs::palette::TextPrimary);
 
     const bool has_tsys = (cfg.system_temp_k > 0.0);
     std::snprintf(val, sizeof(val), "%.2e", m.column_density_cm2);
-    std::snprintf(sub, sizeof(sub), "W: %.1f K*km/s", m.integrated_flux_k_kms);
+    std::snprintf(sub, sizeof(sub), "W:%.0f | tau:%.3f", m.integrated_flux_k_kms, m.peak_optical_depth);
     kpi_card(5, "##KpiNhi", "N_HI COLUMN", val, "cm^-2", sub,
              has_tsys ? ui_obs::palette::TextPrimary : ui_obs::palette::TextMuted);
 
@@ -1513,10 +1540,12 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
     vp.draw_decimated_xy(dl, n, vel_at, ta_at,
                          ui_obs::palette::U32(ui_obs::palette::Cyan), ui_obs::dp(1.6f), trace_scratch_);
 
-    // 4. Line profile fit overlay + secondary component curves + FWHM half-max bracket
+    // 4. Line profile fit overlay + multi-component curves + FWHM half-max bracket
     const auto& gfit = snap->metrics.gauss_fit;
     if (gfit.success && gfit.fitted_curve.size() == n) {
-        if (gfit.method == LineAnalysisMethod::DoubleGaussian && gfit.has_secondary &&
+        if ((gfit.method == LineAnalysisMethod::DoubleGaussian ||
+             gfit.method == LineAnalysisMethod::TripleGaussian) &&
+            gfit.has_secondary &&
             gfit.component1_curve.size() == n && gfit.component2_curve.size() == n) {
             vp.draw_decimated_xy(dl, n, vel_at,
                                  [&](size_t i) { return gfit.component1_curve[i]; },
@@ -1524,6 +1553,11 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
             vp.draw_decimated_xy(dl, n, vel_at,
                                  [&](size_t i) { return gfit.component2_curve[i]; },
                                  ui_obs::palette::U32(ui_obs::palette::Purple, 0.85f), ui_obs::dp(1.3f), trace_scratch_);
+            if (gfit.has_tertiary && gfit.component3_curve.size() == n) {
+                vp.draw_decimated_xy(dl, n, vel_at,
+                                     [&](size_t i) { return gfit.component3_curve[i]; },
+                                     ui_obs::palette::U32(ui_obs::palette::Emerald, 0.85f), ui_obs::dp(1.3f), trace_scratch_);
+            }
         }
 
         vp.draw_decimated_xy(dl, n, vel_at,
@@ -1531,9 +1565,10 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
                              ui_obs::palette::U32(ui_obs::palette::Pink), ui_obs::dp(1.8f), trace_scratch_);
 
         if (gfit.fwhm_kms > 0.0 && gfit.amplitude_k > 0.0) {
-            const float hy = vp.map_y(0.5 * gfit.amplitude_k);
-            const float x_l = vp.map_x(gfit.v_center_kms - 0.5 * gfit.fwhm_kms);
-            const float x_r = vp.map_x(gfit.v_center_kms + 0.5 * gfit.fwhm_kms);
+            const bool has_exact_bracket = (gfit.fwhm_right_kms > gfit.fwhm_left_kms && gfit.fwhm_half_temp_k > 0.0);
+            const float hy = vp.map_y(has_exact_bracket ? gfit.fwhm_half_temp_k : (0.5 * gfit.amplitude_k));
+            const float x_l = vp.map_x(has_exact_bracket ? gfit.fwhm_left_kms : (gfit.v_center_kms - 0.5 * gfit.fwhm_kms));
+            const float x_r = vp.map_x(has_exact_bracket ? gfit.fwhm_right_kms : (gfit.v_center_kms + 0.5 * gfit.fwhm_kms));
             const ImU32 brk_col = ui_obs::palette::U32(ui_obs::palette::Pink, 0.80f);
             ui_obs::widgets::draw_dashed_hline(dl, std::min(x_l, x_r), std::max(x_l, x_r), hy, brk_col, 1.3f, 4.0f, 3.0f);
             dl->AddLine(ImVec2(x_l, hy - ui_obs::dp(4.0f)), ImVec2(x_l, hy + ui_obs::dp(4.0f)), brk_col, 1.3f);
@@ -1572,9 +1607,11 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
         if (gfit.success) {
             switch (gfit.method) {
                 case LineAnalysisMethod::DoubleGaussian:  card_hdr = "DOUBLE GAUSSIAN (2-ARM)"; break;
+                case LineAnalysisMethod::TripleGaussian:  card_hdr = "TRIPLE GAUSSIAN (3-ARM)"; break;
                 case LineAnalysisMethod::VoigtProfile:    card_hdr = "PSEUDO-VOIGT PROFILE"; break;
                 case LineAnalysisMethod::GaussHermite:    card_hdr = "GAUSS-HERMITE (h3/h4)"; break;
                 case LineAnalysisMethod::SpectralMoments: card_hdr = "SPECTRAL MOMENTS (M0-M2)"; break;
+                case LineAnalysisMethod::BusyFunction:    card_hdr = "BUSY FUNCTION (WESTMEIER)"; break;
                 default:                                  card_hdr = "GAUSSIAN H I FIT (L-M)"; break;
             }
         }
@@ -1591,7 +1628,11 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
         std::snprintf(v3, sizeof(v3), "%.2f km/s", snap->metrics.fwhm_kms);
         std::snprintf(v4, sizeof(v4), "%.2f sigma", snap->metrics.snr);
         std::snprintf(v5, sizeof(v5), "%.2e", snap->metrics.column_density_cm2);
-        if (gfit.method == LineAnalysisMethod::DoubleGaussian && gfit.has_secondary) {
+        if (gfit.method == LineAnalysisMethod::TripleGaussian && gfit.has_tertiary) {
+            k6 = "Arm2/3";
+            std::snprintf(v6, sizeof(v6), "%+.1f / %+.1f", gfit.v2_center_kms, gfit.v3_center_kms);
+        } else if ((gfit.method == LineAnalysisMethod::DoubleGaussian ||
+                    gfit.method == LineAnalysisMethod::TripleGaussian) && gfit.has_secondary) {
             k6 = "Arm 2";
             std::snprintf(v6, sizeof(v6), "%.1fK @ %+.1f", gfit.amp2_k, gfit.v2_center_kms);
         } else if (gfit.method == LineAnalysisMethod::VoigtProfile) {
@@ -1603,6 +1644,9 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
         } else if (gfit.method == LineAnalysisMethod::SpectralMoments) {
             k6 = "M1/M2";
             std::snprintf(v6, sizeof(v6), "%+.1f / %.1f", gfit.moment1_kms, gfit.moment2_sigma_kms);
+        } else if (gfit.method == LineAnalysisMethod::BusyFunction) {
+            k6 = "Busy";
+            std::snprintf(v6, sizeof(v6), "w=%.1f c=%.4f", gfit.busy_half_width_kms, gfit.busy_trough_c);
         } else {
             std::snprintf(v6, sizeof(v6), "%.3f K", gfit.rmse_k);
         }
@@ -1722,7 +1766,8 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
     }
     if (y1_min >= y1_max) { y1_min = -80.0; y1_max = 0.0; }
     const double y1_pad = std::max(0.8, (y1_max - y1_min) * 0.10);
-    y1_min -= y1_pad; y1_max += y1_pad;
+    const double def_y1_min = y1_min - y1_pad;
+    const double def_y1_max = y1_max + y1_pad;
 
     if (y2_min >= y2_max) { y2_min = -0.5; y2_max = 0.8; }
     else {
@@ -1730,6 +1775,9 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
         y2_min = std::min(y2_min - y2_pad, -0.35);
         y2_max = std::max(y2_max + y2_pad,  0.55);
     }
+
+    const double plot_y1_min = (compact && zoom.active) ? zoom.y_min : def_y1_min;
+    const double plot_y1_max = (compact && zoom.active) ? zoom.y_max : def_y1_max;
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1787,7 +1835,7 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
 
     if (compact) {
         ui_obs::PlotMargin m{ui_obs::dp(54.0f), ui_obs::dp(16.0f), ui_obs::dp(22.0f), ui_obs::dp(28.0f)};
-        auto vp = ui_obs::PlotViewport2D::create(origin, avail, x_min, x_max, y1_min, y1_max, m);
+        auto vp = ui_obs::PlotViewport2D::create(origin, avail, x_min, x_max, plot_y1_min, plot_y1_max, m);
         vp.draw_background_and_grid(dl, 5, 4, "%.2f", "%.1f", "Frequency (MHz)", "dB", fonts_.mono);
         draw_passband_overlays(vp, false);
 
@@ -1802,7 +1850,7 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
 
         ImGui::SetCursorScreenPos(origin);
         ImGui::InvisibleButton(hit_id, avail);
-        ui_obs::handle_plot_zoom_pan(vp.plot_min, vp.plot_max, f_min_full, f_max_full, y1_min, y1_max, zoom, true, true);
+        ui_obs::handle_plot_zoom_pan(vp.plot_min, vp.plot_max, f_min_full, f_max_full, def_y1_min, def_y1_max, zoom, true, true);
         if (ImGui::IsItemHovered() && vp.contains(ImGui::GetIO().MousePos)) {
             const ImVec2 mp = ImGui::GetIO().MousePos;
             ui_obs::widgets::draw_dashed_vline(dl, mp.x, vp.plot_min.y, vp.plot_max.y, ui_obs::palette::PlotCrosshair, 1.0f);
@@ -1836,7 +1884,7 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
     ui_obs::PlotMargin m_top{ui_obs::dp(64.0f), ui_obs::dp(22.0f), ui_obs::dp(16.0f), ui_obs::dp(16.0f)};
     ui_obs::PlotMargin m_bot{ui_obs::dp(64.0f), ui_obs::dp(22.0f), ui_obs::dp(16.0f), ui_obs::dp(36.0f)};
 
-    auto vp_top = ui_obs::PlotViewport2D::create(origin, ImVec2(avail.x, top_h), x_min, x_max, y1_min, y1_max, m_top);
+    auto vp_top = ui_obs::PlotViewport2D::create(origin, ImVec2(avail.x, top_h), x_min, x_max, def_y1_min, def_y1_max, m_top);
     vp_top.draw_background_and_grid(dl, 7, 5, "%.2f", "%.1f", nullptr, "Power (dB)", fonts_.mono);
     draw_passband_overlays(vp_top, true);
 
@@ -1913,9 +1961,14 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
 
     ImGui::SetCursorScreenPos(origin);
     ImGui::InvisibleButton(hit_id, avail);
+    // Split plot shares one frequency X-axis across two independent Y scales, so zoom X only here
     ui_obs::handle_plot_zoom_pan(ImVec2(vp_top.plot_min.x, vp_top.plot_min.y),
                                  ImVec2(vp_bot.plot_max.x, vp_bot.plot_max.y),
-                                 f_min_full, f_max_full, y1_min, y1_max, zoom, true, true);
+                                 f_min_full, f_max_full, def_y1_min, def_y1_max, zoom, true, false);
+    if (!ImGui::GetIO().KeyCtrl && !ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f) && zoom.active) {
+        zoom.y_min = def_y1_min;
+        zoom.y_max = def_y1_max;
+    }
 
     if (ImGui::IsItemHovered()) {
         const ImVec2 mp = ImGui::GetIO().MousePos;
@@ -1964,6 +2017,8 @@ void UiAnalyzePanel::render_q2_calibrated_db_plot(const std::shared_ptr<const An
     }
 
     const size_t n = snap->stream.freq_mhz.size();
+    const double f_full0 = snap->stream.freq_mhz.front();
+    const double f_full1 = snap->stream.freq_mhz.back();
     const size_t edge_bins = std::min(n / 4, static_cast<size_t>(n * std::clamp(snap->config_used.passband_edge_fraction, 0.0, 0.45)));
     const double f0 = snap->stream.freq_mhz[edge_bins];
     const double f1 = snap->stream.freq_mhz[n - 1 - edge_bins];
@@ -2008,12 +2063,12 @@ void UiAnalyzePanel::render_q2_calibrated_db_plot(const std::shared_ptr<const An
                                            ui_obs::palette::U32(ui_obs::palette::Amber, 0.72f), 1.2f);
     }
 
-    const double df = (f1 - f0) / static_cast<double>(n - 1);
+    const double df = (f_full1 - f_full0) / static_cast<double>(n - 1);
     vp.draw_area_fill_above_ref(dl, n,
-                                [&](size_t i) { return f0 + static_cast<double>(i) * df; },
+                                [&](size_t i) { return f_full0 + static_cast<double>(i) * df; },
                                 [&](size_t i) { return snap->calibrated_db[i]; },
                                 0.0, ui_obs::palette::Emerald, 0.02f, 0.30f, fill_scratch_);
-    vp.draw_decimated_trace(dl, n, f0, f1,
+    vp.draw_decimated_trace(dl, n, f_full0, f_full1,
                             [&](size_t i) { return snap->calibrated_db[i]; },
                             ui_obs::palette::U32(ui_obs::palette::Emerald), ui_obs::dp(1.6f), trace_scratch_);
 
@@ -2028,7 +2083,7 @@ void UiAnalyzePanel::render_q2_calibrated_db_plot(const std::shared_ptr<const An
 
     ImGui::SetCursorScreenPos(origin);
     ImGui::InvisibleButton(hit_id, avail);
-    ui_obs::handle_plot_zoom_pan(vp.plot_min, vp.plot_max, f0, f1, def_ymin, def_ymax, zoom, true, false);
+    ui_obs::handle_plot_zoom_pan(vp.plot_min, vp.plot_max, f_full0, f_full1, def_ymin, def_ymax, zoom, true, false);
 
     if (ImGui::IsItemHovered() && vp.contains(ImGui::GetIO().MousePos)) {
         const ImVec2 mp = ImGui::GetIO().MousePos;

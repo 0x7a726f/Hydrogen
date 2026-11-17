@@ -15,11 +15,6 @@ constexpr float kAlignedRightMarginBase = 76.0f;
 constexpr float kSharedBarOffsetXBase   = 12.0f;
 constexpr float kSharedBarWidthBase     = 14.0f;
 
-static bool is_device_status_healthy(const std::string& status_detail) {
-    return status_detail.find("locked") == std::string::npos &&
-           status_detail.find("error") == std::string::npos;
-}
-
 static std::string build_timestamped_cs16_path(const std::string& output_dir,
                                                const std::string& prefix,
                                                uint64_t center_freq_hz) {
@@ -133,7 +128,6 @@ void UiRecordPanel::sync_device_selection() {
     bias_tee_enabled_ = sdr_.is_bias_tee_enabled();
     ppm_correction_ = sdr_.get_current_ppm();
     device_status_text_ = sdr_.get_status_detail();
-    device_status_ok_ = !sim_active || is_device_status_healthy(device_status_text_);
 
     const uint64_t f_hz = sdr_.get_current_frequency();
     std::snprintf(tune_input_buf_, sizeof(tune_input_buf_), "%.6f", static_cast<double>(f_hz) / 1e6);
@@ -239,7 +233,7 @@ void UiRecordPanel::update_peak_hold(double center_hz, double rate_hz) {
     }
 }
 
-void UiRecordPanel::render_panel(ID3D11DeviceContext* context, float width, float height) {
+void UiRecordPanel::sync_recording_state() {
     if (!writer_.is_recording() && app_state_.is_recording_active()) {
         std::string last = writer_.get_last_recorded_filepath();
         app_state_.set_recording_active(false);
@@ -247,6 +241,10 @@ void UiRecordPanel::render_panel(ID3D11DeviceContext* context, float width, floa
             app_state_.set_last_recorded_file(last);
         }
     }
+}
+
+void UiRecordPanel::render_panel(ID3D11DeviceContext* context, float width, float height) {
+    sync_recording_state();
 
     const float pad_x = ui_obs::dp(10.0f);
     const float pad_y = ui_obs::dp(8.0f);
@@ -589,6 +587,8 @@ void UiRecordPanel::render_device_card() {
             : "No Source";
 
         const float scan_w = ui_obs::dp(52.0f);
+        const bool is_rec_busy = writer_.is_recording();
+        ImGui::BeginDisabled(is_rec_busy);
         ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - scan_w - ui_obs::dp(6.0f)));
         if (ImGui::BeginCombo("##SdrDeviceCombo", cur_label)) {
             for (int i = 0; i < static_cast<int>(device_entries_.size()); ++i) {
@@ -597,23 +597,26 @@ void UiRecordPanel::render_device_card() {
                     if (selected_device_idx_ != i) {
                         const auto& entry = device_entries_[static_cast<size_t>(i)];
                         const bool was_streaming = sdr_.is_streaming();
-                        const bool was_recording = writer_.is_recording();
-                        if (!was_recording) {
-                            sdr_.stop_streaming();
-                            sdr_.initialize(entry.is_virtual, entry.hw_index);
-                            if (was_streaming) sdr_.start_streaming();
-                            sync_device_selection();
-                        }
+                        sdr_.stop_streaming();
+                        sdr_.initialize(entry.is_virtual, entry.hw_index);
+                        if (was_streaming) sdr_.start_streaming();
+                        sync_device_selection();
                     }
                 }
                 if (is_sel) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
         }
+        ImGui::EndDisabled();
+        if (is_rec_busy && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Stop active CS16 recording before switching SDR source.");
+        }
         ImGui::SameLine();
+        ImGui::BeginDisabled(is_rec_busy);
         if (ImGui::Button("Scan", ImVec2(scan_w, 0.0f))) {
             refresh_devices();
         }
+        ImGui::EndDisabled();
 
         const ImVec4 st_col = sim ? ui_obs::palette::TextMuted : ui_obs::palette::Emerald;
         ImGui::TextColored(st_col, "%s", device_status_text_.c_str());

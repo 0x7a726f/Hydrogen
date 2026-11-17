@@ -1,12 +1,18 @@
+#ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#else
+#include <unistd.h>
+#endif
 #include <iostream>
 #include <iomanip>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <chrono>
 #include <filesystem>
 #include <cmath>
+#include <thread>
 
 #include "constants.h"
 #include "config.h"
@@ -34,11 +40,21 @@ static int g_tests_passed = 0;
 #define ASSERT_FALSE(a, msg) TEST_ASSERT(!(a), msg)
 
 static double get_rss_mb() {
+#ifdef _WIN32
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
         return pmc.WorkingSetSize / (1024.0 * 1024.0);
     }
     return 0.0;
+#else
+    std::ifstream ifs("/proc/self/statm");
+    size_t vm_pages = 0, rss_pages = 0;
+    if (ifs >> vm_pages >> rss_pages) {
+        const long page_sz = sysconf(_SC_PAGESIZE);
+        return (static_cast<double>(rss_pages) * static_cast<double>(page_sz)) / (1024.0 * 1024.0);
+    }
+    return 0.0;
+#endif
 }
 
 int main() {
@@ -79,9 +95,9 @@ int main() {
     auto t_write_start = std::chrono::high_resolution_clock::now();
     for (size_t c = 0; c < num_chunks; ++c) {
         writer.feed_samples(synthetic_raw.data(), synthetic_raw.size());
-        // Slight throttling (every 8 blocks = 2MB) to allow async disk worker to keep pace
-        if (c % 8 == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const uint64_t expected_cs16_bytes = static_cast<uint64_t>(c + 1) * chunk_size * sizeof(int16_t);
+        while (expected_cs16_bytes > writer.get_stats().bytes_written + 8ULL * 1024ULL * 1024ULL) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
     writer.stop_recording();

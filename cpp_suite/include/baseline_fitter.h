@@ -54,6 +54,22 @@ private:
         const std::vector<uint8_t>& hi_window,
         const AstroConfig& config
     );
+
+    static std::vector<double> fit_savgol(
+        const std::vector<double>& p_db,
+        const std::vector<double>& freqs_mhz,
+        const std::vector<uint8_t>& passband_mask,
+        const std::vector<uint8_t>& hi_window,
+        const AstroConfig& config
+    );
+
+    static std::vector<double> fit_standing_wave(
+        const std::vector<double>& p_db,
+        const std::vector<double>& freqs_mhz,
+        const std::vector<uint8_t>& passband_mask,
+        const std::vector<uint8_t>& hi_window,
+        const AstroConfig& config
+    );
 };
 
 // Fast Pentadiagonal Linear System Solver for Whittaker / ALS:

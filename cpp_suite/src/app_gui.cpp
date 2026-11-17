@@ -39,7 +39,6 @@ AppGui::~AppGui() {
 }
 
 void AppGui::set_owner_hwnd(HWND hwnd) {
-    owner_hwnd_ = hwnd;
     analyze_panel_.set_owner_hwnd(hwnd);
 }
 
@@ -431,6 +430,9 @@ void AppGui::render_status_bar(float width, float height) {
 
 void AppGui::render_frame(ID3D11DeviceContext* context, float display_w, float display_h) {
     if (display_w < 100.0f || display_h < 100.0f) return;
+
+    // Keep global REC ACTIVE badge and collision guards synchronized across tabs
+    record_panel_.sync_recording_state();
 
     // Keyboard shortcuts when not editing a text box
     if (!ImGui::GetIO().WantTextInput) {

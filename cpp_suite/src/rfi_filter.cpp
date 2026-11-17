@@ -28,17 +28,21 @@ static inline double calc_median_15(const double* src) {
     return win[7];
 }
 
-// Clamped edge-replicated 15-tap window median for boundary bins [0..6] and [nfft-7..nfft-1]
-static inline double calc_median_15_clamped(const double* power, int nfft, int center_idx) {
-    double win[15];
-    for (int k = -7; k <= 7; ++k) {
-        int src_idx = center_idx + k;
-        if (src_idx < 0) src_idx = 0;
-        else if (src_idx >= nfft) src_idx = nfft - 1;
-        win[k + 7] = power[src_idx];
+// Unreplicated boundary window median over [max(0, center_idx - 7), min(nfft - 1, center_idx + 7)]
+// Avoids edge replication where a bin-0 or bin-(nfft-1) spike would replicate itself 8 times and become its own median.
+static inline double calc_median_boundary(const double* power, int nfft, int center_idx) {
+    double win[15] = {};
+    int lo = std::max(0, center_idx - 7);
+    int hi = std::min(nfft - 1, center_idx + 7);
+    int count = 0;
+    for (int idx = lo; idx <= hi; ++idx) {
+        win[count++] = power[idx];
     }
-    std::nth_element(win, win + 7, win + 15);
-    return win[7];
+    int mid = count / 2;
+    std::nth_element(win, win + mid, win + count);
+    if (count % 2 != 0) return win[mid];
+    double left_max = *std::max_element(win, win + mid);
+    return 0.5 * (left_max + win[mid]);
 }
 
 #ifdef __AVX2__
@@ -132,7 +136,7 @@ std::vector<double> RFIFilter::mitigate(
 
     // Left boundary [0..6]
     for (int i = 0; i < 7; ++i) {
-        res_ptr[i] = pwr_ptr[i] - calc_median_15_clamped(pwr_ptr, nfft, i);
+        res_ptr[i] = pwr_ptr[i] - calc_median_boundary(pwr_ptr, nfft, i);
     }
     int i = 7;
 #ifdef __AVX2__
@@ -148,7 +152,7 @@ std::vector<double> RFIFilter::mitigate(
     }
     // Right boundary [nfft - 7 .. nfft - 1]
     for (; i < nfft; ++i) {
-        res_ptr[i] = pwr_ptr[i] - calc_median_15_clamped(pwr_ptr, nfft, i);
+        res_ptr[i] = pwr_ptr[i] - calc_median_boundary(pwr_ptr, nfft, i);
     }
 
     tl_residuals_valid.clear();
@@ -178,7 +182,7 @@ std::vector<double> RFIFilter::mitigate(
     is_rfi.assign(nfft, 0);
     tl_rfi_indices.clear();
     for (int i = 0; i < nfft; ++i) {
-        if (valid_mask[i] && res_ptr[i] > threshold) {
+        if (valid_mask[i] && (res_ptr[i] - med_res) > threshold) {
             is_rfi[i] = 1;
             tl_rfi_indices.push_back(i);
         }
@@ -194,15 +198,21 @@ std::vector<double> RFIFilter::mitigate(
         ++k;
 
         int l_idx = run_start - 1;
-        while (l_idx > 0 && is_rfi[l_idx]) --l_idx;
+        while (l_idx >= 0 && is_rfi[l_idx]) --l_idx;
         int r_idx = run_end + 1;
-        while (r_idx < nfft - 1 && is_rfi[r_idx]) ++r_idx;
+        while (r_idx < nfft && is_rfi[r_idx]) ++r_idx;
 
-        const double v_l = !is_rfi[l_idx] ? power[l_idx] : power[r_idx];
-        const double v_r = !is_rfi[r_idx] ? power[r_idx] : power[l_idx];
-        const int span = std::max(1, r_idx - l_idx);
+        const bool has_left = (l_idx >= 0);
+        const bool has_right = (r_idx < nfft);
+        if (!has_left && !has_right) continue;
+
+        const double v_l = has_left ? power[l_idx] : power[r_idx];
+        const double v_r = has_right ? power[r_idx] : power[l_idx];
+        const int span_l = has_left ? l_idx : run_start - 1;
+        const int span_r = has_right ? r_idx : run_end + 1;
+        const int span = std::max(1, span_r - span_l);
         for (int idx = run_start; idx <= run_end; ++idx) {
-            const double t = static_cast<double>(idx - l_idx) / static_cast<double>(span);
+            const double t = static_cast<double>(idx - span_l) / static_cast<double>(span);
             clean_power[idx] = v_l + t * (v_r - v_l);
         }
     }

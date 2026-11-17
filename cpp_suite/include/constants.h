@@ -100,6 +100,13 @@ constexpr double SPEED_OF_LIGHT_MS = SPEED_OF_LIGHT_KMS * 1e3;
 // where T_B is brightness temperature in K, dv is velocity in km/s
 constexpr double HI_COLUMN_DENSITY_FACTOR = 1.8224e18;
 
+// Doppler thermal kinetic temperature upper bound factor:
+// T_k,max = (m_H * (1000 m/km)^2) / (8 * k_B * ln(2)) * FWHM_kms^2 = 21.855312 * FWHM_kms^2 [K]
+constexpr double HI_THERMAL_TEMP_FACTOR_K = 21.855312;
+
+// Standard Galactic harmonic-mean H I 21-cm spin temperature T_s [K]
+constexpr double DEFAULT_HI_SPIN_TEMP_K = 150.0;
+
 // Gaussian FWHM constant: FWHM = 2 * sqrt(2 * ln(2)) * sigma
 constexpr double GAUSSIAN_SIGMA_TO_FWHM = 2.3548200450309493;
 
