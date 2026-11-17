@@ -56,6 +56,7 @@ else()
 endif()
 
 if (WIN32)
+    target_compile_definitions(astro_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
     set(WINDOWS_LIBS
         d3d11 dxgi d3dcompiler dwmapi
         ole32 kernel32 user32 shell32 gdi32 psapi comdlg32
