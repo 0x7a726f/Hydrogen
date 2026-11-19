@@ -87,7 +87,7 @@ VirtualSdrDevice::VirtualSdrDevice() {
 
 bool VirtualSdrDevice::open(uint32_t /*index*/) {
     is_open_ = true;
-    next_chunk_time_ = std::chrono::high_resolution_clock::now();
+    next_chunk_time_ = std::chrono::steady_clock::now();
     return true;
 }
 
@@ -102,6 +102,7 @@ std::vector<float> VirtualSdrDevice::get_valid_gains() {
 }
 
 bool VirtualSdrDevice::set_sample_rate(uint32_t rate_hz) {
+    if (rate_hz == 0) return false;
     sample_rate_hz_.store(rate_hz);
     return true;
 }
@@ -132,24 +133,24 @@ void VirtualSdrDevice::reset_buffer() {
 }
 
 int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read) {
-    if (!is_open_) {
-        if (bytes_read) *bytes_read = 0;
+    if (bytes_read) *bytes_read = 0;
+    if (!is_open_ || !buffer || length < 2) {
         return -1;
     }
 
     const int chunk_samples = length / 2;
-    const uint32_t fs = sample_rate_hz_.load();
+    const uint32_t fs = std::max(1u, sample_rate_hz_.load());
     const uint64_t fc = center_freq_hz_.load();
-    const double span = (double)fs;
+    const double span = static_cast<double>(fs);
 
     // Real-time pacing with drift compensation
-    auto now = std::chrono::high_resolution_clock::now();
+    auto now = std::chrono::steady_clock::now();
     if (next_chunk_time_ > now) {
         std::this_thread::sleep_until(next_chunk_time_);
-        now = std::chrono::high_resolution_clock::now();
+        now = std::chrono::steady_clock::now();
     }
-    double chunk_duration_sec = (double)chunk_samples / (double)fs;
-    auto chunk_duration = std::chrono::microseconds((int64_t)(chunk_duration_sec * 1000000.0));
+    double chunk_duration_sec = static_cast<double>(chunk_samples) / static_cast<double>(fs);
+    auto chunk_duration = std::chrono::microseconds(static_cast<int64_t>(chunk_duration_sec * 1000000.0));
     if (next_chunk_time_ + chunk_duration * 2 < now) {
         next_chunk_time_ = now + chunk_duration;
     } else {
@@ -163,7 +164,7 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
     const float dc_offset_i = 10.0f + 128.0f;
     const float dc_offset_q = 128.0f;
 
-    if (std::abs(static_cast<double>(fc) - SdrConstants::HI_REST_FREQ_HZ) < span) {
+    if (std::abs(static_cast<double>(fc) - SdrConstants::HI_REST_FREQ_HZ) < span * 0.48) {
         // Simulate Doppler-shifted (+7.4 km/s) narrowband thermal 21cm H I emission (~12 km/s FWHM)
         const double hi_line_freq_hz = SdrConstants::HI_REST_FREQ_HZ - 35000.0;
         const double hi_offset = hi_line_freq_hz - static_cast<double>(fc);
@@ -310,6 +311,6 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
         if (in_band) *phase_ptr = osc.final_phase();
     }
 
-    *bytes_read = chunk_samples * 2;
+    if (bytes_read) *bytes_read = chunk_samples * 2;
     return 0;
 }

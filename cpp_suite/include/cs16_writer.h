@@ -31,12 +31,18 @@ struct RecordingStats {
     uint64_t dropped_blocks = 0;
     double free_space_gb = 0.0;
     double elapsed_seconds = 0.0;
+    bool io_error = false;
 };
 
 class Cs16Writer {
 public:
     explicit Cs16Writer(const std::string& output_dir = "recordings");
     ~Cs16Writer();
+
+    Cs16Writer(const Cs16Writer&) = delete;
+    Cs16Writer& operator=(const Cs16Writer&) = delete;
+    Cs16Writer(Cs16Writer&&) = delete;
+    Cs16Writer& operator=(Cs16Writer&&) = delete;
 
     std::string start_recording(
         uint32_t sample_rate_hz,
@@ -50,6 +56,7 @@ public:
 
     bool stop_recording();
     bool is_recording() const { return is_recording_.load(); }
+    bool has_io_error() const { return io_error_.load(std::memory_order_acquire); }
 
     void feed_samples(const uint8_t* data, size_t length);
 
@@ -85,6 +92,7 @@ private:
     std::atomic<uint64_t> bytes_written_{0};
     std::atomic<uint64_t> samples_written_{0};
     std::atomic<uint64_t> dropped_blocks_{0};
+    std::atomic<bool> io_error_{false};
     std::atomic<bool> sidecars_written_{false};
 
 #ifdef _WIN32

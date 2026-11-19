@@ -3,21 +3,27 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
-#include <cmath>
-#include <filesystem>
-#include <ctime>
 
 namespace fs = std::filesystem;
 
 #ifdef _WIN32
 static std::wstring to_wide(const std::string& str) {
-    if (str.empty()) return std::wstring();
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
-    std::wstring result(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &result[0], size);
+    if (str.empty() || str.size() > static_cast<size_t>(INT_MAX)) return std::wstring();
+    const int src_len = static_cast<int>(str.size());
+    const int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), src_len, nullptr, 0);
+    if (size <= 0) return std::wstring();
+    std::wstring result(static_cast<size_t>(size), L'\0');
+    const int written = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), src_len, &result[0], size);
+    if (written <= 0) return std::wstring();
     return result;
 }
 #endif
@@ -70,17 +76,26 @@ std::string Cs16Writer::start_recording(
     double max_duration_s
 ) {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-    if (is_recording_.load()) {
+    if (is_recording_.load(std::memory_order_acquire)) {
         return get_current_filepath();
     }
-    // Join any finished auto-stopped worker thread before restarting
+
+    // Stop intake, join any finished auto-stopped worker thread, and drain all active feeders
+    // before mutating shared state or resetting the ring buffer.
+    accepting_samples_.store(false, std::memory_order_release);
     if (writer_thread_.joinable()) {
-        stop_worker_ = true;
+        stop_worker_.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(queue_mutex_);
+        }
         queue_cv_.notify_all();
         writer_thread_.join();
     }
+    while (active_feeders_.load(std::memory_order_acquire) > 0) {
+        std::this_thread::yield();
+    }
 
-    sample_rate_hz_ = sample_rate_hz;
+    sample_rate_hz_.store(sample_rate_hz);
     center_freq_hz_ = center_freq_hz;
     device_name_ = device_name;
     gain_db_ = gain_db;
@@ -94,8 +109,8 @@ std::string Cs16Writer::start_recording(
     } else {
         std::ostringstream ss;
         ss << output_dir_ << "/hi_capture_" << format_time_slug_now() << "_"
-           << std::fixed << std::setprecision(3) << (center_freq_hz / 1e6) << "MHz_"
-           << std::setprecision(2) << (sample_rate_hz / 1e6) << "MSPS.cs16";
+           << std::fixed << std::setprecision(3) << (static_cast<double>(center_freq_hz) / 1e6) << "MHz_"
+           << std::setprecision(2) << (static_cast<double>(sample_rate_hz) / 1e6) << "MSPS.cs16";
         path_to_use = ss.str();
     }
 
@@ -116,12 +131,14 @@ std::string Cs16Writer::start_recording(
         nullptr
     );
     if (file_handle_ == INVALID_HANDLE_VALUE) {
+        io_error_.store(true, std::memory_order_release);
         return "";
     }
 #else
     {
         std::ofstream probe(path_to_use, std::ios::binary | std::ios::trunc);
         if (!probe.is_open()) {
+            io_error_.store(true, std::memory_order_release);
             return "";
         }
     }
@@ -130,14 +147,15 @@ std::string Cs16Writer::start_recording(
     {
         std::lock_guard<std::mutex> lock(path_mutex_);
         current_filepath_ = path_to_use;
+        start_time_ = std::chrono::steady_clock::now();
     }
 
-    bytes_written_ = 0;
-    samples_written_ = 0;
-    dropped_blocks_ = 0;
-    sidecars_written_.store(false);
-    start_time_ = std::chrono::steady_clock::now();
-    stop_worker_ = false;
+    bytes_written_.store(0, std::memory_order_relaxed);
+    samples_written_.store(0, std::memory_order_relaxed);
+    dropped_blocks_.store(0, std::memory_order_relaxed);
+    io_error_.store(false, std::memory_order_release);
+    sidecars_written_.store(false, std::memory_order_release);
+    stop_worker_.store(false, std::memory_order_release);
 
     if (!ring_buffer_) {
         ring_buffer_ = std::make_unique<LockFreeSpscRingBuffer<uint8_t>>(8ULL * 1024ULL * 1024ULL);
@@ -174,7 +192,7 @@ bool Cs16Writer::stop_recording() {
     while (active_feeders_.load(std::memory_order_acquire) > 0) {
         std::this_thread::yield();
     }
-    bool was_recording = is_recording_.load();
+    bool was_recording = is_recording_.load(std::memory_order_acquire);
     bool has_thread = writer_thread_.joinable();
     if (!was_recording && !has_thread) {
         return false;
@@ -191,8 +209,13 @@ bool Cs16Writer::stop_recording() {
     }
     is_recording_.store(false, std::memory_order_release);
 
+    std::chrono::steady_clock::time_point st;
+    {
+        std::lock_guard<std::mutex> lock(path_mutex_);
+        st = start_time_;
+    }
     auto now = std::chrono::steady_clock::now();
-    double duration_s = std::chrono::duration<double>(now - start_time_).count();
+    double duration_s = std::chrono::duration<double>(now - st).count();
     finalize_sidecars(duration_s);
 
     return was_recording || has_thread;
@@ -209,6 +232,8 @@ std::string Cs16Writer::get_last_recorded_filepath() const {
 }
 
 void Cs16Writer::feed_samples(const uint8_t* data, size_t length) {
+    // Enforce even I/Q byte alignment so odd transfers can never swap I and Q channels
+    length &= ~size_t(1);
     if (!accepting_samples_.load(std::memory_order_acquire) || !ring_buffer_ || !data || length == 0) return;
 
     struct FeederGuard {
@@ -234,11 +259,10 @@ void Cs16Writer::feed_samples(const uint8_t* data, size_t length) {
         }
     }
 
-    const size_t wrote = ring_buffer_->write(data, length);
-    if (wrote < length) {
+    // All-or-nothing block admission prevents partial writes from breaking I/Q framing
+    if (!ring_buffer_->write_exact(data, length)) {
         dropped_blocks_.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (wrote > 0) {
+    } else {
         {
             std::lock_guard<std::mutex> lk(queue_mutex_);
         }
@@ -257,19 +281,34 @@ void Cs16Writer::writer_worker() {
 #ifndef _WIN32
     std::ofstream out(get_current_filepath(), std::ios::binary);
     if (!out.is_open()) {
-        accepting_samples_ = false;
-        is_recording_ = false;
+        io_error_.store(true, std::memory_order_release);
+        accepting_samples_.store(false, std::memory_order_release);
+        is_recording_.store(false, std::memory_order_release);
         return;
     }
     std::vector<char> file_buf(2097152);
-    out.rdbuf()->pubsetbuf(file_buf.data(), file_buf.size());
+    out.rdbuf()->pubsetbuf(file_buf.data(), static_cast<std::streamsize>(file_buf.size()));
 #endif
 
-    constexpr size_t kBatchCap = 2ULL * 1024ULL * 1024ULL; // 2 MB u8 -> 4 MB CS16
+    constexpr size_t kBatchCap = 2ULL * 1024ULL * 1024ULL; // 2 MB u8 -> 4 MB CS16 (even)
     std::vector<uint8_t> u8_staging(kBatchCap);
     std::vector<int16_t> cs16_staging(kBatchCap);
 
+    auto check_duration_expired = [this]() -> bool {
+        if (max_duration_s_ <= 0.0) return false;
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start_time_).count();
+        if (elapsed >= max_duration_s_) {
+            accepting_samples_.store(false, std::memory_order_release);
+            stop_worker_.store(true, std::memory_order_release);
+            return true;
+        }
+        return false;
+    };
+
     while (true) {
+        check_duration_expired();
+
         size_t got = ring_buffer_ ? ring_buffer_->read(u8_staging.data(), kBatchCap) : 0;
         if (got == 0) {
             std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -281,12 +320,18 @@ void Cs16Writer::writer_worker() {
                 return stop_worker_.load(std::memory_order_acquire) ||
                        (ring_buffer_ && ring_buffer_->available_read() > 0);
             });
+            lock.unlock();
+
+            check_duration_expired();
             got = ring_buffer_ ? ring_buffer_->read(u8_staging.data(), kBatchCap) : 0;
             if (got == 0 && stop_worker_.load(std::memory_order_acquire)) {
                 break;
             }
             if (got == 0) continue;
         }
+
+        got &= ~size_t(1);
+        if (got == 0) continue;
 
         SimdDsp::convert_u8_to_cs16_fast(u8_staging.data(), cs16_staging.data(), got);
 
@@ -311,8 +356,15 @@ void Cs16Writer::writer_worker() {
 #endif
 
         if (write_ok) {
-            bytes_written_ += total_bytes;
-            samples_written_ += (total_bytes / 4);
+            bytes_written_.fetch_add(total_bytes, std::memory_order_relaxed);
+            samples_written_.fetch_add(total_bytes / 4, std::memory_order_relaxed);
+        } else {
+            // Surface disk-full / I/O write failure cleanly and halt recording
+            io_error_.store(true, std::memory_order_release);
+            dropped_blocks_.fetch_add(1, std::memory_order_relaxed);
+            accepting_samples_.store(false, std::memory_order_release);
+            stop_worker_.store(true, std::memory_order_release);
+            break;
         }
     }
 
@@ -338,8 +390,8 @@ void Cs16Writer::writer_worker() {
 static std::string escape_json_str(const std::string& input) {
     std::string out;
     out.reserve(input.size() + 8);
-    for (char c : input) {
-        switch (c) {
+    for (unsigned char uc : input) {
+        switch (uc) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
             case '\b': out += "\\b"; break;
@@ -347,22 +399,31 @@ static std::string escape_json_str(const std::string& input) {
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
-            default:   out.push_back(c); break;
+            default:
+                if (uc < 0x20u) {
+                    char hex_buf[8];
+                    std::snprintf(hex_buf, sizeof(hex_buf), "\\u%04x", static_cast<unsigned int>(uc));
+                    out += hex_buf;
+                } else {
+                    out.push_back(static_cast<char>(uc));
+                }
+                break;
         }
     }
     return out;
 }
 
 void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double duration_s) {
-    double fc_hz = (double)center_freq_hz_;
+    double fc_hz = static_cast<double>(center_freq_hz_);
     double fc_mhz = fc_hz / 1e6;
-    double fs_hz = (double)sample_rate_hz_.load();
+    double fs_hz = static_cast<double>(sample_rate_hz_.load());
     double fs_msps = fs_hz / 1e6;
     double offset_hz = fc_hz - SdrConstants::HI_REST_FREQ_HZ;
     double offset_khz = offset_hz / 1e3;
     double dur_min = duration_s / 60.0;
-    double size_mb = (double)bytes_written_ / (1024.0 * 1024.0);
-    double size_gb = (double)bytes_written_ / (1024.0 * 1024.0 * 1024.0);
+    uint64_t total_bytes_w = bytes_written_.load();
+    double size_mb = static_cast<double>(total_bytes_w) / (1024.0 * 1024.0);
+    double size_gb = static_cast<double>(total_bytes_w) / (1024.0 * 1024.0 * 1024.0);
     const std::string cur_file = get_current_filepath();
     std::error_code ec;
     std::string cs16_filename = fs::path(cur_file).filename().string();
@@ -398,15 +459,15 @@ void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double durat
       << "----------------------------------------------------------------------\n"
       << "HI Rest Frequency:          1420.405752 MHz\n"
       << std::fixed << std::setprecision(6)
-      << "Tuned SDR Center LO:        " << fc_mhz << " MHz (" << (int64_t)fc_hz << " Hz)\n"
+      << "Tuned SDR Center LO:        " << fc_mhz << " MHz (" << static_cast<int64_t>(fc_hz) << " Hz)\n"
       << std::showpos << std::setprecision(3)
-      << "LO Frequency Offset:        " << offset_khz << " kHz (" << (int64_t)offset_hz << " Hz)\n"
+      << "LO Frequency Offset:        " << offset_khz << " kHz (" << static_cast<int64_t>(offset_hz) << " Hz)\n"
       << std::noshowpos
       << "Offset Assessment:          " << offset_desc << "\n\n"
       << "SDR Configuration\n"
       << "----------------------------------------------------------------------\n"
       << std::setprecision(3)
-      << "Sampling Rate (Fs):         " << fs_msps << " MSPS (" << (int64_t)fs_hz << " Hz)\n"
+      << "Sampling Rate (Fs):         " << fs_msps << " MSPS (" << static_cast<int64_t>(fs_hz) << " Hz)\n"
       << "Passband Coverage:          " << passband_min_mhz << " to " << passband_max_mhz << " MHz\n"
       << std::setprecision(1)
       << "RF Gain:                    " << gain_db_ << " dB\n"
@@ -417,14 +478,15 @@ void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double durat
       << std::setprecision(2)
       << "Observation Duration:       " << duration_s << " s (" << dur_min << " min)\n"
       << "Total Complex Samples:      " << samples_written_.load() << "\n"
-      << "Total File Size:            " << bytes_written_.load() << " bytes (" << size_mb << " MB / "
+      << "Total File Size:            " << total_bytes_w << " bytes (" << size_mb << " MB / "
       << std::setprecision(3) << size_gb << " GB)\n"
       << std::setprecision(2)
       << "Nominal Data Rate:          " << ((fs_hz * 4.0) / (1024.0 * 1024.0)) << " MB/s\n\n"
       << "CLI Analysis Command\n"
       << "----------------------------------------------------------------------\n"
-      << std::fixed << std::setprecision(4)
-      << "  radio_suite_cli analyze \"" << cs16_filename << "\" --fc " << fc_mhz << "M --fs " << fs_msps << "M -o output\n";
+      << std::fixed << std::setprecision(6)
+      << "  radio_suite_cli analyze \"" << cs16_filename << "\" --fc " << fc_mhz << "M --fs "
+      << std::setprecision(3) << fs_msps << "M -o output\n";
     f.flush();
     f.close();
 }
@@ -433,7 +495,7 @@ void Cs16Writer::write_sidecar_json(const std::string& json_path, double duratio
     std::ofstream f(json_path);
     if (!f.is_open()) return;
 
-    double offset_hz = (double)center_freq_hz_ - SdrConstants::HI_REST_FREQ_HZ;
+    double offset_hz = static_cast<double>(center_freq_hz_) - SdrConstants::HI_REST_FREQ_HZ;
     double offset_khz = offset_hz / 1e3;
 
     std::string clean_path;
@@ -448,7 +510,7 @@ void Cs16Writer::write_sidecar_json(const std::string& json_path, double duratio
       << "  \"format\": \"cs16\",\n"
       << "  \"endianness\": \"little\",\n"
       << "  \"bytes_per_sample\": 4,\n"
-      << "  \"sample_rate_hz\": " << sample_rate_hz_ << ",\n"
+      << "  \"sample_rate_hz\": " << sample_rate_hz_.load() << ",\n"
       << "  \"center_freq_hz\": " << center_freq_hz_ << ",\n"
       << "  \"hi_rest_freq_hz\": " << std::fixed << std::setprecision(3) << SdrConstants::HI_REST_FREQ_HZ << ",\n"
       << std::fixed << std::setprecision(3)
@@ -473,7 +535,16 @@ RecordingStats Cs16Writer::get_stats() {
     RecordingStats s;
     const bool rec = is_recording_.load(std::memory_order_acquire);
     s.status = rec ? "RECORDING" : "IDLE";
-    std::string cur_path = get_current_filepath();
+    s.io_error = io_error_.load(std::memory_order_acquire);
+
+    std::string cur_path;
+    std::chrono::steady_clock::time_point st;
+    {
+        std::lock_guard<std::mutex> lock(path_mutex_);
+        cur_path = current_filepath_;
+        st = start_time_;
+    }
+
     s.filename = cur_path.empty() ? "None" : fs::path(cur_path).filename().string();
     s.full_path = cur_path;
     s.bytes_written = bytes_written_.load();
@@ -482,41 +553,48 @@ RecordingStats Cs16Writer::get_stats() {
 
     if (rec) {
         auto now = std::chrono::steady_clock::now();
-        s.elapsed_seconds = std::chrono::duration<double>(now - start_time_).count();
+        s.elapsed_seconds = std::max(0.0, std::chrono::duration<double>(now - st).count());
     } else {
         s.elapsed_seconds = 0.0;
     }
 
-    int total_s = (int)s.elapsed_seconds;
+    int total_s = static_cast<int>(s.elapsed_seconds);
     int hrs = total_s / 3600;
     int mins = (total_s % 3600) / 60;
     int secs = total_s % 60;
     char el_buf[32];
-    snprintf(el_buf, sizeof(el_buf), "%02d:%02d:%02d", hrs, mins, secs);
+    std::snprintf(el_buf, sizeof(el_buf), "%02d:%02d:%02d", hrs, mins, secs);
     s.elapsed_str = el_buf;
 
     // File size string
-    double mb = (double)s.bytes_written / (1024.0 * 1024.0);
+    double mb = static_cast<double>(s.bytes_written) / (1024.0 * 1024.0);
     char sz_buf[32];
     if (mb >= 1024.0) {
-        snprintf(sz_buf, sizeof(sz_buf), "%.2f GB", mb / 1024.0);
+        std::snprintf(sz_buf, sizeof(sz_buf), "%.2f GB", mb / 1024.0);
     } else {
-        snprintf(sz_buf, sizeof(sz_buf), "%.2f MB", mb);
+        std::snprintf(sz_buf, sizeof(sz_buf), "%.2f MB", mb);
     }
     s.size_str = sz_buf;
+
+    // Query free space on the actual target file's parent directory (fallback output_dir_ / ".")
+    std::string space_dir = output_dir_.empty() ? "." : output_dir_;
+    if (!cur_path.empty()) {
+        fs::path parent = fs::path(cur_path).parent_path();
+        space_dir = parent.empty() ? "." : parent.string();
+    }
 
     uint64_t free_bytes = 0;
     bool have_free = false;
 #ifdef _WIN32
     ULARGE_INTEGER free_bytes_avail, total_bytes, total_free_bytes;
-    std::wstring dir_w = to_wide(output_dir_.empty() ? "." : output_dir_);
-    if (GetDiskFreeSpaceExW(dir_w.c_str(), &free_bytes_avail, &total_bytes, &total_free_bytes)) {
+    std::wstring dir_w = to_wide(space_dir);
+    if (!dir_w.empty() && GetDiskFreeSpaceExW(dir_w.c_str(), &free_bytes_avail, &total_bytes, &total_free_bytes)) {
         free_bytes = free_bytes_avail.QuadPart;
         have_free = true;
     }
 #else
     std::error_code space_ec;
-    auto si = fs::space(output_dir_.empty() ? "." : output_dir_, space_ec);
+    auto si = fs::space(space_dir, space_ec);
     if (!space_ec) {
         free_bytes = static_cast<uint64_t>(si.available);
         have_free = true;
@@ -524,23 +602,23 @@ RecordingStats Cs16Writer::get_stats() {
 #endif
 
     if (have_free) {
-        s.free_space_gb = (double)free_bytes / (1024.0 * 1024.0 * 1024.0);
+        s.free_space_gb = static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0);
         char free_buf[32];
-        snprintf(free_buf, sizeof(free_buf), "%.2f GB", s.free_space_gb);
+        std::snprintf(free_buf, sizeof(free_buf), "%.2f GB", s.free_space_gb);
         s.free_space_str = free_buf;
 
-        uint64_t bytes_per_sec = (uint64_t)sample_rate_hz_ * 4ULL;
+        uint64_t bytes_per_sec = static_cast<uint64_t>(sample_rate_hz_.load()) * 4ULL;
         if (bytes_per_sec > 0) {
             uint64_t time_left_s = free_bytes / bytes_per_sec;
-            int tl_days = (int)(time_left_s / 86400);
-            int tl_hrs = (int)((time_left_s % 86400) / 3600);
-            int tl_mins = (int)((time_left_s % 3600) / 60);
-            int tl_secs = (int)(time_left_s % 60);
+            int tl_days = static_cast<int>(time_left_s / 86400);
+            int tl_hrs = static_cast<int>((time_left_s % 86400) / 3600);
+            int tl_mins = static_cast<int>((time_left_s % 3600) / 60);
+            int tl_secs = static_cast<int>(time_left_s % 60);
             char tl_buf[64];
             if (tl_days > 0) {
-                snprintf(tl_buf, sizeof(tl_buf), "%02d:%02d:%02d:%02d", tl_days, tl_hrs, tl_mins, tl_secs);
+                std::snprintf(tl_buf, sizeof(tl_buf), "%02d:%02d:%02d:%02d", tl_days, tl_hrs, tl_mins, tl_secs);
             } else {
-                snprintf(tl_buf, sizeof(tl_buf), "%02d:%02d:%02d", tl_hrs, tl_mins, tl_secs);
+                std::snprintf(tl_buf, sizeof(tl_buf), "%02d:%02d:%02d", tl_hrs, tl_mins, tl_secs);
             }
             s.time_left_str = tl_buf;
         } else {

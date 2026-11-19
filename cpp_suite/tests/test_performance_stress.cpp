@@ -82,38 +82,44 @@ int main() {
     std::cout << "[Benchmark 1] Stress-Testing CS16 Async Disk Writer (50 MB raw capture)...\n";
     const size_t chunk_size = 262144; // 256 KB RTL-SDR standard block size
     const size_t num_chunks = 200;    // 50 MB total input data
-    std::vector<uint8_t> synthetic_raw(chunk_size);
-    for (size_t i = 0; i < chunk_size; ++i) {
-        synthetic_raw[i] = static_cast<uint8_t>((i % 256) ^ 0x55);
-    }
-
-    Cs16Writer writer(test_dir);
-    std::string actual_file = writer.start_recording(
-        2400000, 1420500000, "Virtual Perf SDR", 25.4f, false, perf_cs16, 0.0
-    );
-
-    auto t_write_start = std::chrono::high_resolution_clock::now();
-    for (size_t c = 0; c < num_chunks; ++c) {
-        writer.feed_samples(synthetic_raw.data(), synthetic_raw.size());
-        const uint64_t expected_cs16_bytes = static_cast<uint64_t>(c + 1) * chunk_size * sizeof(int16_t);
-        while (expected_cs16_bytes > writer.get_stats().bytes_written + 8ULL * 1024ULL * 1024ULL) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::string actual_file;
+    RecordingStats stats;
+    double write_elapsed_s = 0.0;
+    {
+        std::vector<uint8_t> synthetic_raw(chunk_size);
+        for (size_t i = 0; i < chunk_size; ++i) {
+            synthetic_raw[i] = static_cast<uint8_t>((i % 256) ^ 0x55);
         }
-    }
-    writer.stop_recording();
-    auto t_write_end = std::chrono::high_resolution_clock::now();
 
-    double write_elapsed_s = std::chrono::duration<double>(t_write_end - t_write_start).count();
+        Cs16Writer writer(test_dir);
+        actual_file = writer.start_recording(
+            2400000, 1420500000, "Virtual Perf SDR", 25.4f, false, perf_cs16, 0.0
+        );
+
+        auto t_write_start = std::chrono::steady_clock::now();
+        for (size_t c = 0; c < num_chunks; ++c) {
+            writer.feed_samples(synthetic_raw.data(), synthetic_raw.size());
+            const uint64_t expected_cs16_bytes = static_cast<uint64_t>(c + 1) * chunk_size * sizeof(int16_t);
+            while (expected_cs16_bytes > writer.get_stats().bytes_written + 8ULL * 1024ULL * 1024ULL) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        writer.stop_recording();
+        auto t_write_end = std::chrono::steady_clock::now();
+        write_elapsed_s = std::chrono::duration<double>(t_write_end - t_write_start).count();
+        stats = writer.get_stats();
+        ASSERT_FALSE(writer.has_io_error(), "Zero disk I/O write errors during 50 MB write burst");
+    }
+
     uint64_t file_bytes = std::filesystem::file_size(actual_file);
     double write_mb = file_bytes / (1024.0 * 1024.0);
-    double write_speed_mb_s = write_mb / write_elapsed_s;
-    double write_msps = (file_bytes / (2 * sizeof(int16_t))) / (write_elapsed_s * 1e6);
+    double write_speed_mb_s = write_mb / std::max(1e-6, write_elapsed_s);
+    double write_msps = (file_bytes / (2 * sizeof(int16_t))) / (std::max(1e-6, write_elapsed_s) * 1e6);
 
     std::cout << "  Written: " << write_mb << " MB in " << write_elapsed_s << "s\n"
               << "  Sustained Write Throughput: " << std::fixed << std::setprecision(2)
               << write_speed_mb_s << " MB/s (" << write_msps << " MSPS)\n";
 
-    auto stats = writer.get_stats();
     std::cout << "  Dropped Blocks: " << stats.dropped_blocks << "\n";
 
     ASSERT_TRUE(stats.dropped_blocks == 0, "Zero dropped blocks during 50 MB write burst");
@@ -134,13 +140,13 @@ int main() {
 
     StreamingProcessor processor(actual_file, config);
 
-    auto t_stream_start = std::chrono::high_resolution_clock::now();
+    auto t_stream_start = std::chrono::steady_clock::now();
     StreamingResults stream_res = processor.process(nullptr);
-    auto t_stream_end = std::chrono::high_resolution_clock::now();
+    auto t_stream_end = std::chrono::steady_clock::now();
 
     double stream_elapsed_s = std::chrono::duration<double>(t_stream_end - t_stream_start).count();
-    double stream_mb_s = (stream_res.file_size_bytes / (1024.0 * 1024.0)) / stream_elapsed_s;
-    double stream_msps = (stream_res.total_samples / 1e6) / stream_elapsed_s;
+    double stream_mb_s = (stream_res.file_size_bytes / (1024.0 * 1024.0)) / std::max(1e-6, stream_elapsed_s);
+    double stream_msps = (stream_res.total_samples / 1e6) / std::max(1e-6, stream_elapsed_s);
 
     std::cout << "  Processed: " << stream_res.total_samples << " complex samples in "
               << stream_elapsed_s << "s\n"
@@ -161,7 +167,7 @@ int main() {
     int num_rfi = 0;
     std::vector<double> rfi_clean = RFIFilter::mitigate(dc_clean, stream_res.freq_mhz, config, num_rfi);
 
-    auto t_pipe_start = std::chrono::high_resolution_clock::now();
+    auto t_pipe_start = std::chrono::steady_clock::now();
     const int stress_iterations = 50;
     for (int iter = 0; iter < stress_iterations; ++iter) {
         BaselineResults baseline = BaselineFitter::fit(rfi_clean, stream_res.freq_mhz, config);
@@ -178,14 +184,15 @@ int main() {
         }
 
         double slope = 0.0, intercept = 0.0;
-        BaselineFitter::refine_local(v_kms, cal_k, cal_db, config, slope, intercept);
+        const auto* pb_mask = baseline.effective_passband_mask.empty() ? nullptr : &baseline.effective_passband_mask;
+        BaselineFitter::refine_local(v_kms, cal_k, cal_db, config, slope, intercept, pb_mask);
 
         AstrophysicalMetrics metrics = Astrophysics::calculate_metrics(
-            stream_res.freq_mhz, v_kms, cal_k, cal_db, config
+            stream_res.freq_mhz, v_kms, cal_k, cal_db, config, pb_mask
         );
         (void)metrics;
     }
-    auto t_pipe_end = std::chrono::high_resolution_clock::now();
+    auto t_pipe_end = std::chrono::steady_clock::now();
     double pipe_elapsed_ms = std::chrono::duration<double, std::milli>(t_pipe_end - t_pipe_start).count();
     double avg_pipe_ms = pipe_elapsed_ms / stress_iterations;
 

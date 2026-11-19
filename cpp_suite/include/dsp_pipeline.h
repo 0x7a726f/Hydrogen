@@ -14,28 +14,31 @@ public:
     ~DspPipeline();
 
     void set_fft_size(int size);
-    int get_fft_size() const { return fft_size_; }
+    int get_fft_size() const { return fft_size_.load(std::memory_order_acquire); }
 
     void set_averaging(float factor);
-    float get_averaging() const { return avg_factor_; }
+    float get_averaging() const { return avg_factor_.load(std::memory_order_relaxed); }
 
     // Flush the smoothing buffer (called on frequency change to remove ghost peaks)
     void flush();
 
-    // Ingest new raw uint8 I/Q data from SDR thread
+    // Ingest new raw uint8 I/Q data from SDR thread (accumulates small chunks into rolling buffer)
     void feed_samples(const uint8_t* data, size_t length);
 
     // Compute FFT & smoothing and populate output buffer for GUI
     // Returns true if new spectrum was calculated
+    bool get_power_spectrum(std::vector<float>& out_power, double& out_peak_freq, float& out_peak_db,
+                            uint64_t center_freq_hz, uint32_t sample_rate_hz);
     bool get_power_spectrum(std::vector<float>& out_power, float& out_peak_freq, float& out_peak_db,
                             uint64_t center_freq_hz, uint32_t sample_rate_hz);
 
     // Instantaneous un-averaged FFT accessors (updated on each FFT pass, GUI thread only)
     const std::vector<float>& get_instant_fft_db() const { return power_raw_; }
     const std::vector<float>& get_instant_fft_mag() const { return fft_mag_linear_; }
-    float get_instant_fft_peak_db() const { return fft_peak_db_; }
-    float get_instant_fft_peak_mag() const { return fft_peak_mag_; }
-    float get_instant_fft_peak_freq() const { return fft_peak_freq_; }
+    float get_instant_fft_peak_db() const { return fft_peak_db_.load(std::memory_order_relaxed); }
+    float get_instant_fft_peak_mag() const { return fft_peak_mag_.load(std::memory_order_relaxed); }
+    double get_instant_fft_peak_freq() const { return fft_peak_freq_.load(std::memory_order_relaxed); }
+    double get_fft_peak_freq_hz() const { return fft_peak_freq_.load(std::memory_order_relaxed); }
 
     // Live Telemetry Accessors
     float get_noise_floor_db() const { return noise_floor_db_.load(std::memory_order_relaxed); }
@@ -48,9 +51,12 @@ private:
     void update_window();
     void compute_telemetry(const std::vector<float>& power, float peak_db);
 
-    int fft_size_ = SdrConstants::DEFAULT_FFT_SIZE;
-    float avg_factor_ = SdrConstants::DEFAULT_AVG_FACTOR;
+    std::atomic<int> fft_size_{SdrConstants::DEFAULT_FFT_SIZE};
+    std::atomic<float> avg_factor_{SdrConstants::DEFAULT_AVG_FACTOR};
     std::atomic<bool> need_flush_{true};
+
+    // Protects FFT plan & DSP working buffers (always acquired before sample_mutex_)
+    std::mutex dsp_mutex_;
 
     // Aligned window coefficients (scaled by 1/128 for direct AVX multiplication)
     std::vector<float> window_scaled_;
@@ -66,9 +72,9 @@ private:
     std::vector<float> telemetry_scratch_;
     bool has_smooth_ = false;
     double coh_gain_sum_ = 1.0;
-    float fft_peak_db_ = -110.0f;
-    float fft_peak_mag_ = 0.0f;
-    float fft_peak_freq_ = 0.0f;
+    std::atomic<float> fft_peak_db_{-110.0f};
+    std::atomic<float> fft_peak_mag_{0.0f};
+    std::atomic<double> fft_peak_freq_{0.0};
 
     // Telemetry state
     std::atomic<float> noise_floor_db_{-110.0f};

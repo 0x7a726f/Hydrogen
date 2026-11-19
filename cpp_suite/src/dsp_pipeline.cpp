@@ -9,10 +9,12 @@
 #endif
 
 DspPipeline::DspPipeline() {
+    std::lock_guard<std::mutex> lock(dsp_mutex_);
     rebuild_plans();
 }
 
 DspPipeline::~DspPipeline() {
+    std::lock_guard<std::mutex> lock(dsp_mutex_);
     if (fft_cfg_) {
         free(fft_cfg_);
         fft_cfg_ = nullptr;
@@ -20,23 +22,27 @@ DspPipeline::~DspPipeline() {
 }
 
 void DspPipeline::set_fft_size(int size) {
-    size = std::max(2, (size + 1) & ~1);
-    if (size != fft_size_) {
-        std::lock_guard<std::mutex> lock(sample_mutex_);
-        fft_size_ = size;
+    size = std::max(16, (size + 1) & ~1);
+    std::lock_guard<std::mutex> dsp_lock(dsp_mutex_);
+    if (size != fft_size_.load(std::memory_order_relaxed)) {
+        fft_size_.store(size, std::memory_order_release);
         rebuild_plans();
-        sample_buffer_.clear();
-        has_new_samples_ = false;
+        {
+            std::lock_guard<std::mutex> sample_lock(sample_mutex_);
+            sample_buffer_.clear();
+            sample_buffer_.reserve(static_cast<size_t>(size) * 2);
+            has_new_samples_ = false;
+        }
         flush();
     }
 }
 
 void DspPipeline::set_averaging(float factor) {
-    avg_factor_ = std::clamp(factor, 0.0f, 0.95f);
+    avg_factor_.store(std::clamp(factor, 0.0f, 0.95f), std::memory_order_relaxed);
 }
 
 void DspPipeline::flush() {
-    need_flush_.store(true);
+    need_flush_.store(true, std::memory_order_release);
 }
 
 void DspPipeline::rebuild_plans() {
@@ -45,29 +51,30 @@ void DspPipeline::rebuild_plans() {
         fft_cfg_ = nullptr;
     }
 
-    fft_cfg_ = kiss_fft_alloc(fft_size_, 0, nullptr, nullptr);
-    fft_in_.resize(fft_size_);
-    fft_out_.resize(fft_size_);
-    power_raw_.resize(fft_size_);
-    fft_mag_linear_.resize(fft_size_);
-    power_linear_raw_.resize(fft_size_, 0.0f);
-    power_linear_smooth_.assign(fft_size_, 1e-12f);
-    power_smooth_.assign(fft_size_, -120.0f);
-    scratch_u8_.resize(static_cast<size_t>(fft_size_) * 2);
-    sample_buffer_.reserve(static_cast<size_t>(fft_size_) * 2);
-    telemetry_scratch_.reserve(static_cast<size_t>(fft_size_) / 16 + 2);
+    const int n_pts = fft_size_.load(std::memory_order_relaxed);
+    fft_cfg_ = kiss_fft_alloc(n_pts, 0, nullptr, nullptr);
+    fft_in_.resize(n_pts);
+    fft_out_.resize(n_pts);
+    power_raw_.resize(n_pts);
+    fft_mag_linear_.resize(n_pts);
+    power_linear_raw_.resize(n_pts, 0.0f);
+    power_linear_smooth_.assign(n_pts, 1e-12f);
+    power_smooth_.assign(n_pts, -120.0f);
+    scratch_u8_.resize(static_cast<size_t>(n_pts) * 2);
+    telemetry_scratch_.reserve(static_cast<size_t>(n_pts) / 16 + 2);
     has_smooth_ = false;
 
     update_window();
 }
 
 void DspPipeline::update_window() {
-    window_scaled_.resize(fft_size_);
-    const double inv_n_minus_1 = 2.0 * M_PI / static_cast<double>(fft_size_ - 1);
+    const int n_pts = fft_size_.load(std::memory_order_relaxed);
+    window_scaled_.resize(n_pts);
+    const double inv_n_minus_1 = 2.0 * M_PI / static_cast<double>(std::max(1, n_pts - 1));
     const float inv_128 = 1.0f / 128.0f;
     double sum_w = 0.0;
 
-    for (int n = 0; n < fft_size_; ++n) {
+    for (int n = 0; n < n_pts; ++n) {
         // Hann window: 0.5 * (1 - cos(2*pi*n / (N-1)))
         float w = 0.5f * (1.0f - static_cast<float>(std::cos(static_cast<double>(n) * inv_n_minus_1)));
         sum_w += static_cast<double>(w);
@@ -79,11 +86,27 @@ void DspPipeline::update_window() {
 }
 
 void DspPipeline::feed_samples(const uint8_t* data, size_t length) {
+    if (!data || length == 0) return;
+
     std::lock_guard<std::mutex> lock(sample_mutex_);
-    size_t needed_bytes = static_cast<size_t>(fft_size_) * 2;
+    const size_t needed_bytes = static_cast<size_t>(fft_size_.load(std::memory_order_acquire)) * 2;
+    if (needed_bytes == 0) return;
+
     if (length >= needed_bytes) {
-        sample_buffer_.assign(data, data + needed_bytes);
+        // Keep the latest full FFT frame for minimum display latency
+        sample_buffer_.assign(data + (length - needed_bytes), data + length);
         has_new_samples_ = true;
+    } else {
+        // Accumulate small chunks into a rolling buffer bounded to needed_bytes
+        sample_buffer_.insert(sample_buffer_.end(), data, data + length);
+        if (sample_buffer_.size() > needed_bytes) {
+            const size_t excess = sample_buffer_.size() - needed_bytes;
+            std::memmove(sample_buffer_.data(), sample_buffer_.data() + excess, needed_bytes);
+            sample_buffer_.resize(needed_bytes);
+        }
+        if (sample_buffer_.size() >= needed_bytes) {
+            has_new_samples_ = true;
+        }
     }
 }
 
@@ -105,23 +128,36 @@ void DspPipeline::compute_telemetry(const std::vector<float>& power, float peak_
 }
 
 bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_peak_freq, float& out_peak_db,
-                                    uint64_t center_freq_hz, uint32_t sample_rate_hz) {
-    const size_t needed_bytes = static_cast<size_t>(fft_size_) * 2;
+                                     uint64_t center_freq_hz, uint32_t sample_rate_hz) {
+    double peak_freq_hz = 0.0;
+    if (!get_power_spectrum(out_power, peak_freq_hz, out_peak_db, center_freq_hz, sample_rate_hz)) {
+        return false;
+    }
+    out_peak_freq = static_cast<float>(peak_freq_hz);
+    return true;
+}
+
+bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, double& out_peak_freq, float& out_peak_db,
+                                     uint64_t center_freq_hz, uint32_t sample_rate_hz) {
+    std::lock_guard<std::mutex> dsp_lock(dsp_mutex_);
+
+    const int n_pts = fft_size_.load(std::memory_order_acquire);
+    const size_t needed_bytes = static_cast<size_t>(n_pts) * 2;
     {
-        std::lock_guard<std::mutex> lock(sample_mutex_);
+        std::lock_guard<std::mutex> sample_lock(sample_mutex_);
         if (!has_new_samples_ || sample_buffer_.size() < needed_bytes) {
             return false;
         }
         if (scratch_u8_.size() < needed_bytes) {
             scratch_u8_.resize(needed_bytes);
         }
-        std::memcpy(scratch_u8_.data(), sample_buffer_.data(), needed_bytes);
+        const size_t offset = sample_buffer_.size() - needed_bytes;
+        std::memcpy(scratch_u8_.data(), sample_buffer_.data() + offset, needed_bytes);
         has_new_samples_ = false;
     }
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    const int n_pts = fft_size_;
     const float inv_norm_sq = static_cast<float>(1.0 / (coh_gain_sum_ * coh_gain_sum_));
 
     // 1. Vectorized Normalization & Hann Windowing (AVX2 / SSE2)
@@ -132,9 +168,10 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
         n_pts
     );
 
-    // 2. High-speed complex FFT (AVX2+FMA Stockham for power-of-2 >= 8, KissFFT fallback)
+    // 2. High-speed complex FFT (runtime-verified AVX2+FMA Stockham for power-of-2 >= 8, KissFFT fallback)
     const float* fft_power_src = nullptr;
-    if (SimdDsp::fft_cpx_f32_avx2(reinterpret_cast<float*>(fft_in_.data()), n_pts)) {
+    if (SimdDsp::detect_cpu_simd() >= SimdDsp::CpuSimdLevel::AVX2 &&
+        SimdDsp::fft_cpx_f32_avx2(reinterpret_cast<float*>(fft_in_.data()), n_pts)) {
         fft_power_src = reinterpret_cast<const float*>(fft_in_.data());
     } else {
         kiss_fft(fft_cfg_, fft_in_.data(), fft_out_.data());
@@ -167,16 +204,17 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
             fft_peak_idx = k;
         }
     }
-    fft_peak_db_ = max_fft_db;
-    fft_peak_mag_ = fft_mag_linear_[fft_peak_idx];
+    fft_peak_db_.store(max_fft_db, std::memory_order_relaxed);
+    fft_peak_mag_.store(fft_mag_linear_[fft_peak_idx], std::memory_order_relaxed);
 
     // 4. Exponential Smoothing in linear power (unbiased noise PSD estimator) -> dBFS
-    bool do_flush = need_flush_.exchange(false);
+    const float cur_avg = avg_factor_.load(std::memory_order_relaxed);
+    bool do_flush = need_flush_.exchange(false, std::memory_order_acq_rel);
     if (do_flush || !has_smooth_) {
-        std::memcpy(power_linear_smooth_.data(), power_linear_raw_.data(), n_pts * sizeof(float));
-        std::memcpy(power_smooth_.data(), power_raw_.data(), n_pts * sizeof(float));
+        std::memcpy(power_linear_smooth_.data(), power_linear_raw_.data(), static_cast<size_t>(n_pts) * sizeof(float));
+        std::memcpy(power_smooth_.data(), power_raw_.data(), static_cast<size_t>(n_pts) * sizeof(float));
     } else {
-        SimdDsp::apply_smoothing_avx2(power_linear_smooth_.data(), power_linear_raw_.data(), n_pts, avg_factor_);
+        SimdDsp::apply_smoothing_avx2(power_linear_smooth_.data(), power_linear_raw_.data(), n_pts, cur_avg);
         int k = 0;
 #if defined(__AVX2__)
         const __m256 v_eps = _mm256_set1_ps(1e-14f);
@@ -204,10 +242,10 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, float& out_p
     out_power = power_smooth_;
     out_peak_db = max_pwr;
 
-    double start_f = static_cast<double>(center_freq_hz) - (static_cast<double>(sample_rate_hz) / 2.0);
-    double step_f = static_cast<double>(sample_rate_hz) / static_cast<double>(n_pts);
-    out_peak_freq = static_cast<float>(start_f + static_cast<double>(peak_idx) * step_f);
-    fft_peak_freq_ = static_cast<float>(start_f + static_cast<double>(fft_peak_idx) * step_f);
+    const double start_f = static_cast<double>(center_freq_hz) - (static_cast<double>(sample_rate_hz) / 2.0);
+    const double step_f = static_cast<double>(sample_rate_hz) / static_cast<double>(n_pts);
+    out_peak_freq = start_f + static_cast<double>(peak_idx) * step_f;
+    fft_peak_freq_.store(start_f + static_cast<double>(fft_peak_idx) * step_f, std::memory_order_relaxed);
 
     // Compute Telemetry (SNR, Noise floor)
     compute_telemetry(power_smooth_, max_pwr);

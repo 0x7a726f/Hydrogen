@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <stdexcept>
 #include <immintrin.h>
 #include "kiss_fft.h"
 
@@ -103,6 +104,22 @@ struct AlignedBuffer32 {
     std::vector<uint8_t> raw;
     float* ptr = nullptr;
 
+    AlignedBuffer32() = default;
+    AlignedBuffer32(const AlignedBuffer32&) = delete;
+    AlignedBuffer32& operator=(const AlignedBuffer32&) = delete;
+    AlignedBuffer32(AlignedBuffer32&& other) noexcept
+        : raw(std::move(other.raw)), ptr(other.ptr) {
+        other.ptr = nullptr;
+    }
+    AlignedBuffer32& operator=(AlignedBuffer32&& other) noexcept {
+        if (this != &other) {
+            raw = std::move(other.raw);
+            ptr = other.ptr;
+            other.ptr = nullptr;
+        }
+        return *this;
+    }
+
     void resize_floats(size_t count) {
         raw.resize(count * sizeof(float) + 32);
         uintptr_t addr = reinterpret_cast<uintptr_t>(raw.data());
@@ -117,6 +134,7 @@ struct AlignedBuffer32 {
 inline void batch8_fft_power_avx2(
     const int16_t* raw_base,
     int nfft,
+    int block_stride_i16,
     const float* win,
     const StockhamTwiddles& tw,
     __m256* a_re, __m256* a_im,
@@ -124,8 +142,6 @@ inline void batch8_fft_power_avx2(
     float* out_blocks,
     double* total_accum
 ) {
-    const int block_stride_i16 = nfft * 2;
-
     // 1. Load 8 CS16 blocks + multiply by window + transpose into SoA a_re/a_im
     for (int k = 0; k < nfft; k += 4) {
         const __m256 w = _mm256_set_ps(
@@ -134,7 +150,7 @@ inline void batch8_fft_power_avx2(
         );
         __m256 r[8];
         for (int b = 0; b < 8; ++b) {
-            const int16_t* src = raw_base + static_cast<size_t>(b) * block_stride_i16 + 2 * k;
+            const int16_t* src = raw_base + static_cast<size_t>(b) * static_cast<size_t>(block_stride_i16) + 2 * k;
             __m128i u = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
             r[b] = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(u)), w);
         }
@@ -290,6 +306,12 @@ std::vector<float> StreamingProcessor::generate_window(WindowType type, int size
 
 StreamingProcessor::StreamingProcessor(const std::string& filepath, const AstroConfig& config)
     : filepath_(filepath), config_(config) {
+    if (config_.fft_size <= 0) {
+        throw std::invalid_argument("Invalid FFT size (must be > 0): " + std::to_string(config_.fft_size));
+    }
+    if (!std::isfinite(config_.sample_rate_hz) || config_.sample_rate_hz <= 0.0) {
+        throw std::invalid_argument("Invalid sample rate (must be > 0 Hz)");
+    }
     if (!std::filesystem::exists(filepath)) {
         throw std::runtime_error("IQ file does not exist: " + filepath);
     }
@@ -370,20 +392,37 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         res.freq_mhz[i] = f_abs / 1e6;
     }
 
-    // Number of blocks per streaming batch (~16 MB RAM buffer max)
-    const int chunk_blocks = std::max(64, config_.chunk_blocks);
-    const int chunk_samples = chunk_blocks * nfft;
-    const size_t block_bytes = static_cast<size_t>(nfft) * 4;
-    const size_t raw_buffer_bytes = static_cast<size_t>(chunk_samples) * 4;
+    if (bytes_to_process_ == 0) {
+        res.averaged_power.assign(nfft, 0.0);
+        res.waterfall_rows = 0;
+        res.waterfall_cols = nfft;
+        return res;
+    }
 
-    // Waterfall decimation parameters
+    // 50% Welch overlap recovers ~2x effective integration time for Hann/Blackman/BH windows
+    const bool use_welch = config_.enable_welch_overlap && (nfft >= 2);
+    const int hop_samples = use_welch ? (nfft / 2) : nfft;
+    const int hop_stride_i16 = hop_samples * 2;
+
+    // Number of FFT blocks per streaming batch (sized with size_t to prevent 32-bit overflow
+    // and bounded so double-buffered slots + power buffer stay well under 50 MB RSS)
+    const size_t chunk_blocks = static_cast<size_t>(std::max(64, config_.chunk_blocks));
+    const size_t chunk_samples = (chunk_blocks - 1) * static_cast<size_t>(hop_samples) + static_cast<size_t>(nfft);
+    const size_t block_bytes = static_cast<size_t>(nfft) * 4;
+    const size_t hop_bytes = static_cast<size_t>(hop_samples) * 4;
+    const size_t raw_buffer_bytes = chunk_samples * 4;
+
+    // Waterfall decimation parameters (each block advances by hop_samples / sample_rate_hz)
     double waterfall_dt = std::max(0.05, config_.waterfall_dt_s);
-    int blocks_per_waterfall_row = std::max(1, static_cast<int>(waterfall_dt * config_.sample_rate_hz / nfft));
+    int blocks_per_waterfall_row = std::max(1, static_cast<int>(waterfall_dt * config_.sample_rate_hz / static_cast<double>(hop_samples)));
 
     std::vector<double> current_row_accum(nfft, 0.0);
     int current_row_blocks = 0;
 
-    size_t est_wf_rows = (bytes_to_process_ / 4) / (static_cast<size_t>(blocks_per_waterfall_row) * nfft) + 16;
+    const uint64_t est_total_blocks = (samples_to_process_ >= static_cast<uint64_t>(nfft))
+        ? ((samples_to_process_ - static_cast<uint64_t>(nfft)) / static_cast<uint64_t>(hop_samples) + 1)
+        : 0;
+    size_t est_wf_rows = static_cast<size_t>(est_total_blocks / static_cast<uint64_t>(blocks_per_waterfall_row)) + 16;
     std::vector<float> flat_waterfall;
     flat_waterfall.reserve(est_wf_rows * static_cast<size_t>(nfft));
     std::vector<double> waterfall_timestamps;
@@ -458,34 +497,38 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         bool eof = false;
     };
     ReadSlot slots[2];
-    slots[0].buf.resize(static_cast<size_t>(chunk_samples) * 2);
-    slots[1].buf.resize(static_cast<size_t>(chunk_samples) * 2);
+    slots[0].buf.resize(chunk_samples * 2);
+    slots[1].buf.resize(chunk_samples * 2);
 
-    std::mutex io_mutex;
-    std::condition_variable io_cv;
-    bool io_stop = false;
+    std::atomic<bool> io_stop{false};
 
     std::thread reader_thread([&]() {
         int w_idx = 0;
         uint64_t bytes_fed = 0;
+        uint64_t carried_new_bytes = 0;
         std::vector<uint8_t> carryover;
         carryover.reserve(block_bytes);
 
-        while (!io_stop && !is_cancelled()) {
+        while (!io_stop.load(std::memory_order_acquire) && !is_cancelled()) {
             {
-                std::unique_lock<std::mutex> lock(io_mutex);
-                io_cv.wait(lock, [&]() { return !slots[w_idx].ready || io_stop || is_cancelled(); });
-                if (io_stop || is_cancelled()) break;
+                std::unique_lock<std::mutex> lock(io_mutex_);
+                io_cv_.wait_for(lock, std::chrono::milliseconds(10), [&]() {
+                    return !slots[w_idx].ready || io_stop.load(std::memory_order_acquire) || is_cancelled();
+                });
+                if (io_stop.load(std::memory_order_acquire) || is_cancelled()) break;
+                if (slots[w_idx].ready) continue;
             }
 
             ReadSlot& s = slots[w_idx];
             if (bytes_fed >= bytes_to_process_) {
-                std::lock_guard<std::mutex> lock(io_mutex);
-                s.blocks = 0;
-                s.bytes_consumed = 0;
-                s.eof = true;
-                s.ready = true;
-                io_cv.notify_all();
+                {
+                    std::lock_guard<std::mutex> lock(io_mutex_);
+                    s.blocks = 0;
+                    s.bytes_consumed = 0;
+                    s.eof = true;
+                    s.ready = true;
+                }
+                io_cv_.notify_all();
                 break;
             }
 
@@ -502,7 +545,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
             size_t got = 0;
 
 #ifdef _WIN32
-            while (got < to_read) {
+            while (got < to_read && !io_stop.load(std::memory_order_acquire) && !is_cancelled()) {
                 DWORD chunk = static_cast<DWORD>(std::min<size_t>(to_read - got, 64ULL * 1024ULL * 1024ULL));
                 DWORD br = 0;
                 if (!ReadFile(h_file, dst + carry_sz + got, chunk, &br, nullptr) || br == 0) {
@@ -516,28 +559,42 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
             if (gr > 0) got = static_cast<size_t>(gr);
 #endif
             bytes_fed += got;
+            carried_new_bytes += got;
             size_t total_avail = carry_sz + got;
-            int blocks = static_cast<int>(total_avail / block_bytes);
-            size_t valid_bytes = static_cast<size_t>(blocks) * block_bytes;
-            size_t rem_bytes = total_avail - valid_bytes;
-            if (rem_bytes > 0) {
-                carryover.assign(dst + valid_bytes, dst + total_avail);
+
+            int blocks = 0;
+            if (total_avail >= block_bytes) {
+                blocks = static_cast<int>((total_avail - block_bytes) / hop_bytes + 1);
+                size_t step_bytes = static_cast<size_t>(blocks) * hop_bytes;
+                size_t rem_bytes = total_avail - step_bytes;
+                if (rem_bytes > 0) {
+                    carryover.assign(dst + step_bytes, dst + total_avail);
+                }
+            } else if (got > 0 && bytes_fed < bytes_to_process_ && !io_stop.load(std::memory_order_acquire) && !is_cancelled()) {
+                // Short read smaller than a single FFT block: carry forward until full block arrives
+                carryover.assign(dst, dst + total_avail);
+                continue;
             }
 
-            std::lock_guard<std::mutex> lock(io_mutex);
-            s.blocks = blocks;
-            s.bytes_consumed = valid_bytes;
-            s.eof = (got == 0 && blocks == 0);
-            s.ready = true;
-            io_cv.notify_all();
+            const uint64_t slot_new_bytes = carried_new_bytes;
+            carried_new_bytes = 0;
 
-            if (s.eof) break;
+            {
+                std::lock_guard<std::mutex> lock(io_mutex_);
+                s.blocks = blocks;
+                s.bytes_consumed = slot_new_bytes;
+                s.eof = (blocks == 0);
+                s.ready = true;
+            }
+            io_cv_.notify_all();
+
+            if (blocks == 0) break;
             w_idx ^= 1;
         }
     });
 
     // Persistent worker pool with RAII teardown
-    std::vector<float> thread_power_blocks(static_cast<size_t>(chunk_blocks) * nfft);
+    std::vector<float> thread_power_blocks(chunk_blocks * static_cast<size_t>(nfft));
     const int16_t* active_raw_buf = nullptr;
     int active_blocks = 0;
 
@@ -578,8 +635,9 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
                         __m256* b_im = b_re + nfft;
                         for (; b + 8 <= end_b; b += 8) {
                             batch8_fft_power_avx2(
-                                &active_raw_buf[static_cast<size_t>(b) * nfft * 2],
+                                &active_raw_buf[static_cast<size_t>(b) * static_cast<size_t>(hop_stride_i16)],
                                 nfft,
+                                hop_stride_i16,
                                 window.data(),
                                 twiddles,
                                 a_re, a_im, b_re, b_im,
@@ -596,7 +654,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
                     float* p_cx_in_f = reinterpret_cast<float*>(p_cx_in);
 
                     for (; b < end_b; ++b) {
-                        const int16_t* p_raw = &active_raw_buf[static_cast<size_t>(b) * nfft * 2];
+                        const int16_t* p_raw = &active_raw_buf[static_cast<size_t>(b) * static_cast<size_t>(hop_stride_i16)];
                         SimdDsp::convert_cs16_window_float_fast(p_raw, window_interleaved.data(), p_cx_in_f, nfft);
                         kiss_fft(cfg, p_cx_in, p_cx_out);
 
@@ -627,7 +685,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
 #endif
         std::mutex& io_m;
         std::condition_variable& io_cv;
-        bool& io_stop;
+        std::atomic<bool>& io_stop;
         std::thread& reader;
         std::mutex& p_m;
         std::condition_variable& p_cv;
@@ -637,7 +695,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         ~CleanupGuard() {
             {
                 std::lock_guard<std::mutex> lock(io_m);
-                io_stop = true;
+                io_stop.store(true, std::memory_order_release);
             }
             io_cv.notify_all();
             if (reader.joinable()) reader.join();
@@ -665,7 +723,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
 #else
         &file,
 #endif
-        io_mutex, io_cv, io_stop, reader_thread,
+        io_mutex_, io_cv_, io_stop, reader_thread,
         pool_mutex, pool_cv_work, pool_stop, workers
     };
 
@@ -695,18 +753,23 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         uint64_t slot_bytes = 0;
         bool slot_eof = false;
         {
-            std::unique_lock<std::mutex> lock(io_mutex);
-            io_cv.wait(lock, [&]() { return slots[r_idx].ready || is_cancelled(); });
+            std::unique_lock<std::mutex> lock(io_mutex_);
+            io_cv_.wait_for(lock, std::chrono::milliseconds(10), [&]() {
+                return slots[r_idx].ready || is_cancelled();
+            });
             if (is_cancelled()) break;
+            if (!slots[r_idx].ready) continue;
             blocks = slots[r_idx].blocks;
             slot_bytes = slots[r_idx].bytes_consumed;
             slot_eof = slots[r_idx].eof;
         }
 
         if (slot_eof || blocks <= 0) {
-            std::lock_guard<std::mutex> lock(io_mutex);
-            slots[r_idx].ready = false;
-            io_cv.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(io_mutex_);
+                slots[r_idx].ready = false;
+            }
+            io_cv_.notify_all();
             break;
         }
 
@@ -725,10 +788,10 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
 
         // Release slot back to background reader immediately
         {
-            std::lock_guard<std::mutex> lock(io_mutex);
+            std::lock_guard<std::mutex> lock(io_mutex_);
             slots[r_idx].ready = false;
-            io_cv.notify_all();
         }
+        io_cv_.notify_all();
         r_idx ^= 1;
 
         // Accumulate waterfall rows in AVX2 (total power already accumulated per worker thread)
@@ -740,7 +803,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
 
             if (current_row_blocks >= blocks_per_waterfall_row) {
                 double ts = static_cast<double>(waterfall_timestamps.size() + 1)
-                          * (static_cast<double>(blocks_per_waterfall_row) * static_cast<double>(nfft) / config_.sample_rate_hz);
+                          * (static_cast<double>(blocks_per_waterfall_row) * static_cast<double>(hop_samples) / config_.sample_rate_hz);
                 append_shifted_waterfall_row(current_row_blocks, ts);
                 std::fill(current_row_accum.begin(), current_row_accum.end(), 0.0);
                 current_row_blocks = 0;
@@ -753,9 +816,10 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
             last_progress_time = now;
             std::chrono::duration<double> total_el = now - t_start;
             double elapsed_s = total_el.count();
-            double pct = std::min(100.0, (static_cast<double>(bytes_read_so_far) / bytes_to_process_) * 100.0);
-            double speed_mb = (bytes_read_so_far / (1024.0 * 1024.0)) / std::max(0.001, elapsed_s);
-            double eta_s = (bytes_to_process_ - bytes_read_so_far) / std::max(1.0, speed_mb * 1024.0 * 1024.0);
+            double pct = std::min(100.0, (static_cast<double>(bytes_read_so_far) / static_cast<double>(std::max<uint64_t>(1, bytes_to_process_))) * 100.0);
+            double speed_mb = (static_cast<double>(bytes_read_so_far) / (1024.0 * 1024.0)) / std::max(0.001, elapsed_s);
+            uint64_t rem_bytes = (bytes_to_process_ > bytes_read_so_far) ? (bytes_to_process_ - bytes_read_so_far) : 0ULL;
+            double eta_s = static_cast<double>(rem_bytes) / std::max(1.0, speed_mb * 1024.0 * 1024.0);
 
             if (progress_cb) {
                 progress_cb(pct, speed_mb, eta_s);
@@ -763,11 +827,17 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         }
     }
 
+    const double processed_duration_s = static_cast<double>(bytes_read_so_far / 4) / config_.sample_rate_hz;
+    if (is_cancelled()) {
+        res.total_samples = bytes_read_so_far / 4;
+        res.total_duration_s = processed_duration_s;
+    }
+
     // Flush final partial waterfall row only if it covers at least 50% of a row interval
-    // (or if no full rows exist yet), avoiding a high-variance sliver at the end.
+    // (or if no full rows exist yet), recording actual processed integration time (accurate on cancel).
     if (current_row_blocks > 0 &&
         (waterfall_timestamps.empty() || current_row_blocks * 2 >= blocks_per_waterfall_row)) {
-        append_shifted_waterfall_row(current_row_blocks, duration_to_process_s_);
+        append_shifted_waterfall_row(current_row_blocks, processed_duration_s);
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -815,7 +885,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         for (int k = 0; k < nfft; ++k) {
             res.waterfall_data[k] = static_cast<float>(res.averaged_power[k]);
         }
-        res.waterfall_times.push_back(duration_to_process_s_);
+        res.waterfall_times.push_back(processed_duration_s);
     }
 
     return res;

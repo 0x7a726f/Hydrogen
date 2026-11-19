@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <cmath>
+#include <cstring>
+#include <cfloat>
+#include <limits>
 #include <algorithm>
 #include <vector>
 #include <immintrin.h>
@@ -43,15 +46,30 @@ inline CpuSimdLevel detect_cpu_simd() {
         int info[4];
         __cpuid(info, 0);
         int nIds = info[0];
-        if (nIds >= 7) {
-            __cpuidex(info, 7, 0);
-            if (info[1] & (1 << 5)) return CpuSimdLevel::AVX2; // AVX2
-        }
+        bool has_sse2 = false;
+        bool has_sse41 = false;
+        bool has_fma = false;
+        bool has_osxsave = false;
+        bool has_avx = false;
         if (nIds >= 1) {
             __cpuid(info, 1);
-            if (info[2] & (1 << 19)) return CpuSimdLevel::SSE4_1;
-            if (info[3] & (1 << 26)) return CpuSimdLevel::SSE2;
+            has_sse2    = (info[3] & (1 << 26)) != 0;
+            has_sse41   = (info[2] & (1 << 19)) != 0;
+            has_fma     = (info[2] & (1 << 12)) != 0;
+            has_osxsave = (info[2] & (1 << 27)) != 0;
+            has_avx     = (info[2] & (1 << 28)) != 0;
         }
+        if (nIds >= 7 && has_osxsave && has_avx && has_fma) {
+            unsigned long long xcr0 = _xgetbv(0);
+            if ((xcr0 & 0x6ULL) == 0x6ULL) {
+                __cpuidex(info, 7, 0);
+                if ((info[1] & (1 << 5)) != 0) {
+                    return CpuSimdLevel::AVX2;
+                }
+            }
+        }
+        if (has_sse41) return CpuSimdLevel::SSE4_1;
+        if (has_sse2) return CpuSimdLevel::SSE2;
 #endif
         return CpuSimdLevel::Scalar;
     }();
@@ -351,7 +369,7 @@ inline __m256d fast_log10_pd_avx2(__m256d x) {
     __m256d q47 = _mm256_fmadd_pd(p67, u4, p45);
     __m256d poly = _mm256_fmadd_pd(q47, u8, q03);
     __m256d log10_m = _mm256_mul_pd(_mm256_mul_pd(k_2log10_e, u), poly);
-    return _mm256_fmadd_pd(k, k_log10_2, log10_m);
+    __m256d res = _mm256_fmadd_pd(k, k_log10_2, log10_m);
 #else
     __m256d p01 = _mm256_add_pd(_mm256_mul_pd(c3,  u2), k_one);
     __m256d p23 = _mm256_add_pd(_mm256_mul_pd(c7,  u2), c5);
@@ -361,8 +379,24 @@ inline __m256d fast_log10_pd_avx2(__m256d x) {
     __m256d q47 = _mm256_add_pd(_mm256_mul_pd(p67, u4), p45);
     __m256d poly = _mm256_add_pd(_mm256_mul_pd(q47, u8), q03);
     __m256d log10_m = _mm256_mul_pd(_mm256_mul_pd(k_2log10_e, u), poly);
-    return _mm256_add_pd(_mm256_mul_pd(k, k_log10_2), log10_m);
+    __m256d res = _mm256_add_pd(_mm256_mul_pd(k, k_log10_2), log10_m);
 #endif
+
+    // Match IEEE-754 / std::log10 special-value semantics: NaN->NaN, <0->NaN, 0->-Inf, +Inf->+Inf
+    const __m256d k_zero    = _mm256_setzero_pd();
+    const __m256d k_pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
+    const __m256d k_neg_inf = _mm256_set1_pd(-std::numeric_limits<double>::infinity());
+    const __m256d k_qnan    = _mm256_set1_pd(std::numeric_limits<double>::quiet_NaN());
+
+    __m256d is_nan  = _mm256_cmp_pd(x, x, _CMP_UNORD_Q);
+    __m256d is_neg  = _mm256_cmp_pd(x, k_zero, _CMP_LT_OQ);
+    __m256d is_zero = _mm256_cmp_pd(x, k_zero, _CMP_EQ_OQ);
+    __m256d is_pinf = _mm256_cmp_pd(x, k_pos_inf, _CMP_EQ_OQ);
+
+    res = _mm256_blendv_pd(res, k_pos_inf, is_pinf);
+    res = _mm256_blendv_pd(res, k_neg_inf, is_zero);
+    res = _mm256_blendv_pd(res, k_qnan, _mm256_or_pd(is_nan, is_neg));
+    return res;
 }
 
 // Shared core: evaluates 2^z = 2^k * exp((z - k) * ln2) in double precision (Estrin deg-11)
@@ -419,26 +453,46 @@ inline __m256d exp2_pd_core_avx2(__m256d z) {
     return _mm256_mul_pd(p, _mm256_castsi256_pd(pow2k_i));
 }
 
-// High-precision (~1e-14) double-precision AVX2+FMA exp(x); flushes underflow <= -708.0 safely to +0.0
+// High-precision (~1e-14) double-precision AVX2+FMA exp(x); flushes underflow <= -708.0 safely to +0.0,
+// preserves NaN and maps overflow / +Inf to +Inf
 inline __m256d fast_exp_pd_avx2(__m256d x) {
-    const __m256d k_min_x  = _mm256_set1_pd(-708.0);
-    const __m256d k_max_x  = _mm256_set1_pd(709.0);
-    const __m256d k_log2_e = _mm256_set1_pd(1.44269504088896340736);
+    const __m256d k_min_x   = _mm256_set1_pd(-708.0);
+    const __m256d k_max_x   = _mm256_set1_pd(709.0);
+    const __m256d k_over_x  = _mm256_set1_pd(709.782712893384);
+    const __m256d k_log2_e  = _mm256_set1_pd(1.44269504088896340736);
+    const __m256d k_pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
 
+    __m256d is_nan  = _mm256_cmp_pd(x, x, _CMP_UNORD_Q);
+    __m256d is_over = _mm256_cmp_pd(x, k_over_x, _CMP_GT_OQ);
     __m256d mask_gt = _mm256_cmp_pd(x, k_min_x, _CMP_GT_OQ);
     __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_max_x);
-    __m256d res = exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_e));
-    return _mm256_and_pd(res, mask_gt);
+    __m256d res = _mm256_and_pd(exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_e)), mask_gt);
+    res = _mm256_blendv_pd(res, k_pos_inf, is_over);
+    res = _mm256_blendv_pd(res, x, is_nan);
+    return res;
 }
 
-// High-precision (~1e-14) double-precision AVX2+FMA pow(10, x) for x in [-300, +300]
+// High-precision (~1e-14) double-precision AVX2+FMA pow(10, x);
+// preserves NaN, flushes underflow <= -308.0 to +0.0, and maps overflow / +Inf to +Inf
 inline __m256d fast_exp10_pd_avx2(__m256d x) {
-    const __m256d k_min_x   = _mm256_set1_pd(-300.0);
-    const __m256d k_max_x   = _mm256_set1_pd(300.0);
+    const __m256d k_under   = _mm256_set1_pd(-308.0);
+    const __m256d k_min_x   = _mm256_set1_pd(-307.5);
+    const __m256d k_max_x   = _mm256_set1_pd(308.0);
+    const __m256d k_over    = _mm256_set1_pd(308.25471555991675);
     const __m256d k_log2_10 = _mm256_set1_pd(3.32192809488736234787);
+    const __m256d k_pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
+    const __m256d k_zero    = _mm256_setzero_pd();
+
+    __m256d is_nan   = _mm256_cmp_pd(x, x, _CMP_UNORD_Q);
+    __m256d is_over  = _mm256_cmp_pd(x, k_over, _CMP_GT_OQ);
+    __m256d is_under = _mm256_cmp_pd(x, k_under, _CMP_LT_OQ);
 
     __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_max_x);
-    return exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_10));
+    __m256d res = exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_10));
+    res = _mm256_blendv_pd(res, k_zero, is_under);
+    res = _mm256_blendv_pd(res, k_pos_inf, is_over);
+    res = _mm256_blendv_pd(res, x, is_nan);
+    return res;
 }
 #endif
 
@@ -526,11 +580,13 @@ inline float fast_10log10_scalar(float x) {
         return 40.0f;
     }
 
-    union { float f; uint32_t i; } u;
-    u.f = x;
-    int exp = (int)(u.i >> 23) - 127;
-    u.i = (u.i & 0x007FFFFF) | 0x3F800000;
-    float m = u.f - 1.0f;
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    int exp = static_cast<int>(bits >> 23) - 127;
+    bits = (bits & 0x007FFFFFu) | 0x3F800000u;
+    float mant = 1.0f;
+    std::memcpy(&mant, &bits, sizeof(mant));
+    float m = mant - 1.0f;
 
     // Endpoint-continuous 4th-degree minimax polynomial matching fast_log2_avx2
     float p = -0.082320779f * m + 0.324036323f;
@@ -538,7 +594,7 @@ inline float fast_10log10_scalar(float x) {
     p = p * m + 1.439991293f;
     p = p * m;
 
-    float val = 3.01029995664f * ((float)exp + p);
+    float val = 3.01029995664f * (static_cast<float>(exp) + p);
     return std::clamp(val, -140.0f, 40.0f);
 }
 
@@ -552,7 +608,13 @@ inline void compute_power_dbfs_avx2(
     float inv_norm,
     float* __restrict out_mag_linear = nullptr
 ) {
-    const size_t half_n = n_pts / 2;
+    if (n_pts == 0) return;
+    // Standard fftshift (matches numpy.fft.fftshift & StreamingProcessor):
+    // Negative freqs: input [pos_len .. n_pts) (count = neg_len = floor(n/2)) -> out [0 .. neg_len)
+    // DC + pos freqs: input [0 .. pos_len)     (count = pos_len = ceil(n/2))  -> out [neg_len .. n_pts)
+    // So DC (input bin 0) always lands at output bin n_pts / 2 for both even and odd n_pts.
+    const size_t neg_len = n_pts / 2;
+    const size_t pos_len = n_pts - neg_len;
 #if defined(__AVX2__)
     const __m256 v_inv_n = _mm256_set1_ps(inv_norm);
     const __m256 v_eps = _mm256_set1_ps(1e-14f);
@@ -593,15 +655,12 @@ inline void compute_power_dbfs_avx2(
         }
     };
 
-    // FFT shift: [half_n .. n_pts) -> out[0 .. n_pts - half_n), then [0 .. half_n) -> out[n_pts - half_n .. n_pts)
-    const size_t first_len = n_pts - half_n;
-    process_range(fft_out_cpx + 2 * half_n, out_power_db, out_mag_linear, first_len);
-    process_range(fft_out_cpx, out_power_db + first_len,
-                  out_mag_linear ? (out_mag_linear + first_len) : nullptr, half_n);
+    process_range(fft_out_cpx + 2 * pos_len, out_power_db, out_mag_linear, neg_len);
+    process_range(fft_out_cpx, out_power_db + neg_len,
+                  out_mag_linear ? (out_mag_linear + neg_len) : nullptr, pos_len);
 #else
-    const size_t first_len = n_pts - half_n;
     for (size_t k = 0; k < n_pts; ++k) {
-        size_t src_idx = (k < first_len) ? (k + half_n) : (k - first_len);
+        size_t src_idx = (k < neg_len) ? (k + pos_len) : (k - neg_len);
         float r = fft_out_cpx[2 * src_idx];
         float i = fft_out_cpx[2 * src_idx + 1];
         float norm_pwr = (r * r + i * i) * inv_norm;
@@ -677,11 +736,16 @@ inline void map_waterfall_line_fast(
             size_t b0 = static_cast<size_t>(x) * n_pwr / static_cast<size_t>(width);
             size_t b1 = static_cast<size_t>(x + 1) * n_pwr / static_cast<size_t>(width);
             if (b1 <= b0) b1 = std::min(b0 + 1, n_pwr);
-            float peak = power_db[b0];
-            for (size_t b = b0 + 1; b < b1; ++b) {
-                if (power_db[b] > peak) peak = power_db[b];
+            float peak = -FLT_MAX;
+            bool has_finite = false;
+            for (size_t b = b0; b < b1; ++b) {
+                const float v = power_db[b];
+                if (std::isfinite(v) && (!has_finite || v > peak)) {
+                    peak = v;
+                    has_finite = true;
+                }
             }
-            col_pwr[x] = peak;
+            col_pwr[x] = has_finite ? peak : min_db;
         }
     } else {
         for (int x = 0; x < width; ++x) {
@@ -689,7 +753,17 @@ inline void map_waterfall_line_fast(
             size_t b0 = static_cast<size_t>(pos);
             size_t b1 = std::min(b0 + 1, n_pwr - 1);
             float frac = pos - static_cast<float>(b0);
-            col_pwr[x] = power_db[b0] + frac * (power_db[b1] - power_db[b0]);
+            const float v0 = power_db[b0];
+            const float v1 = power_db[b1];
+            if (std::isfinite(v0) && std::isfinite(v1)) {
+                col_pwr[x] = v0 + frac * (v1 - v0);
+            } else if (std::isfinite(v0)) {
+                col_pwr[x] = v0;
+            } else if (std::isfinite(v1)) {
+                col_pwr[x] = v1;
+            } else {
+                col_pwr[x] = min_db;
+            }
         }
     }
 
@@ -734,13 +808,30 @@ inline void map_waterfall_line_fast(
 // -----------------------------------------------------------------------
 inline bool fft_cpx_f32_avx2(float* __restrict cpx, int nfft) {
 #if defined(__AVX2__)
-    if (!cpx || nfft < 8 || (nfft & (nfft - 1)) != 0) {
+    if (!cpx || nfft < 8 || (nfft & (nfft - 1)) != 0 || detect_cpu_simd() < CpuSimdLevel::AVX2) {
         return false;
     }
 
     struct ScratchF32 {
         std::vector<float> storage;
         float* ptr = nullptr;
+
+        ScratchF32() = default;
+        ScratchF32(const ScratchF32&) = delete;
+        ScratchF32& operator=(const ScratchF32&) = delete;
+        ScratchF32(ScratchF32&& other) noexcept
+            : storage(std::move(other.storage)), ptr(other.ptr) {
+            other.ptr = nullptr;
+        }
+        ScratchF32& operator=(ScratchF32&& other) noexcept {
+            if (this != &other) {
+                storage = std::move(other.storage);
+                ptr = other.ptr;
+                other.ptr = nullptr;
+            }
+            return *this;
+        }
+
         void resize(size_t count) {
             storage.resize(count + 16);
             uintptr_t raw = reinterpret_cast<uintptr_t>(storage.data());

@@ -14,12 +14,15 @@ struct GaussianFit {
     // Primary component / overall profile metrics
     double amplitude_k = 0.0;
     double v_center_kms = 0.0;
+    double v_peak_kms = 0.0;          // True curve peak velocity [km/s]
     double sigma_kms = 0.0;
     double fwhm_kms = 0.0;
     double fwhm_left_kms = 0.0;
     double fwhm_right_kms = 0.0;
     double fwhm_half_temp_k = 0.0;
     double rmse_k = 0.0;              // Residual RMS inside H I window [K]
+    double delta_bic = 0.0;           // BIC improvement over null T=0 model (>10 = strong detection)
+    double reduced_chi2 = 0.0;        // Reduced chi-squared inside H I window
 
     // Secondary component (populated for DoubleGaussian & TripleGaussian)
     bool has_secondary = false;
@@ -82,6 +85,21 @@ struct AstrophysicalMetrics {
     double w50_kms = 0.0;                  // Full velocity width at 50% peak intensity [km/s]
     double w20_kms = 0.0;                  // Full velocity width at 20% peak intensity [km/s]
 
+    // Thermal vs baseline-quality & matched-filter detection telemetry
+    double thermal_noise_std_k = 0.0;      // Lag-6 diff MAD radiometer thermal RMS [K]
+    double off_line_rms_k = 0.0;           // Total off-line residual RMS [K]
+    double baseline_sys_error_k = 0.0;     // Excess coherent baseline ripple error sqrt(max(0, off^2 - therm^2)) [K]
+    double baseline_quality_ratio = 1.0;   // off_line_rms_k / thermal_noise_std_k (~1.0 = flat/thermal)
+    double window_corr_factor = 1.0;       // Window bin-correlation factor F_corr (1.94 Hann, 2.35 Blackman)
+    double peak_temp_smoothed_k = 0.0;     // Matched-filter / smoothed peak temperature [K]
+    double peak_vel_smoothed_kms = 0.0;    // Matched-filter / smoothed peak velocity [km/s]
+    double snr_single_bin = 0.0;           // Raw single-bin peak / noise_std_k
+    double snr_matched = 0.0;              // Multi-scale matched-filter SNR accounting for F_corr & baseline error
+    double snr_integrated = 0.0;           // Integrated flux SNR over fitted line support
+    double integrated_flux_err_k_kms = 0.0;// 1-sigma uncertainty on integrated flux [K * km/s]
+    double column_density_err_cm2 = 0.0;   // 1-sigma uncertainty on optically-thin N_HI [atoms/cm^2]
+    bool is_detected = false;              // True only when matched SNR, BIC, and physical width gates pass
+
     GaussianFit gauss_fit;
     double lo_offset_khz = 0.0;
     int bin_separation = 0;
@@ -122,7 +140,8 @@ public:
         const std::vector<double>& vel_kms,
         const std::vector<double>& calibrated_k,
         const std::vector<double>& calibrated_db,
-        const AstroConfig& config
+        const AstroConfig& config,
+        const std::vector<uint8_t>* effective_passband_mask = nullptr
     );
 };
 

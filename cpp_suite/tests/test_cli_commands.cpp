@@ -56,10 +56,11 @@ static CommandResult run_cli(const std::string& args) {
         exe_path = candidates.front();
     }
 
-    std::string cmd = "\"" + exe_path + "\" " + args + " 2>&1";
 #ifdef _WIN32
+    std::string cmd = "\"\"" + exe_path + "\" " + args + " 2>&1\"";
     FILE* pipe = _popen(cmd.c_str(), "r");
 #else
+    std::string cmd = "\"" + exe_path + "\" " + args + " 2>&1";
     FILE* pipe = popen(cmd.c_str(), "r");
 #endif
     if (!pipe) return {-1, "Failed to execute pipe"};
@@ -175,11 +176,55 @@ int main() {
         auto res_m_out = run_cli("analyze -o");
         ASSERT_EQ(res_m_out.exit_code, 1, "Missing -o argument exits with code 1");
 
-        auto res_bad_n = run_cli("analyze foo.cs16 -n 63");
-        ASSERT_EQ(res_bad_n.exit_code, 1, "Odd/too-small FFT size (-n 63) exits with code 1");
+        // Create a real temp file so argument validation checks are non-vacuous
+        std::string dummy_cs16 = test_dir + "/flag_check.cs16";
+        {
+            std::ofstream ofs(dummy_cs16, std::ios::binary);
+            std::vector<char> zeros(64, 0);
+            ofs.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+        }
 
-        auto res_bad_tsys = run_cli("analyze foo.cs16 --tsys -5");
-        ASSERT_EQ(res_bad_tsys.exit_code, 1, "Non-positive Tsys exits with code 1");
+        auto res_bad_n = run_cli("analyze " + dummy_cs16 + " -n 63");
+        ASSERT_EQ(res_bad_n.exit_code, 1, "Odd/too-small FFT size (-n 63) exits with code 1");
+        ASSERT_TRUE(res_bad_n.output.find("--fft-size") != std::string::npos,
+                    "Reports specific --fft-size error for -n 63 (non-vacuous)");
+
+        auto res_nan_n = run_cli("analyze " + dummy_cs16 + " -n abc");
+        ASSERT_EQ(res_nan_n.exit_code, 1, "Non-numeric FFT size (-n abc) exits with code 1");
+        ASSERT_TRUE(res_nan_n.output.find("--fft-size") != std::string::npos,
+                    "Reports --fft-size error for -n abc");
+
+        auto res_bad_tsys = run_cli("analyze " + dummy_cs16 + " --tsys -5");
+        ASSERT_EQ(res_bad_tsys.exit_code, 1, "Non-positive Tsys (--tsys -5) exits with code 1");
+        ASSERT_TRUE(res_bad_tsys.output.find("--tsys") != std::string::npos,
+                    "Reports specific --tsys error for --tsys -5 (non-vacuous)");
+
+        auto res_nan_tsys = run_cli("analyze " + dummy_cs16 + " --tsys NaN");
+        ASSERT_EQ(res_nan_tsys.exit_code, 1, "NaN Tsys (--tsys NaN) exits with code 1");
+        ASSERT_TRUE(res_nan_tsys.output.find("--tsys") != std::string::npos,
+                    "Reports --tsys error for --tsys NaN");
+
+        auto res_bad_base = run_cli("analyze " + dummy_cs16 + " --baseline bogus");
+        ASSERT_EQ(res_bad_base.exit_code, 1, "Unrecognized --baseline bogus exits with code 1");
+        ASSERT_TRUE(res_bad_base.output.find("--baseline") != std::string::npos,
+                    "Reports unrecognized --baseline error");
+
+        auto res_bad_lm = run_cli("analyze " + dummy_cs16 + " --line-method bogus");
+        ASSERT_EQ(res_bad_lm.exit_code, 1, "Unrecognized --line-method bogus exits with code 1");
+        ASSERT_TRUE(res_bad_lm.output.find("--line-method") != std::string::npos,
+                    "Reports unrecognized --line-method error");
+
+        auto res_bad_win = run_cli("analyze " + dummy_cs16 + " --window bogus");
+        ASSERT_EQ(res_bad_win.exit_code, 1, "Unrecognized --window bogus exits with code 1");
+
+        auto res_bad_fc = run_cli("analyze " + dummy_cs16 + " --fc bogus");
+        ASSERT_EQ(res_bad_fc.exit_code, 1, "Invalid --fc bogus exits with code 1");
+
+        auto res_bad_fs = run_cli("analyze " + dummy_cs16 + " --fs bogus");
+        ASSERT_EQ(res_bad_fs.exit_code, 1, "Invalid --fs bogus exits with code 1");
+
+        auto res_bad_edge = run_cli("analyze " + dummy_cs16 + " --edge-fraction 0.9");
+        ASSERT_EQ(res_bad_edge.exit_code, 1, "Out-of-range --edge-fraction 0.9 exits with code 1");
     }
 
     // -----------------------------------------------------------------------
@@ -228,6 +273,27 @@ int main() {
         ASSERT_TRUE(std::filesystem::exists(out_dir + "/5_hi_master_dashboard.png"), "Artifact 5 exists");
         ASSERT_TRUE(std::filesystem::exists(out_dir + "/calibrated_spectrum.csv"), "CSV artifact exists");
         ASSERT_TRUE(std::filesystem::exists(out_dir + "/analysis_report.json"), "JSON report artifact exists");
+
+        // Positive test: advanced baseline/line/window CLI options (--baseline standing_wave --line-method double_gaussian --hi-window-khz 180)
+        std::string out_dir_adv = "tests/test_out_cli_adv";
+        std::filesystem::remove_all(out_dir_adv, ec);
+        std::string adv_cmd = "analyze \"" + rec_target +
+                              "\" --baseline standing_wave --line-method double_gaussian --hi-window-khz 180 --window hann -d 1.0 --output \"" +
+                              out_dir_adv + "\" --quiet";
+        auto adv_res = run_cli(adv_cmd);
+        ASSERT_EQ(adv_res.exit_code, 0, "CLI analyze with --baseline standing_wave --line-method double_gaussian --hi-window-khz 180 succeeded");
+        std::string adv_json_path = out_dir_adv + "/analysis_report.json";
+        ASSERT_TRUE(std::filesystem::exists(adv_json_path), "Advanced CLI analysis emitted analysis_report.json");
+        {
+            std::ifstream ajifs(adv_json_path);
+            std::string ajtxt((std::istreambuf_iterator<char>(ajifs)), std::istreambuf_iterator<char>());
+            ASSERT_TRUE(ajtxt.find("\"standing_wave\"") != std::string::npos, "JSON records standing_wave baseline");
+            ASSERT_TRUE(ajtxt.find("\"double_gaussian\"") != std::string::npos, "JSON records double_gaussian line method");
+            ASSERT_TRUE(ajtxt.find("\"is_detected\"") != std::string::npos &&
+                        ajtxt.find("\"snr_matched\"") != std::string::npos,
+                        "JSON exports is_detected and snr_matched telemetry");
+        }
+        std::filesystem::remove_all(out_dir_adv, ec);
     }
 
     // -----------------------------------------------------------------------

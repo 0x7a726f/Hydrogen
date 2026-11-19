@@ -52,6 +52,7 @@ private:
     void update_waterfall_texture(ID3D11DeviceContext* context);
     void render_segmented_lo_tuner(float box_h);
     void apply_tuned_frequency_hz(double new_freq_hz);
+    void auto_fit_db_range();
     void update_peak_hold(double center_hz, double rate_hz);
 
     SdrController& sdr_;
@@ -120,9 +121,17 @@ private:
     // Inline segmented LO edit & cross-plot cursor sync
     bool editing_freq_inline_ = false;
     bool focus_freq_inline_ = false;
+    double pre_click_lo_hz_ = 0.0;
+    double last_digit_click_time_ = -10.0;
     bool hover_spec_active_ = false;
     double hover_spec_freq_mhz_ = 0.0;
     bool hover_wf_active_ = false;
     double hover_wf_freq_mhz_ = 0.0;
     float wf_row_dt_s_ = 0.033f;
+
+    // Synchronized Live SDR X-Zoom (normalized [0, 1] passband span) + per-panel interaction state
+    ui_obs::PlotZoomState live_zoom_;
+    ui_obs::PlotZoomState spec_interact_zoom_;
+    ui_obs::PlotZoomState wf_interact_zoom_;
+    double context_tune_freq_mhz_ = 0.0;
 };

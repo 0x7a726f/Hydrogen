@@ -16,24 +16,29 @@ The suite compiles two primary executables from CMake:
   - Linear-power exponential moving average (`P_smooth`) converted to full-scale dBFS (`0 dBFS` = full-scale complex tone), preserving unbiased noise power statistics.
   - Lock-free SPSC ring buffer between SDR capture and DSP/disk threads.
 - **Offline Calibration & Artifact Removal (`StreamingProcessor`, `DCExcision`, `RFIFilter`)**:
-  - Multi-threaded batched FFT accumulator (`StreamingProcessor`) yielding averaged power spectra and time-frequency waterfall histories.
-  - Local oscillator DC notch excision (`DCExcision`).
-  - Modified Z-score median-15 MAD RFI mitigation (`RFIFilter`) with H I line protection (`±190 kHz` around `1420.40575 MHz`).
+  - Multi-threaded 50%-Welch-overlapped batched FFT accumulator (`StreamingProcessor`) yielding averaged power spectra and time-frequency waterfall histories with $\sim 1.41\times$ reduced thermal variance.
+  - Local oscillator DC notch excision (`DCExcision`) with guard-band centroid interpolation.
+  - Homoscedastic dB-space median-15 + MAD RFI mitigation (`RFIFilter`) with $\pm 1$ bin continuum dilation and narrow 1–2 bin CW spur excision inside the H I window (`±190 kHz` around `1420.40575 MHz`).
 - **Continuum Baseline Solvers (`BaselineFitter`)**:
-  - `ripple_filter` (`RippleFilter`): $O(N \log N)$ frequency-domain Gaussian baseline estimator with H I window masking.
-  - `als` (`Asymmetric Least Squares`): $O(N)$ macro-binned Whittaker-Eilers pentadiagonal Cholesky solver (`lambda`, `p`).
-  - `poly` (`Poly`): Chebyshev-scaled sigma-clipped polynomial fit.
-  - `savitzky_golay` (`SavitzkyGolay`): 2-pass outlier-clipped, moment-preserving degree-2 Savitzky-Golay polynomial filter with local-median H I gap anchoring.
-  - `standing_wave` (`StandingWave`): Delay-domain FFT coaxial/dish reflection peak detector with sub-bin parabolic frequency refinement and 2-harmonic sinusoidal least-squares excision across line-free channels.
-  - Local linear trend removal in linear brightness temperature $T_A$ space (`refine_local`).
-- **21-cm Line Profile Models (`Astrophysics`)**:
-  - `gaussian_ls`: 3-parameter Levenberg-Marquardt Gaussian fit (`A`, `v0`, `sigma`).
+  - Automatic IF filter roll-off skirt detection (`auto_skirt_trim`) and 3rd-order Whittaker ($D_3^T D_3$) heptadiagonal $LDL^T$ + Tukey twicing gap inpainting across masked H I, DC, and RFI intervals.
+  - `ripple_filter` (`RippleFilter`): $D_3^T D_3$ + twicing gap-inpainted Gaussian-kernel baseline estimator with Huber IRLS scale refinement.
+  - `als` (`Asymmetric Least Squares`): Cutoff-frequency-aware $O(N)$ 3rd-difference ($D_3^T D_3$) Whittaker-Eilers solver with symmetric continuum Huber IRLS and upper-envelope peak protection.
+  - `poly` (`Poly`): Degree-12 orthogonal Chebyshev basis solved via cache-chunked Householder QR with $D_3$ curvature ridge regularization and symmetric Huber IRLS.
+  - `savitzky_golay` (`SavitzkyGolay`): $D_3^T D_3$ + twicing gap-inpainted, 2-pass outlier-clipped degree-4 Savitzky-Golay polynomial filter.
+  - `standing_wave` (`StandingWave`): Exact gapped weighted least-squares (WLS) harmonic delay projection across line-free channels paired with a $D_3^T D_3$ smooth residual envelope.
+  - Unbiased trimmed linear-power ratio calibration ($\langle P/B \rangle_{\text{trim}} = 1$), lag-6 MAD baseline quality diagnostics (`BaselineFitDiagnostics`), and multiplicative Huber IRLS local trend refinement (`refine_local`).
+- **21-cm Line Profile Models & Detection Gating (`Astrophysics`)**:
+  - Exact FFT window bin-correlation factor ($F_{\text{corr}}$), lag-6 difference MAD pure thermal noise estimator, coherent gap-interpolation floor ($\sigma_{\text{gap}}$), multi-scale matched-filter SNR (`snr_matched`), and 6-gate false-positive rejection (`is_detected`).
+  - `gaussian_ls`: 3-parameter Levenberg-Marquardt Gaussian fit (`A`, `v0`, `sigma`) with analytical Jacobians.
   - `double_gaussian`: 6-parameter two-component Levenberg-Marquardt decomposition with individual arm profiles.
   - `triple_gaussian`: 9-parameter three-component Levenberg-Marquardt decomposition for multi-arm Galactic sightlines (e.g. Local + Perseus + Outer arms or CNM + WNM halos).
   - `voigt`: 4-parameter equal-FWHM Pseudo-Voigt fit (`A`, `v0`, `sigma`, `eta`).
   - `gauss_hermite`: 5-parameter Gauss-Hermite fit (`A`, `v0`, `sigma`, `h3`, `h4`) with numerical FWHM measurement.
-  - `moments`: Non-parametric spectral moments ($M_0$, $M_1$, $\sigma_{M_2} = \sqrt{M_2}$) and smoothed half-maximum FWHM.
-  - `busy_function`: 6-parameter Generalized Busy Function (Westmeier et al. 2014) modeling flat-topped, double-horned, and asymmetric 21-cm profiles.
+  - `moments`: Velocity-space Gaussian-smoothed non-parametric spectral moments ($M_0$, $M_1$, $\sigma_{M_2} = \sqrt{M_2}$) and half-maximum FWHM.
+  - `busy_function`: Dimensionless 6-parameter Generalized Busy Function (Westmeier et al. 2014) modeling flat-topped, double-horned, and asymmetric 21-cm profiles.
+- **Interactive Workstation UX & Instant `< 5 ms` Live Re-Fit (`UiAnalyzePanel`, `UiRecordPanel`, `UiObservatory`)**:
+  - Cached Welch-averaged PSD (`CachedStreamData`) re-solves baseline and line-profile parameters live in `< 5 ms` when tuning sidebar controls without re-streaming multi-GB `.cs16` captures from disk.
+  - Ergonomic plot navigation: X-only scroll wheel zoom (`Shift+Wheel` for Y, `Ctrl+Wheel` for XY), right-drag / `Shift+Left-Drag` rubber-band box zoom with live $\Delta f / \Delta v / \Delta y$ readout, left-drag pan, axis-gutter drag/scroll, synchronized split-plot & waterfall X-zoom, keyboard shortcuts (`+`, `-`, `A`, `H`, `0`/`R`, `Left`/`Right`, `1`–`4`), and a clickable floating zoom toolbar (`[+]`, `[-]`, `[Auto Y]`, `[H I]`, `[Full]`, `[Reset]`).
 - **Derived 21-cm Physical & Kinematic Metrics (`AstrophysicalMetrics`)**:
   - Optically-thin ($N_{\text{HI}}$) and optically-thick corrected ($N_{\text{HI,thick}}$) column densities, peak optical depth $\tau_{\max}$, upper-bound Doppler kinetic temperature $T_{k,\max} = 21.855\,\text{FWHM}^2$, equivalent width $W_{\text{eq}}$, and full velocity widths $W_{50}$ and $W_{20}$.
 - **Exports (`Exporter`, `PlotRenderer`)**:

@@ -145,43 +145,138 @@ void test_record_to_analyze_bridge() {
 }
 
 void test_multithreaded_concurrency() {
-    std::cout << "[Test 6] Testing AppState thread safety and concurrent mutations...\n";
-    AppState state;
-    const int num_threads = 8;
-    const int iterations_per_thread = 500;
-    std::atomic<bool> start_gate{false};
-    std::vector<std::thread> workers;
+    std::cout << "[Test 6] Testing AppState thread safety and concurrent invariants...\n";
 
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&state, &start_gate, t, iterations_per_thread]() {
-            while (!start_gate.load()) {
+    // Part A: Mixed concurrent mutations + invariant validation (zero torn strings / corrupt states)
+    {
+        AppState state;
+        const int num_threads = 8;
+        const int iterations_per_thread = 500;
+        std::atomic<bool> start_gate{false};
+        std::atomic<int> auto_requests{0};
+        std::atomic<int> auto_consumed{0};
+        std::atomic<int> corrupt_reads{0};
+        std::vector<std::thread> workers;
+
+        auto is_valid_path = [](const std::string& p) {
+            if (p.empty()) return true;
+            return p.rfind("test_path_", 0) == 0 && p.size() >= 15 &&
+                   p.compare(p.size() - 5, 5, ".cs16") == 0;
+        };
+
+        for (int t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&, t]() {
+                while (!start_gate.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (int i = 0; i < iterations_per_thread; ++i) {
+                    std::string path = "test_path_" + std::to_string(t) + "_" + std::to_string(i) + ".cs16";
+                    if (i % 4 == 0) {
+                        state.set_recording_active(true, path);
+                        (void)state.is_file_actively_recording(path);
+                        std::string act = state.get_active_recording_filepath();
+                        if (!is_valid_path(act)) corrupt_reads.fetch_add(1, std::memory_order_relaxed);
+                    } else if (i % 4 == 1) {
+                        state.set_recording_active(false);
+                        std::string last = state.get_last_recorded_file();
+                        if (!is_valid_path(last)) corrupt_reads.fetch_add(1, std::memory_order_relaxed);
+                    } else if (i % 4 == 2) {
+                        state.switch_to_analyze(path, true);
+                        auto_requests.fetch_add(1, std::memory_order_relaxed);
+                        std::string target;
+                        if (state.check_and_clear_auto_analyze(target)) {
+                            auto_consumed.fetch_add(1, std::memory_order_relaxed);
+                            if (target.empty() || !is_valid_path(target)) {
+                                corrupt_reads.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    } else {
+                        state.switch_to_record();
+                        AppSection sec = state.get_section();
+                        if (sec != AppSection::Record && sec != AppSection::Analyze) {
+                            corrupt_reads.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            });
+        }
+
+        start_gate.store(true, std::memory_order_release);
+        for (auto& th : workers) {
+            th.join();
+        }
+
+        // At most one unconsumed request may remain after all threads finish
+        std::string leftover;
+        if (state.check_and_clear_auto_analyze(leftover)) {
+            auto_consumed.fetch_add(1, std::memory_order_relaxed);
+            ASSERT_TRUE(!leftover.empty() && is_valid_path(leftover),
+                        "Final leftover auto_analyze target path is intact");
+        }
+        std::string none_left;
+        ASSERT_FALSE(state.check_and_clear_auto_analyze(none_left),
+                     "No residual auto_analyze flag remains after final drain");
+        ASSERT_EQ(corrupt_reads.load(), 0,
+                  "Zero torn strings or corrupted enum states observed across 4000 concurrent ops");
+        ASSERT_TRUE(auto_consumed.load() >= 1 && auto_consumed.load() <= auto_requests.load(),
+                    "Consumed auto_analyze triggers strictly bounded by [1, requested_count]");
+    }
+
+    // Part B: Single-producer / multi-consumer atomic consumption uniqueness check
+    {
+        AppState state;
+        constexpr int kEvents = 200;
+        std::vector<std::atomic<int>> seen_counts(kEvents);
+        for (auto& c : seen_counts) c.store(0);
+
+        std::atomic<bool> producer_done{false};
+        std::atomic<int> total_consumed{0};
+        std::atomic<int> invalid_id{0};
+        std::vector<std::thread> consumers;
+
+        for (int c = 0; c < 4; ++c) {
+            consumers.emplace_back([&]() {
+                while (!producer_done.load(std::memory_order_acquire) || true) {
+                    std::string target;
+                    if (state.check_and_clear_auto_analyze(target)) {
+                        try {
+                            int id = std::stoi(target);
+                            if (id >= 0 && id < kEvents) {
+                                seen_counts[static_cast<size_t>(id)].fetch_add(1, std::memory_order_relaxed);
+                                total_consumed.fetch_add(1, std::memory_order_relaxed);
+                            } else {
+                                invalid_id.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        } catch (...) {
+                            invalid_id.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    } else if (producer_done.load(std::memory_order_acquire)) {
+                        break;
+                    } else {
+                        std::this_thread::yield();
+                    }
+                }
+            });
+        }
+
+        for (int e = 0; e < kEvents; ++e) {
+            state.switch_to_analyze(std::to_string(e), true);
+            // Wait until a consumer claims this event so every single event is contested
+            while (seen_counts[static_cast<size_t>(e)].load(std::memory_order_acquire) == 0) {
                 std::this_thread::yield();
             }
-            for (int i = 0; i < iterations_per_thread; ++i) {
-                std::string path = "test_path_" + std::to_string(t) + "_" + std::to_string(i) + ".cs16";
-                if (i % 4 == 0) {
-                    state.set_recording_active(true, path);
-                    state.is_file_actively_recording(path);
-                } else if (i % 4 == 1) {
-                    state.set_recording_active(false);
-                } else if (i % 4 == 2) {
-                    state.switch_to_analyze(path, true);
-                    std::string target;
-                    state.check_and_clear_auto_analyze(target);
-                } else {
-                    state.switch_to_record();
-                }
-            }
-        });
-    }
+        }
+        producer_done.store(true, std::memory_order_release);
+        for (auto& th : consumers) th.join();
 
-    start_gate.store(true);
-    for (auto& th : workers) {
-        th.join();
+        int duplicates = 0;
+        for (int e = 0; e < kEvents; ++e) {
+            if (seen_counts[static_cast<size_t>(e)].load() != 1) ++duplicates;
+        }
+        ASSERT_EQ(invalid_id.load(), 0, "Zero malformed event IDs across multi-consumer contention");
+        ASSERT_EQ(total_consumed.load(), kEvents, "All 200 auto_analyze bridge events consumed");
+        ASSERT_EQ(duplicates, 0, "Each auto_analyze event claimed by strictly one consumer (zero double-fires)");
     }
-
-    // State should remain consistent and not corrupted or deadlock
-    ASSERT_TRUE(true, "Concurrent worker execution completed without deadlock or crash");
 }
 
 int main() {

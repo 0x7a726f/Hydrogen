@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -15,10 +17,12 @@
 #include "dsp_pipeline.h"
 #include "kiss_fft.h"
 #include "lockfree_ringbuffer.h"
+#include "plot_renderer.h"
 #include "rfi_filter.h"
 #include "sidecar_reader.h"
 #include "simd_dsp.h"
 #include "streaming_processor.h"
+#include "virtual_sdr.h"
 #include "waterfall.h"
 
 namespace fs = std::filesystem;
@@ -362,23 +366,31 @@ static void test_simd_fft_and_rfi_kernels() {
         if (nfft >= 32) {
             int edge_bins = static_cast<int>(nfft * std::clamp(cfg.passband_edge_fraction, 0.0, 0.45));
             double hi_half = cfg.hi_protection_half_width_khz / 1e3;
-            std::vector<uint8_t> valid(nfft, 1);
+            std::vector<uint8_t> passband(nfft, 1), hi_win(nfft, 0), valid(nfft, 1);
             for (int i = 0; i < nfft; ++i) {
-                if (i < edge_bins || i >= nfft - edge_bins) valid[i] = 0;
+                if (i < edge_bins || i >= nfft - edge_bins) {
+                    passband[i] = 0;
+                    valid[i] = 0;
+                }
                 if (freqs[i] >= astro::HYDROGEN_REST_FREQ_MHZ - hi_half &&
-                    freqs[i] <= astro::HYDROGEN_REST_FREQ_MHZ + hi_half) valid[i] = 0;
+                    freqs[i] <= astro::HYDROGEN_REST_FREQ_MHZ + hi_half) {
+                    hi_win[i] = 1;
+                    valid[i] = 0;
+                }
             }
+            std::vector<double> p_db(nfft);
+            SimdDsp::power_to_db_f64(pwr.data(), p_db.data(), static_cast<size_t>(nfft), 1e-30);
             std::vector<double> ref_res(nfft), ref_valid;
             for (int i = 0; i < nfft; ++i) {
                 double win[15] = {};
                 int lo = std::max(0, i - 7);
                 int hi = std::min(nfft - 1, i + 7);
                 int count = 0;
-                for (int j = lo; j <= hi; ++j) win[count++] = pwr[j];
+                for (int j = lo; j <= hi; ++j) win[count++] = p_db[j];
                 int mid_w = count / 2;
                 std::nth_element(win, win + mid_w, win + count);
                 double med_w = (count % 2) ? win[mid_w] : 0.5 * (*std::max_element(win, win + mid_w) + win[mid_w]);
-                ref_res[i] = pwr[i] - med_w;
+                ref_res[i] = p_db[i] - med_w;
                 if (valid[i]) ref_valid.push_back(ref_res[i]);
             }
             auto med_fn = [](std::vector<double>& v) {
@@ -388,15 +400,40 @@ static void test_simd_fft_and_rfi_kernels() {
             };
             double ref_med = med_fn(ref_valid);
             for (double& r : ref_valid) r = std::abs(r - ref_med);
-            double ref_sig = std::max(1e-12, 1.4826 * med_fn(ref_valid));
-            double ref_thr = cfg.rfi_threshold_mad * ref_sig;
-            std::vector<uint8_t> is_rfi(nfft, 0);
-            std::vector<int> rfi_idx;
+            double ref_sig = std::max(1e-4, 1.4826 * med_fn(ref_valid));
+            double ref_thr = std::max(0.0, cfg.rfi_threshold_mad) * ref_sig;
+            std::vector<uint8_t> core_rfi(nfft, 0), is_rfi(nfft, 0);
             for (int i = 0; i < nfft; ++i) {
                 if (valid[i] && (ref_res[i] - ref_med) > ref_thr) {
+                    core_rfi[i] = 1;
                     is_rfi[i] = 1;
-                    rfi_idx.push_back(i);
                 }
+            }
+            for (int i = 0; i < nfft; ++i) {
+                if (!core_rfi[i]) continue;
+                if (i - 1 >= 0 && valid[i - 1]) is_rfi[i - 1] = 1;
+                if (i + 1 < nfft && valid[i + 1]) is_rfi[i + 1] = 1;
+            }
+            const double cw_thresh_db = std::max(12.0 * ref_sig, 6.0);
+            for (int idx = 0; idx < nfft;) {
+                if (passband[idx] && hi_win[idx] && (ref_res[idx] - ref_med) > cw_thresh_db) {
+                    const int run_start = idx;
+                    int run_end = idx;
+                    while (run_end + 1 < nfft && passband[run_end + 1] && hi_win[run_end + 1] &&
+                           (ref_res[run_end + 1] - ref_med) > cw_thresh_db) {
+                        ++run_end;
+                    }
+                    if (run_end - run_start + 1 <= 2) {
+                        for (int k = run_start; k <= run_end; ++k) is_rfi[k] = 1;
+                    }
+                    idx = run_end + 1;
+                } else {
+                    ++idx;
+                }
+            }
+            std::vector<int> rfi_idx;
+            for (int i = 0; i < nfft; ++i) {
+                if (is_rfi[i]) rfi_idx.push_back(i);
             }
             ref_cnt = static_cast<int>(rfi_idx.size());
             for (size_t k = 0; k < rfi_idx.size();) {
@@ -411,17 +448,18 @@ static void test_simd_fft_and_rfi_kernels() {
                 int r_idx = run_end + 1;
                 while (r_idx < nfft && is_rfi[r_idx]) ++r_idx;
                 if (l_idx < 0 && r_idx >= nfft) continue;
-                const double v_l = (l_idx >= 0) ? pwr[l_idx] : pwr[r_idx];
-                const double v_r = (r_idx < nfft) ? pwr[r_idx] : pwr[l_idx];
                 if (l_idx < 0) {
-                    for (int idx = run_start; idx <= run_end; ++idx) ref_out[idx] = v_r;
+                    for (int idx = run_start; idx <= run_end; ++idx) ref_out[idx] = pwr[r_idx];
                 } else if (r_idx >= nfft) {
-                    for (int idx = run_start; idx <= run_end; ++idx) ref_out[idx] = v_l;
+                    for (int idx = run_start; idx <= run_end; ++idx) ref_out[idx] = pwr[l_idx];
                 } else {
-                    const int span = std::max(1, r_idx - l_idx);
+                    const double db_l = p_db[l_idx];
+                    const double db_r = p_db[r_idx];
+                    const double inv_span = 1.0 / static_cast<double>(r_idx - l_idx);
                     for (int idx = run_start; idx <= run_end; ++idx) {
-                        const double t = static_cast<double>(idx - l_idx) / static_cast<double>(span);
-                        ref_out[idx] = v_l + t * (v_r - v_l);
+                        const double t = static_cast<double>(idx - l_idx) * inv_span;
+                        const double interp_db = db_l + t * (db_r - db_l);
+                        ref_out[idx] = std::pow(10.0, interp_db * 0.1);
                     }
                 }
             }
@@ -674,6 +712,7 @@ static void test_math_accuracy_and_solvers() {
         TEST_ASSERT(std::abs(mean_hi_k) < 0.25, "refine_local linear-space subtraction is unbiased on pure noise");
         TEST_ASSERT(std::abs(m.integrated_flux_k_kms) < 15.0 && m.column_density_cm2 >= 0.0,
                     "Pure noise metrics are zero-mean without positive clamping bias");
+        TEST_ASSERT(!m.is_detected, "Pure white noise triggers zero false H I detections");
     }
 
     // 5. Parametric recovery for DoubleGaussian, VoigtProfile, GaussHermite (h3, h4>0, h4<0), SpectralMoments
@@ -793,9 +832,10 @@ static void test_math_accuracy_and_solvers() {
                           cfg.sample_rate_hz * static_cast<double>(i) / static_cast<double>(n);
             freqs_mhz[i] = freqs_hz[i] * 1e-6;
             double x = (static_cast<double>(i) - 0.5 * n) / (0.5 * n);
-            // Smooth quadratic passband + sinusoidal coaxial standing wave (14 cycles across passband)
-            double ripple_db = 0.35 * std::cos(2.0 * 3.14159265358979323846 * 14.0 * i / n + 0.4)
-                             + 0.12 * std::sin(2.0 * 3.14159265358979323846 * 23.0 * i / n - 0.7);
+            // Smooth quadratic passband + 2-tone physical coaxial standing wave (P1 = 0.72 MHz, P2 = 0.43 MHz)
+            const double df_mhz = freqs_mhz[i] - astro::HYDROGEN_REST_FREQ_MHZ;
+            double ripple_db = 0.35 * std::cos(2.0 * 3.14159265358979323846 * df_mhz / 0.72 + 0.4)
+                             + 0.14 * std::sin(2.0 * 3.14159265358979323846 * df_mhz / 0.43 - 0.7);
             true_base_db[i] = -20.0 - 0.8 * x * x + 0.15 * x + ripple_db;
         }
         auto vel_kms = astro::Astrophysics::compute_doppler_velocity(freqs_hz);
@@ -872,6 +912,362 @@ static void test_math_accuracy_and_solvers() {
     }
 }
 
+static void test_multi_crest_ripple_benchmark_matrix() {
+    std::cout << "[Test 9] Multi-Crest Passband Ripple Benchmark Matrix (ALL 5 solvers, Case A null & Case B 15 K H I)...\n";
+
+    constexpr int n = 4096;
+    constexpr double kTwoPi = 6.28318530717958647692;
+    astro::AstroConfig base_cfg;
+    base_cfg.center_freq_hz = 1420.5e6;
+    base_cfg.sample_rate_hz = 2.4e6;
+    base_cfg.fft_size = n;
+    base_cfg.system_temp_k = 100.0;
+    base_cfg.hi_protection_half_width_khz = 190.0;
+    base_cfg.auto_skirt_trim = true;
+    base_cfg.line_method = astro::LineAnalysisMethod::GaussianLS;
+
+    std::vector<double> freqs_hz(n), freqs_mhz(n), true_base_db(n), noise_z(n);
+    const double f0 = base_cfg.center_freq_hz - 0.5 * base_cfg.sample_rate_hz;
+    const double df = base_cfg.sample_rate_hz / static_cast<double>(n);
+
+    // Deterministic Box-Muller Gaussian radiometer noise
+    uint64_t rng = 0x517CC1B727220A95ULL;
+    auto next_u01 = [&]() -> double {
+        rng += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = rng;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z ^= (z >> 31);
+        return (static_cast<double>(z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    };
+
+    for (int i = 0; i < n; ++i) {
+        freqs_hz[i] = f0 + static_cast<double>(i) * df;
+        freqs_mhz[i] = freqs_hz[i] * 1e-6;
+        const double u = (static_cast<double>(i) - 0.5 * n) / (0.5 * n); // [-1, +1]
+
+        // Steep 15% IF filter skirts (|u| > 0.70 drops -14 dB at edges)
+        double skirt_db = 0.0;
+        if (std::abs(u) > 0.70) {
+            const double t = (std::abs(u) - 0.70) / 0.30;
+            skirt_db = -14.0 * t * t * t;
+        }
+        // Broad continuum dome + 0.75 MHz multi-crest standing-wave ripple with CREST centered right inside +/-190 kHz HI window
+        const double df_hi_mhz = freqs_mhz[i] - astro::HYDROGEN_REST_FREQ_MHZ;
+        const double ripple_db = 0.28 * std::cos(kTwoPi * df_hi_mhz / 0.75);
+        true_base_db[i] = -20.0 - 0.35 * u * u + 0.12 * u + skirt_db + ripple_db;
+
+        const double u1 = std::max(1e-12, next_u01());
+        const double u2 = next_u01();
+        noise_z[i] = std::sqrt(-2.0 * std::log(u1)) * std::cos(kTwoPi * u2);
+    }
+
+    const auto vel_kms = astro::Astrophysics::compute_doppler_velocity(freqs_hz);
+    const double hi_half_mhz = base_cfg.hi_protection_half_width_khz / 1e3;
+    std::vector<uint8_t> hi_window(n, 0);
+    for (int i = 0; i < n; ++i) {
+        if (std::abs(freqs_mhz[i] - astro::HYDROGEN_REST_FREQ_MHZ) <= hi_half_mhz) {
+            hi_window[i] = 1;
+        }
+    }
+
+    // Radiometer noise sigma_T = 0.55 K (~0.024 dB per channel)
+    constexpr double kNoiseFrac = 0.0055;
+    // Case B injected Gaussian H I line: 15 K at +8 km/s, FWHM = 12 km/s
+    constexpr double kTrueAmpK = 15.0;
+    constexpr double kTrueVelKms = 8.0;
+    constexpr double kTrueFwhmKms = 12.0;
+    const double true_sigma_kms = kTrueFwhmKms / astro::GAUSSIAN_SIGMA_TO_FWHM;
+
+    std::vector<double> power_null(n), power_sig(n);
+    for (int i = 0; i < n; ++i) {
+        const double base_lin = std::pow(10.0, true_base_db[i] * 0.1);
+        const double hi_k = kTrueAmpK * std::exp(-0.5 * std::pow((vel_kms[i] - kTrueVelKms) / true_sigma_kms, 2.0));
+        power_null[i] = base_lin * std::max(0.1, 1.0 + kNoiseFrac * noise_z[i]);
+        power_sig[i]  = base_lin * std::max(0.1, 1.0 + hi_k / base_cfg.system_temp_k + kNoiseFrac * noise_z[i]);
+    }
+
+    const astro::BaselineMethod all_methods[5] = {
+        astro::BaselineMethod::RippleFilter,
+        astro::BaselineMethod::ALS,
+        astro::BaselineMethod::Poly,
+        astro::BaselineMethod::SavitzkyGolay,
+        astro::BaselineMethod::StandingWave
+    };
+
+    for (auto method : all_methods) {
+        const std::string mname = astro::baseline_method_to_string(method);
+        astro::AstroConfig cfg = base_cfg;
+        cfg.baseline_method = method;
+
+        // ---------------- Case A: Null sky (NO H I line) ----------------
+        {
+            auto bres = astro::BaselineFitter::fit(power_null, freqs_mhz, cfg);
+            std::vector<double> cal_k(n), cal_db(n);
+            for (int i = 0; i < n; ++i) {
+                const double bp = std::max(1e-30, bres.baseline_power[i]);
+                cal_k[i] = cfg.system_temp_k * (power_null[i] - bres.baseline_power[i]) / bp;
+                cal_db[i] = 10.0 * std::log10(std::max(1e-6, power_null[i] / bp));
+            }
+            double slope = 0.0, intercept = 0.0;
+            const auto* mask_ptr = bres.effective_passband_mask.empty() ? nullptr : &bres.effective_passband_mask;
+            astro::BaselineFitter::refine_local(vel_kms, cal_k, cal_db, cfg, slope, intercept, mask_ptr);
+            auto metrics = astro::Astrophysics::calculate_metrics(freqs_mhz, vel_kms, cal_k, cal_db, cfg, mask_ptr);
+
+            double off_sq = 0.0;
+            int off_cnt = 0;
+            double hi_sum = 0.0;
+            int hi_cnt = 0;
+            for (int i = 0; i < n; ++i) {
+                const bool in_pb = mask_ptr ? ((*mask_ptr)[i] != 0) : (i >= n / 6 && i < n - n / 6);
+                if (hi_window[i]) {
+                    hi_sum += cal_db[i];
+                    ++hi_cnt;
+                } else if (in_pb) {
+                    off_sq += cal_db[i] * cal_db[i];
+                    ++off_cnt;
+                }
+            }
+            const double off_rms_db = std::sqrt(off_sq / std::max(1, off_cnt));
+            const double hi_mean_bias_db = hi_sum / std::max(1, hi_cnt);
+
+            std::cout << "  [Case A Null | " << mname << "] off_rms=" << off_rms_db
+                      << " dB, hi_bias=" << hi_mean_bias_db
+                      << " dB, snr_mf=" << metrics.snr_matched
+                      << ", detected=" << (metrics.is_detected ? "YES" : "NO") << "\n";
+
+            TEST_ASSERT(off_rms_db < 0.08,
+                        "Test 9 Case A (" + mname + "): low off-line residual RMS (< 0.08 dB)");
+            TEST_ASSERT(std::abs(hi_mean_bias_db) < 0.08,
+                        "Test 9 Case A (" + mname + "): mean bias inside HI window < 0.08 dB across ripple crest");
+            TEST_ASSERT(!metrics.is_detected,
+                        "Test 9 Case A (" + mname + "): ZERO false H I detections on null sky with ripple crest");
+        }
+
+        // ---------------- Case B: Injected 15 K Gaussian H I line at +8 km/s, FWHM 12 km/s ----------------
+        {
+            auto bres = astro::BaselineFitter::fit(power_sig, freqs_mhz, cfg);
+            std::vector<double> cal_k(n), cal_db(n);
+            for (int i = 0; i < n; ++i) {
+                const double bp = std::max(1e-30, bres.baseline_power[i]);
+                cal_k[i] = cfg.system_temp_k * (power_sig[i] - bres.baseline_power[i]) / bp;
+                cal_db[i] = 10.0 * std::log10(std::max(1e-6, power_sig[i] / bp));
+            }
+            double slope = 0.0, intercept = 0.0;
+            const auto* mask_ptr = bres.effective_passband_mask.empty() ? nullptr : &bres.effective_passband_mask;
+            astro::BaselineFitter::refine_local(vel_kms, cal_k, cal_db, cfg, slope, intercept, mask_ptr);
+            auto metrics = astro::Astrophysics::calculate_metrics(freqs_mhz, vel_kms, cal_k, cal_db, cfg, mask_ptr);
+
+            std::cout << "  [Case B 15K  | " << mname << "] detected=" << (metrics.is_detected ? "YES" : "NO")
+                      << ", snr_mf=" << metrics.snr_matched
+                      << ", v0=" << metrics.gauss_fit.v_center_kms
+                      << " km/s, amp=" << metrics.gauss_fit.amplitude_k
+                      << " K, fwhm=" << metrics.gauss_fit.fwhm_kms << " km/s\n";
+
+            TEST_ASSERT(metrics.is_detected,
+                        "Test 9 Case B (" + mname + "): confirmed H I detection (is_detected == true)");
+            TEST_ASSERT(metrics.gauss_fit.success &&
+                        std::abs(metrics.gauss_fit.v_center_kms - kTrueVelKms) <= 2.0,
+                        "Test 9 Case B (" + mname + "): recovered v_center within +/-2.0 km/s of +8 km/s");
+            TEST_ASSERT(std::abs(metrics.gauss_fit.amplitude_k - kTrueAmpK) <= 3.0,
+                        "Test 9 Case B (" + mname + "): recovered amplitude within +/-3.0 K of 15 K");
+            TEST_ASSERT(std::abs(metrics.gauss_fit.fwhm_kms - kTrueFwhmKms) <= 3.5,
+                        "Test 9 Case B (" + mname + "): recovered FWHM within +/-3.5 km/s of 12 km/s");
+        }
+    }
+}
+
+static void test_targeted_io_plot_and_solver_units() {
+    std::cout << "[Test 10] SidecarReader .txt/filename roundtrip, PlotRenderer edge cases, VirtualSdrDevice & Heptadiagonal solver...\n";
+
+    fs::path tmp_dir = fs::path("tests") / "test_tmp_units";
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
+    fs::create_directories(tmp_dir, ec);
+
+    // 1. SidecarReader .txt sidecar & default filename roundtrip + JSON quoted string skipping
+    {
+        Cs16Writer writer(tmp_dir.string());
+        std::string rec_path = writer.start_recording(2400000U, 1420500000ULL, "UnitSDR-X1", 29.7f, true, "", 0.0);
+        TEST_ASSERT(!rec_path.empty(), "Cs16Writer started default-named recording");
+        std::vector<uint8_t> iq(16384, 128);
+        writer.feed_samples(iq.data(), iq.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        writer.stop_recording();
+
+        fs::path p(rec_path);
+        fs::path json_p = p.parent_path() / (p.stem().string() + ".json");
+        fs::path txt_p  = p.parent_path() / (p.stem().string() + ".txt");
+        TEST_ASSERT(fs::exists(json_p) && fs::exists(txt_p), "Cs16Writer emitted default .json and .txt sidecars");
+
+        // Remove .json so SidecarReader parses Cs16Writer's own .txt sidecar
+        fs::remove(json_p, ec);
+        auto txt_meta = astro::SidecarReader::parse(rec_path);
+        TEST_ASSERT(txt_meta.found_sidecar, "SidecarReader parsed Cs16Writer .txt sidecar");
+        TEST_ASSERT(std::abs(txt_meta.center_freq_hz - 1420500000.0) < 10.0, ".txt roundtrip center_freq_hz exact");
+        TEST_ASSERT(std::abs(txt_meta.sample_rate_hz - 2400000.0) < 100.0, ".txt roundtrip sample_rate_hz exact");
+        TEST_ASSERT(txt_meta.has_gain && std::abs(txt_meta.gain_db - 29.7) < 0.2, ".txt roundtrip gain_db exact");
+        TEST_ASSERT(txt_meta.bias_tee, ".txt roundtrip bias_tee exact");
+        TEST_ASSERT(std::abs(txt_meta.lo_offset_khz - 94.248) < 0.05, ".txt roundtrip LO Frequency Offset exact");
+        TEST_ASSERT(!txt_meta.timestamp.empty(), ".txt roundtrip Capture Timestamp preserved");
+        TEST_ASSERT(txt_meta.device_name == "UnitSDR-X1", ".txt roundtrip Receiver Hardware exact");
+
+        // Remove .txt so SidecarReader falls back to Cs16Writer's default filename (1420.500MHz_2.40MSPS)
+        fs::remove(txt_p, ec);
+        auto fn_meta = astro::SidecarReader::parse(rec_path);
+        TEST_ASSERT(fn_meta.found_sidecar && fn_meta.sidecar_source == "filename inference",
+                    "SidecarReader parsed Cs16Writer default filename via regex fallback");
+        TEST_ASSERT(std::abs(fn_meta.center_freq_hz - 1420500000.0) < 1e3,
+                    "Default filename fallback parsed 1420.500MHz accurately");
+        TEST_ASSERT(std::abs(fn_meta.sample_rate_hz - 2400000.0) < 1e4,
+                    "Default filename fallback parsed 2.40MSPS accurately");
+
+        // JSON quoted string literal skipping & \b/\f unescaping
+        fs::path tricky_cs16 = tmp_dir / "tricky_json.cs16";
+        fs::path tricky_json = tmp_dir / "tricky_json.json";
+        {
+            std::ofstream oc(tricky_cs16, std::ios::binary);
+            oc << "1234";
+            std::ofstream oj(tricky_json);
+            oj << "{\n"
+               << "  \"device\": \"fake \\\"center_freq_hz\\\": 999000000 \\b\\f ok\",\n"
+               << "  \"center_freq_hz\": 1420500000,\n"
+               << "  \"sample_rate_hz\": 2400000\n"
+               << "}\n";
+        }
+        auto jmeta = astro::SidecarReader::parse(tricky_cs16.string());
+        TEST_ASSERT(jmeta.found_sidecar && std::abs(jmeta.center_freq_hz - 1420500000.0) < 1.0,
+                    "JSON scanner skips quoted string literals containing fake key-value pairs");
+        TEST_ASSERT(jmeta.device_name.find('\b') != std::string::npos &&
+                    jmeta.device_name.find('\f') != std::string::npos,
+                    "JSON string extractor unescapes \\b and \\f control escapes");
+    }
+
+    // 2. PlotRenderer edge cases (1-row waterfall, empty calibrated_db, 0-row waterfall, non-finite values)
+    {
+        constexpr int cols = 64;
+        std::vector<double> freqs_mhz(cols), vel_kms(cols), raw_p(cols, 1.0), base_p(cols, 1.0);
+        std::vector<double> cal_k(cols, 0.0), cal_db(cols, 0.0);
+        for (int i = 0; i < cols; ++i) {
+            freqs_mhz[i] = 1419.5 + 2.4 * static_cast<double>(i) / static_cast<double>(cols - 1);
+            vel_kms[i] = astro::SPEED_OF_LIGHT_KMS * (astro::HYDROGEN_REST_FREQ_MHZ - freqs_mhz[i]) / astro::HYDROGEN_REST_FREQ_MHZ;
+        }
+        astro::AstroConfig cfg;
+        astro::AstrophysicalMetrics m;
+
+        // 2a. 1-row waterfall (previously UB in compute_waterfall_percentiles when n == 1)
+        std::vector<float> wf_1row(cols, 1.0f);
+        std::vector<double> wf_times = {0.5};
+        fs::path wf1_png = tmp_dir / "wf_1row.png";
+        bool wf1_ok = astro::PlotRenderer::render_waterfall_plot(wf_1row, 1, cols, wf_times, freqs_mhz, base_p, cfg, wf1_png.string());
+        TEST_ASSERT(wf1_ok && fs::exists(wf1_png) && fs::file_size(wf1_png) > 0,
+                    "PlotRenderer::render_waterfall_plot handles 1-row waterfall cleanly without UB");
+
+        // 2b. Empty calibrated_db in master dashboard (must return false cleanly instead of crashing)
+        std::vector<double> empty_db;
+        fs::path empty_db_png = tmp_dir / "dash_empty_db.png";
+        bool empty_db_res = astro::PlotRenderer::render_master_dashboard(
+            freqs_mhz, vel_kms, raw_p, base_p, cal_k, empty_db,
+            wf_1row, 1, cols, wf_times, m, cfg, "test.cs16", empty_db_png.string());
+        TEST_ASSERT(!empty_db_res, "PlotRenderer::render_master_dashboard rejects empty calibrated_db safely");
+
+        // 2c. 0-row waterfall in master dashboard (renders Q1-Q3 + graceful Q4 placeholder)
+        std::vector<float> empty_wf;
+        std::vector<double> empty_t;
+        fs::path dash_nowf_png = tmp_dir / "dash_nowf.png";
+        bool dash_nowf_ok = astro::PlotRenderer::render_master_dashboard(
+            freqs_mhz, vel_kms, raw_p, base_p, cal_k, cal_db,
+            empty_wf, 0, 0, empty_t, m, cfg, "test.cs16", dash_nowf_png.string());
+        TEST_ASSERT(dash_nowf_ok && fs::exists(dash_nowf_png) && fs::file_size(dash_nowf_png) > 0,
+                    "PlotRenderer::render_master_dashboard succeeds gracefully with 0 waterfall rows");
+
+        // 2d. Non-finite coordinates in calibrated_k
+        cal_k[10] = std::numeric_limits<double>::quiet_NaN();
+        cal_k[20] = std::numeric_limits<double>::infinity();
+        fs::path nan_png = tmp_dir / "nan_spec.png";
+        bool nan_ok = astro::PlotRenderer::render_calibrated_spectrum(
+            freqs_mhz, vel_kms, cal_k, cal_db, m, cfg, nan_png.string());
+        TEST_ASSERT(nan_ok && fs::exists(nan_png) && fs::file_size(nan_png) > 0,
+                    "PlotRenderer::render_calibrated_spectrum handles NaN/Inf inputs safely");
+    }
+
+    // 3. VirtualSdrDevice safety guards (rate_hz=0, null bytes_read, invalid buffer/length)
+    {
+        VirtualSdrDevice vsdr;
+        TEST_ASSERT(vsdr.open(0), "VirtualSdrDevice opens cleanly");
+        const uint32_t orig_rate = vsdr.get_sample_rate();
+        TEST_ASSERT(!vsdr.set_sample_rate(0), "VirtualSdrDevice rejects sample_rate == 0");
+        TEST_ASSERT(vsdr.get_sample_rate() == orig_rate, "VirtualSdrDevice preserves prior rate after rate=0 rejection");
+
+        uint8_t buf[64] = {};
+        int got = -1;
+        TEST_ASSERT(vsdr.read_samples(nullptr, 64, &got) == -1 && got == 0,
+                    "VirtualSdrDevice rejects null buffer safely");
+        TEST_ASSERT(vsdr.read_samples(buf, 1, &got) == -1 && got == 0,
+                    "VirtualSdrDevice rejects length < 2 safely");
+        TEST_ASSERT(vsdr.read_samples(buf, 64, nullptr) == 0,
+                    "VirtualSdrDevice handles null bytes_read pointer without crashing");
+        vsdr.close();
+    }
+
+    // 4. solve_heptadiagonal_symmetric exactness across n = 1, 2, 3, 4, 8, 64
+    {
+        const int test_ns[] = {1, 2, 3, 4, 8, 64};
+        for (int n : test_ns) {
+            std::vector<double> d(static_cast<size_t>(n), 1.0);
+            std::vector<double> e1(static_cast<size_t>(std::max(0, n - 1)), 0.0);
+            std::vector<double> e2(static_cast<size_t>(std::max(0, n - 2)), 0.0);
+            std::vector<double> e3(static_cast<size_t>(std::max(0, n - 3)), 0.0);
+
+            // Build strictly SPD A = diag(w) + lam * (D3^T D3)
+            const double lam = 150.0;
+            const double c[4] = {1.0, -3.0, 3.0, -1.0};
+            for (int i = 0; i < n; ++i) {
+                d[static_cast<size_t>(i)] = 0.5 + 0.1 * static_cast<double>(i % 5);
+            }
+            for (int r = 0; r <= n - 4; ++r) {
+                for (int a = 0; a < 4; ++a) {
+                    d[static_cast<size_t>(r + a)] += lam * c[a] * c[a];
+                    if (a + 1 < 4) e1[static_cast<size_t>(r + a)] += lam * c[a] * c[a + 1];
+                    if (a + 2 < 4) e2[static_cast<size_t>(r + a)] += lam * c[a] * c[a + 2];
+                    if (a + 3 < 4) e3[static_cast<size_t>(r + a)] += lam * c[a] * c[a + 3];
+                }
+            }
+
+            std::vector<double> x_true(static_cast<size_t>(n)), rhs(static_cast<size_t>(n), 0.0), x_sol(static_cast<size_t>(n), 0.0);
+            for (int i = 0; i < n; ++i) {
+                x_true[static_cast<size_t>(i)] = std::sin(0.23 * static_cast<double>(i)) + 0.05 * static_cast<double>(i);
+            }
+            for (int i = 0; i < n; ++i) {
+                double s = d[static_cast<size_t>(i)] * x_true[static_cast<size_t>(i)];
+                if (i >= 1) s += e1[static_cast<size_t>(i - 1)] * x_true[static_cast<size_t>(i - 1)];
+                if (i + 1 < n) s += e1[static_cast<size_t>(i)] * x_true[static_cast<size_t>(i + 1)];
+                if (i >= 2) s += e2[static_cast<size_t>(i - 2)] * x_true[static_cast<size_t>(i - 2)];
+                if (i + 2 < n) s += e2[static_cast<size_t>(i)] * x_true[static_cast<size_t>(i + 2)];
+                if (i >= 3) s += e3[static_cast<size_t>(i - 3)] * x_true[static_cast<size_t>(i - 3)];
+                if (i + 3 < n) s += e3[static_cast<size_t>(i)] * x_true[static_cast<size_t>(i + 3)];
+                rhs[static_cast<size_t>(i)] = s;
+            }
+
+            astro::solve_heptadiagonal_symmetric(
+                n, d.data(),
+                e1.empty() ? nullptr : e1.data(),
+                e2.empty() ? nullptr : e2.data(),
+                e3.empty() ? nullptr : e3.data(),
+                rhs.data(), x_sol.data());
+
+            double max_err = 0.0;
+            for (int i = 0; i < n; ++i) {
+                max_err = std::max(max_err, std::abs(x_sol[static_cast<size_t>(i)] - x_true[static_cast<size_t>(i)]));
+            }
+            TEST_ASSERT(max_err < 1e-9,
+                        "solve_heptadiagonal_symmetric exact within 1e-9 for n=" + std::to_string(n));
+        }
+    }
+
+    fs::remove_all(tmp_dir, ec);
+}
+
 int main() {
     std::cout << "======================================================================\n";
     std::cout << "  RUNNING TEST SUITE: test_dsp_optimizations\n";
@@ -885,6 +1281,8 @@ int main() {
     test_simd_fft_and_rfi_kernels();
     test_dsp_pipeline_dbfs_and_instant_fft();
     test_math_accuracy_and_solvers();
+    test_multi_crest_ripple_benchmark_matrix();
+    test_targeted_io_plot_and_solver_units();
 
     std::cout << "----------------------------------------------------------------------\n";
     std::cout << "RESULTS: " << g_tests_passed << " / " << g_tests_run << " assertions PASSED.\n";

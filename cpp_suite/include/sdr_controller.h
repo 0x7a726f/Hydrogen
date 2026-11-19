@@ -38,6 +38,11 @@ public:
     SdrController();
     ~SdrController();
 
+    SdrController(const SdrController&) = delete;
+    SdrController& operator=(const SdrController&) = delete;
+    SdrController(SdrController&&) = delete;
+    SdrController& operator=(SdrController&&) = delete;
+
     bool initialize(bool force_virtual = false, uint32_t device_index = 0);
     void shutdown();
 
@@ -52,7 +57,7 @@ public:
     std::future<bool> request_bias_tee(bool enabled);
     std::future<bool> request_ppm(int ppm);
 
-    // Synchronous queries (reads cached atomic state)
+    // Synchronous queries (reads cached atomic/metadata state without acquiring lifecycle_mutex_)
     uint64_t get_current_frequency() const { return current_freq_.load(); }
     uint32_t get_current_sample_rate() const { return current_rate_.load(); }
     float get_current_gain() const { return current_gain_.load(); }
@@ -66,6 +71,7 @@ public:
 
     // Callbacks
     void add_sample_callback(SampleCallback cb);
+    void clear_sample_callbacks();
     void set_freq_changed_callback(FreqChangedCallback cb);
 
     // Lock-Free Ring Buffer Telemetry
@@ -77,14 +83,17 @@ public:
     static std::vector<std::string> check_blocking_apps();
 
 private:
-    void stop_workers_locked();
+    void stop_workers_locked(std::vector<uint64_t>& freq_events);
     void stream_worker();
     void dispatch_worker();
-    void process_pending_commands();
+    void process_pending_commands(std::vector<uint64_t>& freq_events);
+    void notify_freq_changed(const std::vector<uint64_t>& freq_events);
+    void refresh_cached_metadata_locked(const std::string& status_override = "");
     std::future<bool> enqueue_command(SdrCommand cmd);
 
     std::unique_ptr<ISdrDevice> device_;
     std::atomic<bool> is_streaming_{false};
+    std::atomic<bool> workers_active_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> dispatch_stop_{false};
     std::thread worker_thread_;
@@ -98,8 +107,14 @@ private:
     std::atomic<int> ppm_{0};
     std::atomic<bool> is_simulated_{true};
 
-    // Lifecycle & device access mutex
+    // Lifecycle & device ownership mutex (never held while invoking user callbacks)
     mutable std::mutex lifecycle_mutex_;
+
+    // Lightweight leaf mutex for cached device name, status detail, and gain table
+    mutable std::mutex meta_mutex_;
+    std::string cached_device_name_ = "None";
+    std::string cached_status_detail_ = "Disconnected";
+    std::vector<float> cached_valid_gains_;
 
     // Dispatcher wakeup synchronization
     std::mutex dispatch_mutex_;
@@ -109,7 +124,7 @@ private:
     std::mutex cmd_mutex_;
     std::vector<SdrCommand> cmd_queue_;
 
-    // Sample subscribers
+    // Sample & frequency subscribers
     std::mutex cb_mutex_;
     std::vector<SampleCallback> sample_callbacks_;
     FreqChangedCallback freq_changed_cb_;

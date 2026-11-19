@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <memory>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include "config.h"
 
 namespace astro {
@@ -38,9 +40,18 @@ public:
     StreamingResults process(ProgressCallback progress_cb = nullptr);
 
     // Cancel processing if running
-    void cancel() { cancelled_ = true; }
+    void cancel() {
+        cancelled_.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(io_mutex_);
+        }
+        io_cv_.notify_all();
+    }
     void set_cancel_token(const std::atomic<bool>* token) { external_cancel_ = token; }
-    bool is_cancelled() const { return cancelled_ || (external_cancel_ && external_cancel_->load()); }
+    bool is_cancelled() const {
+        return cancelled_.load(std::memory_order_acquire) ||
+               (external_cancel_ && external_cancel_->load(std::memory_order_acquire));
+    }
 
     uint64_t get_file_size() const { return file_size_; }
     uint64_t get_total_samples() const { return total_samples_; }
@@ -58,8 +69,10 @@ private:
     uint64_t bytes_to_process_ = 0;
     double total_duration_s_ = 0.0;
     double duration_to_process_s_ = 0.0;
-    bool cancelled_ = false;
+    std::atomic<bool> cancelled_{false};
     const std::atomic<bool>* external_cancel_ = nullptr;
+    std::mutex io_mutex_;
+    std::condition_variable io_cv_;
 };
 
 } // namespace astro

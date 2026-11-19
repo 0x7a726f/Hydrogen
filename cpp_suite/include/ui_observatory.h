@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -381,31 +382,53 @@ inline void draw_slider_rail(const char* label, float u, const ImVec4& accent) {
 
 inline bool SliderFloatAccent(const char* label, float* v, float v_min, float v_max,
                               const char* format = "%.2f", const ImVec4& accent = palette::Cyan,
-                              ImGuiSliderFlags flags = 0) {
+                              ImGuiSliderFlags flags = 0,
+                              bool has_default = false, float default_val = 0.0f) {
     ImGui::PushStyleColor(ImGuiCol_FrameBg, palette::BgWell);
-    ImGui::PushStyleColor(ImGuiCol_SliderGrab, palette::Tint(accent, 0.24f));
-    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, palette::Tint(accent, 0.42f));
-    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, dp(4.0f));
-    const bool changed = ImGui::SliderFloat(label, v, v_min, v_max, format, flags);
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, palette::Tint(accent, 0.48f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, palette::Tint(accent, 0.78f));
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, dp(6.0f));
+    bool changed = ImGui::SliderFloat(label, v, v_min, v_max, format, flags);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(3);
 
+    if (has_default && ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        const float clamped = std::clamp(default_val, v_min, v_max);
+        if (std::abs(*v - clamped) > 1e-6f) {
+            *v = clamped;
+            changed = true;
+        }
+    }
+
     if (v_max > v_min) {
-        draw_slider_rail(label, (*v - v_min) / (v_max - v_min), accent);
+        float u = (*v - v_min) / (v_max - v_min);
+        if ((flags & ImGuiSliderFlags_Logarithmic) != 0 && v_min > 0.0f && v_max > v_min && *v > 0.0f) {
+            u = std::log(*v / v_min) / std::log(v_max / v_min);
+        }
+        draw_slider_rail(label, u, accent);
     }
     return changed;
 }
 
 inline bool SliderIntAccent(const char* label, int* v, int v_min, int v_max,
                             const char* format = "%d", const ImVec4& accent = palette::Cyan,
-                            ImGuiSliderFlags flags = 0) {
+                            ImGuiSliderFlags flags = 0,
+                            bool has_default = false, int default_val = 0) {
     ImGui::PushStyleColor(ImGuiCol_FrameBg, palette::BgWell);
-    ImGui::PushStyleColor(ImGuiCol_SliderGrab, palette::Tint(accent, 0.24f));
-    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, palette::Tint(accent, 0.42f));
-    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, dp(4.0f));
-    const bool changed = ImGui::SliderInt(label, v, v_min, v_max, format, flags);
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, palette::Tint(accent, 0.48f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, palette::Tint(accent, 0.78f));
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, dp(6.0f));
+    bool changed = ImGui::SliderInt(label, v, v_min, v_max, format, flags);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(3);
+
+    if (has_default && ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        const int clamped = std::clamp(default_val, v_min, v_max);
+        if (*v != clamped) {
+            *v = clamped;
+            changed = true;
+        }
+    }
 
     if (v_max > v_min) {
         draw_slider_rail(label, static_cast<float>(*v - v_min) / static_cast<float>(v_max - v_min), accent);
@@ -676,9 +699,37 @@ struct PlotMargin {
 };
 
 struct PlotZoomState {
-    bool   active = false;
+    bool   x_active = false;
+    bool   y_manual = false;
+    bool   active = false; // Compatibility alias kept in sync with is_zoomed()
     double x_min = 0.0, x_max = 1.0;
     double y_min = 0.0, y_max = 1.0;
+
+    // Rubber-band 2D box-zoom transient state
+    bool   box_dragging = false;
+    ImVec2 box_start_px{0.0f, 0.0f};
+    ImVec2 box_cur_px{0.0f, 0.0f};
+
+    // Internal drag state: 0=none, 1=pan_plot, 2=pan_x, 3=pan_y, 4=box_right, 5=box_shift_left, 6=rclick_axis
+    int    drag_mode = 0;
+    ImVec2 rclick_press_px{0.0f, 0.0f};
+
+    bool is_zoomed() const { return x_active || y_manual; }
+
+    void sync_active() { active = (x_active || y_manual); }
+
+    void reset() {
+        x_active = false;
+        y_manual = false;
+        active = false;
+        box_dragging = false;
+        drag_mode = 0;
+    }
+
+    void auto_y() {
+        y_manual = false;
+        sync_active();
+    }
 };
 
 inline double calc_nice_step(double span, int target_ticks) {
@@ -690,6 +741,903 @@ inline double calc_nice_step(double span, int target_ticks) {
     return nice * mag;
 }
 
+inline int calc_tick_decimals(double step, int min_decimals = 0, int max_decimals = 5) {
+    if (!(step > 0.0) || !std::isfinite(step)) return std::clamp(min_decimals, 0, max_decimals);
+    const double lg = std::log10(step);
+    int dec = (lg < 0.0) ? static_cast<int>(std::ceil(-lg - 1e-9)) : 0;
+    const double scaled = step * std::pow(10.0, static_cast<double>(dec));
+    if (dec < max_decimals && std::abs(scaled - std::round(scaled)) > 1e-3) {
+        ++dec;
+    }
+    return std::clamp(dec, min_decimals, max_decimals);
+}
+
+inline void format_adaptive_tick(double val, double step, char* buf, size_t sz,
+                                 bool force_sign = false, int min_decimals = 0) {
+    if (!buf || sz == 0) return;
+    if (!std::isfinite(val)) {
+        std::snprintf(buf, sz, "0");
+        return;
+    }
+    const double abs_step = std::abs(step);
+    if (std::abs(val) < std::max(abs_step * 1e-6, 1e-12)) val = 0.0;
+    const int dec = calc_tick_decimals(abs_step, min_decimals, 5);
+    if (force_sign) {
+        std::snprintf(buf, sz, "%+.*f", dec, val);
+    } else {
+        std::snprintf(buf, sz, "%.*f", dec, val);
+    }
+}
+
+inline void parse_tick_fmt_hint(const char* fmt, int& out_min_dec, bool& out_sign, const char*& out_suffix) {
+    out_min_dec = 0;
+    out_sign = false;
+    out_suffix = "";
+    if (!fmt) return;
+    const char* p = std::strchr(fmt, '%');
+    if (!p) return;
+    ++p;
+    while (*p == '+' || *p == '-' || *p == ' ' || *p == '#' || *p == '0') {
+        if (*p == '+') out_sign = true;
+        ++p;
+    }
+    while (*p >= '0' && *p <= '9') ++p;
+    if (*p == '.') {
+        ++p;
+        int d = 0;
+        while (*p >= '0' && *p <= '9') {
+            d = d * 10 + (*p - '0');
+            ++p;
+        }
+        out_min_dec = std::clamp(d, 0, 5);
+    }
+    if (*p == 'f' || *p == 'F' || *p == 'g' || *p == 'G') {
+        ++p;
+        out_suffix = p;
+    }
+}
+
+struct PlotInteractConfig {
+    // Default viewport domain (e.g. [-200, +200] km/s)
+    double def_xmin = 0.0, def_xmax = 1.0;
+    double def_ymin = 0.0, def_ymax = 1.0;
+
+    // Full data domain clamp (e.g. full passband)
+    double bound_xmin = 0.0, bound_xmax = 1.0;
+    double bound_ymin = -1e9, bound_ymax = 1e9;
+
+    bool   clamp_x = true;
+    bool   clamp_y = false;
+    bool   y_inverted = false;       // true for top-down waterfalls (0 at top, max at bottom)
+    bool   allow_y_zoom = true;
+    double min_x_span_frac = 0.0005; // up to 2000x zoom on X
+    double min_y_span_frac = 0.005;  // up to 200x zoom on Y
+
+    const char* x_unit = "";
+    const char* y_unit = "";
+
+    bool   has_hi_focus = false;
+    double hi_xmin = 0.0, hi_xmax = 0.0;
+
+    bool   show_full_btn = true;
+    bool   is_compact = false;
+    bool   ignore_ctrl_left_drag = false; // allows Ctrl+LeftClick passthrough (e.g. Live SDR tune)
+    const char* auto_y_label = "Auto Y";
+    const char* popup_id = nullptr;
+};
+
+struct PlotInteractResult {
+    bool hovered_plot = false;
+    bool hovered_any = false;
+    bool over_toolbar = false;
+    bool changed = false;
+    bool x_changed = false;
+    bool y_changed = false;
+    bool box_active = false;
+    bool context_open = false;
+    bool context_opened_this_frame = false;
+    bool requested_auto_y = false;
+    bool requested_reset = false;
+    bool requested_hi_focus = false;
+    bool requested_full = false;
+    ImVec2 toolbar_min{0.0f, 0.0f};
+    ImVec2 toolbar_max{0.0f, 0.0f};
+};
+
+namespace detail {
+
+inline void plot_apply_zoom_x(PlotZoomState& zoom, const PlotInteractConfig& cfg,
+                              double factor, double anchor_u) {
+    const double cur_xmin = zoom.x_active ? zoom.x_min : cfg.def_xmin;
+    const double cur_xmax = zoom.x_active ? zoom.x_max : cfg.def_xmax;
+    const double cur_span = std::max(1e-12, cur_xmax - cur_xmin);
+    const double u = std::clamp(anchor_u, 0.0, 1.0);
+    const double ax = cur_xmin + u * cur_span;
+
+    const double b_span = std::max(1e-9, cfg.bound_xmax - cfg.bound_xmin);
+    const double min_span = b_span * std::clamp(cfg.min_x_span_frac, 1e-6, 0.5);
+    const double max_span = cfg.clamp_x ? b_span : (b_span * 4.0);
+    const double new_span = std::clamp(cur_span * factor, min_span, max_span);
+
+    double nx0 = ax - u * new_span;
+    double nx1 = nx0 + new_span;
+    if (cfg.clamp_x) {
+        if (nx0 < cfg.bound_xmin) { nx1 += (cfg.bound_xmin - nx0); nx0 = cfg.bound_xmin; }
+        if (nx1 > cfg.bound_xmax) { nx0 -= (nx1 - cfg.bound_xmax); nx1 = cfg.bound_xmax; }
+        nx0 = std::max(cfg.bound_xmin, nx0);
+        nx1 = std::min(cfg.bound_xmax, nx1);
+    }
+
+    const bool def_is_bound = (std::abs(cfg.def_xmin - cfg.bound_xmin) <= b_span * 1e-5) &&
+                              (std::abs(cfg.def_xmax - cfg.bound_xmax) <= b_span * 1e-5);
+    if (cfg.clamp_x && def_is_bound && (nx1 - nx0) >= b_span * 0.9995) {
+        zoom.x_active = false;
+        zoom.x_min = cfg.def_xmin;
+        zoom.x_max = cfg.def_xmax;
+    } else {
+        zoom.x_min = nx0;
+        zoom.x_max = nx1;
+        zoom.x_active = true;
+    }
+    zoom.sync_active();
+}
+
+inline void plot_apply_zoom_y(PlotZoomState& zoom, const PlotInteractConfig& cfg,
+                              double factor, double anchor_v) {
+    if (!cfg.allow_y_zoom) return;
+    const double cur_ymin = zoom.y_manual ? zoom.y_min : cfg.def_ymin;
+    const double cur_ymax = zoom.y_manual ? zoom.y_max : cfg.def_ymax;
+    const double cur_span = std::max(1e-12, cur_ymax - cur_ymin);
+    const double v = std::clamp(anchor_v, 0.0, 1.0);
+    const double ay = cur_ymin + v * cur_span;
+
+    const double ref_span = cfg.clamp_y
+        ? std::max(1e-9, cfg.bound_ymax - cfg.bound_ymin)
+        : std::max(1e-9, cfg.def_ymax - cfg.def_ymin);
+    const double min_span = ref_span * std::clamp(cfg.min_y_span_frac, 1e-6, 0.5);
+    const double max_span = cfg.clamp_y ? ref_span : (ref_span * 25.0);
+    const double new_span = std::clamp(cur_span * factor, min_span, max_span);
+
+    double ny0 = ay - v * new_span;
+    double ny1 = ny0 + new_span;
+    if (cfg.clamp_y) {
+        if (ny0 < cfg.bound_ymin) { ny1 += (cfg.bound_ymin - ny0); ny0 = cfg.bound_ymin; }
+        if (ny1 > cfg.bound_ymax) { ny0 -= (ny1 - cfg.bound_ymax); ny1 = cfg.bound_ymax; }
+        ny0 = std::max(cfg.bound_ymin, ny0);
+        ny1 = std::min(cfg.bound_ymax, ny1);
+    }
+
+    if (cfg.clamp_y && (ny1 - ny0) >= ref_span * 0.9995) {
+        zoom.y_manual = false;
+        zoom.y_min = cfg.def_ymin;
+        zoom.y_max = cfg.def_ymax;
+    } else {
+        zoom.y_min = ny0;
+        zoom.y_max = ny1;
+        zoom.y_manual = true;
+    }
+    zoom.sync_active();
+}
+
+inline void plot_apply_pan_x(PlotZoomState& zoom, const PlotInteractConfig& cfg, double dx) {
+    if (!zoom.x_active) {
+        zoom.x_min = cfg.def_xmin;
+        zoom.x_max = cfg.def_xmax;
+        zoom.x_active = true;
+    }
+    const double span = std::max(1e-12, zoom.x_max - zoom.x_min);
+    double nx0 = zoom.x_min + dx;
+    double nx1 = nx0 + span;
+    if (cfg.clamp_x) {
+        if (nx0 < cfg.bound_xmin) { nx0 = cfg.bound_xmin; nx1 = std::min(cfg.bound_xmax, nx0 + span); }
+        if (nx1 > cfg.bound_xmax) { nx1 = cfg.bound_xmax; nx0 = std::max(cfg.bound_xmin, nx1 - span); }
+    }
+    zoom.x_min = nx0;
+    zoom.x_max = nx1;
+    zoom.sync_active();
+}
+
+inline void plot_apply_pan_y(PlotZoomState& zoom, const PlotInteractConfig& cfg, double dy) {
+    if (!cfg.allow_y_zoom) return;
+    if (!zoom.y_manual) {
+        zoom.y_min = cfg.def_ymin;
+        zoom.y_max = cfg.def_ymax;
+        zoom.y_manual = true;
+    }
+    const double span = std::max(1e-12, zoom.y_max - zoom.y_min);
+    double ny0 = zoom.y_min + dy;
+    double ny1 = ny0 + span;
+    if (cfg.clamp_y) {
+        if (ny0 < cfg.bound_ymin) { ny0 = cfg.bound_ymin; ny1 = std::min(cfg.bound_ymax, ny0 + span); }
+        if (ny1 > cfg.bound_ymax) { ny1 = cfg.bound_ymax; ny0 = std::max(cfg.bound_ymin, ny1 - span); }
+    }
+    zoom.y_min = ny0;
+    zoom.y_max = ny1;
+    zoom.sync_active();
+}
+
+inline void plot_apply_hi_focus(PlotZoomState& zoom, const PlotInteractConfig& cfg) {
+    if (!cfg.has_hi_focus || !(cfg.hi_xmax > cfg.hi_xmin)) return;
+    double x0 = cfg.hi_xmin;
+    double x1 = cfg.hi_xmax;
+    if (cfg.clamp_x) {
+        x0 = std::clamp(x0, cfg.bound_xmin, cfg.bound_xmax);
+        x1 = std::clamp(x1, cfg.bound_xmin, cfg.bound_xmax);
+    }
+    if (x1 > x0) {
+        zoom.x_min = x0;
+        zoom.x_max = x1;
+        zoom.x_active = true;
+        zoom.y_manual = false;
+        zoom.sync_active();
+    }
+}
+
+inline void plot_apply_full_view(PlotZoomState& zoom, const PlotInteractConfig& cfg) {
+    const double b_span = std::max(1e-9, cfg.bound_xmax - cfg.bound_xmin);
+    const bool def_is_bound = (std::abs(cfg.def_xmin - cfg.bound_xmin) <= b_span * 1e-5) &&
+                              (std::abs(cfg.def_xmax - cfg.bound_xmax) <= b_span * 1e-5);
+    if (def_is_bound) {
+        zoom.reset();
+    } else {
+        zoom.x_min = cfg.bound_xmin;
+        zoom.x_max = cfg.bound_xmax;
+        zoom.x_active = true;
+        zoom.y_manual = false;
+        zoom.sync_active();
+    }
+}
+
+} // namespace detail
+
+namespace widgets {
+
+inline bool draw_plot_zoom_toolbar(
+    const char* id_prefix,
+    ImDrawList* dl,
+    const ImVec2& plot_min, const ImVec2& plot_max,
+    const PlotInteractConfig& cfg,
+    PlotZoomState& zoom,
+    PlotInteractResult& io_res,
+    ImFont* ui_font = nullptr,
+    ImFont* mono_font = nullptr,
+    bool force_visible = true) {
+    const float avail_w = plot_max.x - plot_min.x;
+    const float avail_h = plot_max.y - plot_min.y;
+    if (avail_w < dp(84.0f) || avail_h < dp(36.0f)) return false;
+
+    const float bar_h = dp(22.0f);
+    const float pad_h = dp(6.0f);
+
+    const double ref_span = std::max(1e-9, cfg.def_xmax - cfg.def_xmin);
+    const double cur_span = zoom.x_active ? std::max(1e-9, zoom.x_max - zoom.x_min) : ref_span;
+    const double zoom_mag = ref_span / cur_span;
+    const bool show_mag = zoom.x_active && (zoom_mag >= 1.05 || zoom_mag <= 0.95);
+
+    char mag_buf[16] = "";
+    if (show_mag) {
+        if (zoom_mag >= 100.0) std::snprintf(mag_buf, sizeof(mag_buf), "%.0fx", zoom_mag);
+        else if (zoom_mag >= 10.0) std::snprintf(mag_buf, sizeof(mag_buf), "%.0fx", zoom_mag);
+        else std::snprintf(mag_buf, sizeof(mag_buf), "%.1fx", zoom_mag);
+    }
+
+    struct TbItem {
+        const char* id;
+        const char* label;
+        const char* tip;
+        int action; // 0=zoom_in, 1=zoom_out, 2=auto_y, 3=hi, 4=full, 5=reset, 6=readout
+        bool highlight;
+        bool is_mono;
+        float w;
+    };
+
+    TbItem items[8];
+    int n_items = 0;
+
+    ImFont* uf = ui_font ? ui_font : ImGui::GetFont();
+    ImFont* mf = mono_font ? mono_font : uf;
+    const float ufs = font_dp(11.0f);
+    const float mfs = font_dp(11.5f);
+
+    auto calc_w = [&](const char* txt, bool mono, float min_w) {
+        ImFont* f = mono ? mf : uf;
+        const float fs = mono ? mfs : ufs;
+        return std::max(dp(min_w), std::ceil(f->CalcTextSizeA(fs, FLT_MAX, 0.0f, txt).x) + dp(10.0f));
+    };
+
+    auto push_item = [&](const char* id, const char* lbl, const char* tip, int act, bool hi, bool mono, float min_w) {
+        if (n_items < 8) {
+            items[n_items++] = {id, lbl, tip, act, hi, mono, calc_w(lbl, mono, min_w)};
+        }
+    };
+
+    if (cfg.is_compact) {
+        push_item("##tb_zi", "+", "Zoom In (+)", 0, false, true, 20.0f);
+        push_item("##tb_zo", "-", "Zoom Out (-)", 1, false, true, 20.0f);
+        if (zoom.y_manual && cfg.allow_y_zoom) {
+            push_item("##tb_ay", "Auto Y", "Auto-Fit Y (A)", 2, true, false, 38.0f);
+        }
+        if (show_mag) {
+            push_item("##tb_mg", mag_buf, "Current X zoom factor", 6, true, true, 28.0f);
+        }
+        if (zoom.is_zoomed()) {
+            push_item("##tb_rs", "Reset", "Reset View (R / Dbl-Click)", 5, false, false, 34.0f);
+        }
+    } else {
+        push_item("##tb_zi", "+", "Zoom In (+)", 0, false, true, 22.0f);
+        push_item("##tb_zo", "-", "Zoom Out (-)", 1, false, true, 22.0f);
+        if (cfg.allow_y_zoom) {
+            const char* ay_lbl = (cfg.auto_y_label && cfg.auto_y_label[0]) ? cfg.auto_y_label : "Auto Y";
+            push_item("##tb_ay", ay_lbl, "Auto-Fit Y Axis (A)", 2, zoom.y_manual, false, 44.0f);
+        }
+        if (cfg.has_hi_focus && avail_w > dp(260.0f)) {
+            push_item("##tb_hi", "H I", "Focus 21-cm H I Line (H)", 3, false, false, 28.0f);
+        }
+        if (cfg.show_full_btn && avail_w > dp(310.0f)) {
+            push_item("##tb_fl", "Full", "Full Passband Span (F)", 4, false, false, 32.0f);
+        }
+        if (show_mag) {
+            push_item("##tb_mg", mag_buf, "Current X magnification", 6, true, true, 30.0f);
+        }
+        push_item("##tb_rs", "Reset", "Reset View (R / 0 / Dbl-Click)", 5, zoom.is_zoomed(), false, 38.0f);
+    }
+
+    float total_w = 0.0f;
+    for (int i = 0; i < n_items; ++i) total_w += items[i].w;
+    if (total_w > avail_w - pad_h * 2.0f) return false;
+
+    const ImVec2 tb_min(std::floor(plot_max.x - pad_h - total_w), std::floor(plot_min.y + pad_h));
+    const ImVec2 tb_max(tb_min.x + total_w, tb_min.y + bar_h);
+    io_res.toolbar_min = tb_min;
+    io_res.toolbar_max = tb_max;
+
+    const bool mouse_in_tb = ImGui::IsMouseHoveringRect(tb_min, tb_max, true);
+    if (!force_visible && !mouse_in_tb && !zoom.is_zoomed()) {
+        return false;
+    }
+
+    // Background bezel pill
+    dl->AddRectFilled(tb_min, tb_max, palette::PillBg32, dp(4.0f), ImDrawFlags_RoundAll);
+    dl->AddRect(tb_min, tb_max, palette::PlotBorder32, dp(4.0f), 1.0f, ImDrawFlags_RoundAll);
+
+    ImGui::PushID(id_prefix);
+    float cx = tb_min.x;
+    bool any_over = mouse_in_tb;
+
+    for (int i = 0; i < n_items; ++i) {
+        const TbItem& it = items[i];
+        const ImVec2 bmin(cx, tb_min.y);
+        const ImVec2 bmax(cx + it.w, tb_max.y);
+
+        if (i > 0) {
+            dl->AddLineV(cx, tb_min.y + dp(3.0f), tb_max.y - dp(3.0f),
+                         palette::WithAlphaF(palette::PlotBorder32, 0.75f), 1.0f);
+        }
+
+        bool hov = false;
+        bool clicked = false;
+        if (it.action != 6) {
+            ImGui::SetCursorScreenPos(bmin);
+            clicked = ImGui::InvisibleButton(it.id, ImVec2(it.w, bar_h));
+            hov = ImGui::IsItemHovered();
+            if (hov) {
+                any_over = true;
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                if (it.tip && it.tip[0]) {
+                    ImGui::SetTooltip("%s", it.tip);
+                }
+            }
+        }
+
+        if (hov) {
+            dl->AddRectFilled(ImVec2(bmin.x + 1.0f, bmin.y + 1.0f),
+                              ImVec2(bmax.x - 1.0f, bmax.y - 1.0f),
+                              palette::U32(palette::SurfaceHover, 0.85f), dp(3.0f), ImDrawFlags_RoundAll);
+        } else if (it.highlight && it.action != 6) {
+            dl->AddRectFilled(ImVec2(bmin.x + 1.0f, bmin.y + 1.0f),
+                              ImVec2(bmax.x - 1.0f, bmax.y - 1.0f),
+                              palette::U32(palette::Cyan, 0.14f), dp(3.0f), ImDrawFlags_RoundAll);
+        }
+
+        ImFont* f = it.is_mono ? mf : uf;
+        const float fs = it.is_mono ? mfs : ufs;
+        const ImVec2 tsz = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, it.label);
+        const ImU32 fg = (it.highlight || hov)
+            ? palette::U32(palette::Cyan)
+            : (it.action == 5 && !zoom.is_zoomed() ? palette::U32(palette::TextDim) : palette::TextPrimary32);
+        dl->AddText(f, fs,
+                    ImVec2(std::floor(bmin.x + (it.w - tsz.x) * 0.5f),
+                           std::floor(bmin.y + (bar_h - tsz.y) * 0.5f)),
+                    fg, it.label);
+
+        if (clicked) {
+            switch (it.action) {
+                case 0:
+                    detail::plot_apply_zoom_x(zoom, cfg, 0.72, 0.5);
+                    io_res.changed = true;
+                    io_res.x_changed = true;
+                    break;
+                case 1:
+                    detail::plot_apply_zoom_x(zoom, cfg, 1.0 / 0.72, 0.5);
+                    io_res.changed = true;
+                    io_res.x_changed = true;
+                    break;
+                case 2:
+                    zoom.auto_y();
+                    io_res.requested_auto_y = true;
+                    io_res.y_changed = true;
+                    io_res.changed = true;
+                    break;
+                case 3:
+                    detail::plot_apply_hi_focus(zoom, cfg);
+                    io_res.requested_hi_focus = true;
+                    io_res.x_changed = true;
+                    io_res.changed = true;
+                    break;
+                case 4:
+                    detail::plot_apply_full_view(zoom, cfg);
+                    io_res.requested_full = true;
+                    io_res.x_changed = true;
+                    io_res.changed = true;
+                    break;
+                case 5:
+                    zoom.reset();
+                    io_res.requested_reset = true;
+                    io_res.x_changed = true;
+                    io_res.y_changed = true;
+                    io_res.changed = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+        cx += it.w;
+    }
+
+    ImGui::PopID();
+    io_res.over_toolbar = any_over;
+    return any_over;
+}
+
+} // namespace widgets
+
+inline PlotInteractResult handle_plot_interaction(
+    const char* hit_id,
+    const ImVec2& canvas_min, const ImVec2& canvas_size,
+    const ImVec2& plot_min, const ImVec2& plot_max,
+    const PlotInteractConfig& cfg,
+    PlotZoomState& zoom,
+    ImDrawList* dl,
+    ImFont* ui_font = nullptr,
+    ImFont* mono_font = nullptr,
+    const std::function<void()>& extra_context_menu = nullptr,
+    bool draw_toolbar = true) {
+    PlotInteractResult res;
+    const ImVec2 canvas_max(canvas_min.x + canvas_size.x, canvas_min.y + canvas_size.y);
+    const float pw = std::max(1.0f, plot_max.x - plot_min.x);
+    const float ph = std::max(1.0f, plot_max.y - plot_min.y);
+    const ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 mp = io.MousePos;
+
+    // 1. Overlapping interactive hit area
+    ImGui::SetCursorScreenPos(canvas_min);
+    ImGui::SetNextItemAllowOverlap();
+    ImGui::InvisibleButton(hit_id, canvas_size,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    const bool item_hovered = ImGui::IsItemHovered();
+    const bool item_focused = ImGui::IsItemFocused();
+
+    char popup_buf[96];
+    const char* popup_name = cfg.popup_id;
+    if (!popup_name || !popup_name[0]) {
+        std::snprintf(popup_buf, sizeof(popup_buf), "##PlotCtx_%s", hit_id ? hit_id : "default");
+        popup_name = popup_buf;
+    }
+
+    // 2. Floating top-right zoom toolbar (sits above canvas via AllowOverlap)
+    if (draw_toolbar && dl) {
+        const bool show_tb = !cfg.is_compact || item_hovered || zoom.is_zoomed();
+        widgets::draw_plot_zoom_toolbar(hit_id ? hit_id : "##tb", dl, plot_min, plot_max,
+                                        cfg, zoom, res, ui_font, mono_font, show_tb);
+    }
+
+    const bool popup_open = ImGui::IsPopupOpen(popup_name);
+    const bool any_popup_open = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup);
+    const bool in_plot   = (mp.x >= plot_min.x && mp.x <= plot_max.x && mp.y >= plot_min.y && mp.y <= plot_max.y);
+    const bool in_y_axis = (mp.x >= canvas_min.x && mp.x < plot_min.x && mp.y >= plot_min.y && mp.y <= plot_max.y);
+    const bool in_x_axis = (mp.x >= plot_min.x && mp.x <= plot_max.x && mp.y > plot_max.y && mp.y <= canvas_max.y);
+    const bool can_interact = item_hovered && !res.over_toolbar && !popup_open;
+
+    auto map_px_to_x = [&](float px) -> double {
+        const double x0 = zoom.x_active ? zoom.x_min : cfg.def_xmin;
+        const double x1 = zoom.x_active ? zoom.x_max : cfg.def_xmax;
+        const double u = std::clamp(static_cast<double>(px - plot_min.x) / static_cast<double>(pw), 0.0, 1.0);
+        return x0 + u * (x1 - x0);
+    };
+    auto map_py_to_y = [&](float py) -> double {
+        const double y0 = zoom.y_manual ? zoom.y_min : cfg.def_ymin;
+        const double y1 = zoom.y_manual ? zoom.y_max : cfg.def_ymax;
+        const double v = cfg.y_inverted
+            ? std::clamp(static_cast<double>(py - plot_min.y) / static_cast<double>(ph), 0.0, 1.0)
+            : std::clamp(static_cast<double>(plot_max.y - py) / static_cast<double>(ph), 0.0, 1.0);
+        return y0 + v * (y1 - y0);
+    };
+
+    // 3. Scroll Wheel & Horizontal Wheel
+    if (can_interact) {
+        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelX);
+
+        if (io.MouseWheel != 0.0f) {
+            const double factor = std::pow(0.85, static_cast<double>(io.MouseWheel));
+            const double u = std::clamp(static_cast<double>(mp.x - plot_min.x) / static_cast<double>(pw), 0.0, 1.0);
+            const double v = cfg.y_inverted
+                ? std::clamp(static_cast<double>(mp.y - plot_min.y) / static_cast<double>(ph), 0.0, 1.0)
+                : std::clamp(static_cast<double>(plot_max.y - mp.y) / static_cast<double>(ph), 0.0, 1.0);
+
+            bool do_x = false;
+            bool do_y = false;
+            if (in_y_axis) {
+                do_y = cfg.allow_y_zoom;
+            } else if (in_x_axis) {
+                do_x = true;
+            } else if (in_plot) {
+                if (io.KeyCtrl) {
+                    do_x = true;
+                    do_y = cfg.allow_y_zoom;
+                } else if (io.KeyShift) {
+                    do_y = cfg.allow_y_zoom;
+                } else {
+                    do_x = true;
+                }
+            }
+            if (do_x) {
+                detail::plot_apply_zoom_x(zoom, cfg, factor, u);
+                res.x_changed = true;
+                res.changed = true;
+            }
+            if (do_y) {
+                detail::plot_apply_zoom_y(zoom, cfg, factor, v);
+                res.y_changed = true;
+                res.changed = true;
+            }
+        }
+
+        if (io.MouseWheelH != 0.0f && (in_plot || in_x_axis)) {
+            const double cur_span = zoom.x_active ? (zoom.x_max - zoom.x_min) : (cfg.def_xmax - cfg.def_xmin);
+            detail::plot_apply_pan_x(zoom, cfg, -static_cast<double>(io.MouseWheelH) * 0.12 * cur_span);
+            res.x_changed = true;
+            res.changed = true;
+        }
+
+        // 4. Double-Click Left
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            zoom.drag_mode = 0;
+            zoom.box_dragging = false;
+            if (in_y_axis && cfg.allow_y_zoom) {
+                zoom.auto_y();
+                res.requested_auto_y = true;
+                res.y_changed = true;
+                res.changed = true;
+            } else if (in_x_axis) {
+                zoom.x_active = false;
+                zoom.sync_active();
+                res.x_changed = true;
+                res.changed = true;
+            } else if (in_plot) {
+                zoom.reset();
+                res.requested_reset = true;
+                res.x_changed = true;
+                res.y_changed = true;
+                res.changed = true;
+            }
+        }
+    }
+
+    // 5. Commit helper for rubber-band box zoom
+    auto commit_box_zoom = [&]() {
+        const float bx0 = std::min(zoom.box_start_px.x, zoom.box_cur_px.x);
+        const float bx1 = std::max(zoom.box_start_px.x, zoom.box_cur_px.x);
+        const float by0 = std::min(zoom.box_start_px.y, zoom.box_cur_px.y);
+        const float by1 = std::max(zoom.box_start_px.y, zoom.box_cur_px.y);
+        const float bw = bx1 - bx0;
+        const float bh = by1 - by0;
+
+        if (bw < dp(8.0f)) return; // Reject accidental micro-drags
+
+        double nx0 = map_px_to_x(bx0);
+        double nx1 = map_px_to_x(bx1);
+        if (nx0 > nx1) std::swap(nx0, nx1);
+
+        const double b_xspan = std::max(1e-9, cfg.bound_xmax - cfg.bound_xmin);
+        const double min_xspan = b_xspan * std::clamp(cfg.min_x_span_frac, 1e-6, 0.5);
+        if (nx1 - nx0 < min_xspan) {
+            const double mid = 0.5 * (nx0 + nx1);
+            nx0 = mid - 0.5 * min_xspan;
+            nx1 = mid + 0.5 * min_xspan;
+        }
+        if (cfg.clamp_x) {
+            nx0 = std::clamp(nx0, cfg.bound_xmin, cfg.bound_xmax);
+            nx1 = std::clamp(nx1, cfg.bound_xmin, cfg.bound_xmax);
+        }
+        if (nx1 > nx0) {
+            zoom.x_min = nx0;
+            zoom.x_max = nx1;
+            zoom.x_active = true;
+            res.x_changed = true;
+            res.changed = true;
+        }
+
+        // Smart 1D X-band zoom when height < 12 dp; full 2D box zoom otherwise
+        if (bh >= dp(12.0f) && cfg.allow_y_zoom) {
+            double ny0 = map_py_to_y(by0);
+            double ny1 = map_py_to_y(by1);
+            if (ny0 > ny1) std::swap(ny0, ny1);
+            const double ref_yspan = cfg.clamp_y
+                ? std::max(1e-9, cfg.bound_ymax - cfg.bound_ymin)
+                : std::max(1e-9, cfg.def_ymax - cfg.def_ymin);
+            const double min_yspan = ref_yspan * std::clamp(cfg.min_y_span_frac, 1e-6, 0.5);
+            if (ny1 - ny0 < min_yspan) {
+                const double mid = 0.5 * (ny0 + ny1);
+                ny0 = mid - 0.5 * min_yspan;
+                ny1 = mid + 0.5 * min_yspan;
+            }
+            if (cfg.clamp_y) {
+                ny0 = std::clamp(ny0, cfg.bound_ymin, cfg.bound_ymax);
+                ny1 = std::clamp(ny1, cfg.bound_ymin, cfg.bound_ymax);
+            }
+            if (ny1 > ny0) {
+                zoom.y_min = ny0;
+                zoom.y_max = ny1;
+                zoom.y_manual = true;
+                res.y_changed = true;
+                res.changed = true;
+            }
+        }
+        zoom.sync_active();
+    };
+
+    // 6. Left-Drag Pan & Shift+Left-Drag Box Zoom
+    if (can_interact && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (!(cfg.ignore_ctrl_left_drag && io.KeyCtrl)) {
+            if (io.KeyShift && in_plot) {
+                zoom.drag_mode = 5;
+                zoom.box_dragging = true;
+                zoom.box_start_px = mp;
+                zoom.box_cur_px = mp;
+            } else if (in_y_axis && cfg.allow_y_zoom) {
+                zoom.drag_mode = 3;
+            } else if (in_x_axis) {
+                zoom.drag_mode = 2;
+            } else if (in_plot) {
+                zoom.drag_mode = 1;
+            }
+        }
+    }
+
+    if (zoom.drag_mode == 1 || zoom.drag_mode == 2 || zoom.drag_mode == 3 || zoom.drag_mode == 5) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (zoom.drag_mode == 5) {
+                zoom.box_cur_px = ImVec2(std::clamp(mp.x, plot_min.x, plot_max.x),
+                                         std::clamp(mp.y, plot_min.y, plot_max.y));
+            } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) {
+                const double x_span = zoom.x_active ? (zoom.x_max - zoom.x_min) : (cfg.def_xmax - cfg.def_xmin);
+                const double y_span = zoom.y_manual ? (zoom.y_max - zoom.y_min) : (cfg.def_ymax - cfg.def_ymin);
+                if (zoom.drag_mode == 1 || zoom.drag_mode == 2) {
+                    if (io.MouseDelta.x != 0.0f) {
+                        detail::plot_apply_pan_x(zoom, cfg, -(static_cast<double>(io.MouseDelta.x) / static_cast<double>(pw)) * x_span);
+                        res.x_changed = true;
+                        res.changed = true;
+                    }
+                }
+                const bool pan_y = (zoom.drag_mode == 3) ||
+                                   (zoom.drag_mode == 1 && (zoom.y_manual || cfg.y_inverted));
+                if (pan_y && cfg.allow_y_zoom && io.MouseDelta.y != 0.0f) {
+                    const double sign = cfg.y_inverted ? -1.0 : 1.0;
+                    detail::plot_apply_pan_y(zoom, cfg, sign * (static_cast<double>(io.MouseDelta.y) / static_cast<double>(ph)) * y_span);
+                    res.y_changed = true;
+                    res.changed = true;
+                }
+                ImGui::SetMouseCursor(zoom.drag_mode == 3 ? ImGuiMouseCursor_ResizeNS
+                                    : (zoom.drag_mode == 2 ? ImGuiMouseCursor_ResizeEW : ImGuiMouseCursor_ResizeAll));
+            }
+        } else {
+            if (zoom.drag_mode == 5 && zoom.box_dragging) {
+                commit_box_zoom();
+            }
+            zoom.drag_mode = 0;
+            zoom.box_dragging = false;
+        }
+    }
+
+    // 7. Right-Drag 2D Box Zoom & Short Right-Click Context Menu
+    if (can_interact && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        zoom.rclick_press_px = mp;
+        if (in_plot) {
+            zoom.drag_mode = 4;
+            zoom.box_start_px = mp;
+            zoom.box_cur_px = mp;
+            zoom.box_dragging = false;
+        } else if (in_y_axis || in_x_axis) {
+            zoom.drag_mode = 6;
+            zoom.box_dragging = false;
+        }
+    }
+
+    if (zoom.drag_mode == 4 || zoom.drag_mode == 6) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+            if (zoom.drag_mode == 4) {
+                zoom.box_cur_px = ImVec2(std::clamp(mp.x, plot_min.x, plot_max.x),
+                                         std::clamp(mp.y, plot_min.y, plot_max.y));
+                const float dist = std::hypot(mp.x - zoom.rclick_press_px.x, mp.y - zoom.rclick_press_px.y);
+                if (dist >= dp(4.0f)) {
+                    zoom.box_dragging = true;
+                }
+            }
+        } else {
+            const float dist = std::hypot(mp.x - zoom.rclick_press_px.x, mp.y - zoom.rclick_press_px.y);
+            if (zoom.drag_mode == 4 && zoom.box_dragging) {
+                commit_box_zoom();
+            } else if (dist < dp(4.0f)) {
+                ImGui::OpenPopup(popup_name);
+                res.context_opened_this_frame = true;
+            }
+            zoom.drag_mode = 0;
+            zoom.box_dragging = false;
+        }
+    }
+
+    // 8. Esc cancels active rubber-band drag
+    if (zoom.box_dragging && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        zoom.box_dragging = false;
+        zoom.drag_mode = 0;
+    }
+
+    // 9. Draw Rubber-Band Box Zoom overlay + live delta readout pill
+    if (zoom.box_dragging && dl) {
+        const float bx0 = std::min(zoom.box_start_px.x, zoom.box_cur_px.x);
+        const float bx1 = std::max(zoom.box_start_px.x, zoom.box_cur_px.x);
+        const float by0 = std::min(zoom.box_start_px.y, zoom.box_cur_px.y);
+        const float by1 = std::max(zoom.box_start_px.y, zoom.box_cur_px.y);
+        const float bw = bx1 - bx0;
+        const float bh = by1 - by0;
+        const bool is_1d_xband = (bh < dp(12.0f) || !cfg.allow_y_zoom);
+
+        dl->PushClipRect(plot_min, plot_max, true);
+        if (is_1d_xband) {
+            dl->AddRectFilled(ImVec2(bx0, plot_min.y), ImVec2(bx1, plot_max.y),
+                              palette::U32(palette::Cyan, 0.14f));
+            dl->AddLineV(bx0, plot_min.y, plot_max.y, palette::U32(palette::Cyan, 0.90f), 1.5f);
+            dl->AddLineV(bx1, plot_min.y, plot_max.y, palette::U32(palette::Cyan, 0.90f), 1.5f);
+        } else {
+            dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
+                              palette::U32(palette::Cyan, 0.14f));
+            dl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1),
+                        palette::U32(palette::Cyan, 0.92f), 0.0f, 1.5f, ImDrawFlags_None);
+        }
+
+        if (bw >= dp(8.0f)) {
+            const double dx_val = std::abs(map_px_to_x(bx1) - map_px_to_x(bx0));
+            char dx_buf[32], dy_buf[32], pill_buf[96];
+            format_adaptive_tick(dx_val, dx_val * 0.1, dx_buf, sizeof(dx_buf), false, 1);
+            const char* xu = (cfg.x_unit && cfg.x_unit[0]) ? cfg.x_unit : "";
+            const char* yu = (cfg.y_unit && cfg.y_unit[0]) ? cfg.y_unit : "";
+            if (is_1d_xband) {
+                std::snprintf(pill_buf, sizeof(pill_buf), "dX %s%s%s (X-Band)",
+                              dx_buf, xu[0] ? " " : "", xu);
+            } else {
+                const double dy_val = std::abs(map_py_to_y(by1) - map_py_to_y(by0));
+                format_adaptive_tick(dy_val, dy_val * 0.1, dy_buf, sizeof(dy_buf), false, 1);
+                std::snprintf(pill_buf, sizeof(pill_buf), "dX %s%s%s | dY %s%s%s",
+                              dx_buf, xu[0] ? " " : "", xu,
+                              dy_buf, yu[0] ? " " : "", yu);
+            }
+            const float anchor_x = 0.5f * (bx0 + bx1);
+            const float anchor_y = is_1d_xband ? (plot_min.y + dp(32.0f)) : (by0 - dp(24.0f));
+            const auto pr = widgets::compute_clamped_pill_rect(
+                pill_buf, mono_font ? mono_font : ui_font, 11.0f,
+                anchor_x, anchor_y, plot_min, plot_max);
+            widgets::draw_pill_badge(dl, pr, pill_buf, mono_font ? mono_font : ui_font, 11.0f,
+                                     palette::CardBg32, palette::U32(palette::Cyan, 0.80f),
+                                     palette::U32(palette::Cyan));
+        }
+        dl->PopClipRect();
+    }
+
+    // 10. Plot-local Keyboard Shortcuts (when hovered or focused & not typing)
+    if ((can_interact || item_focused) && !io.WantTextInput && !any_popup_open && !io.KeyCtrl && !io.KeyAlt) {
+        const double anchor_u = in_plot
+            ? std::clamp(static_cast<double>(mp.x - plot_min.x) / static_cast<double>(pw), 0.0, 1.0)
+            : 0.5;
+        if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)) {
+            detail::plot_apply_zoom_x(zoom, cfg, 0.75, anchor_u);
+            res.x_changed = true; res.changed = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract)) {
+            detail::plot_apply_zoom_x(zoom, cfg, 1.0 / 0.75, anchor_u);
+            res.x_changed = true; res.changed = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_0) || ImGui::IsKeyPressed(ImGuiKey_Keypad0) ||
+                   ImGui::IsKeyPressed(ImGuiKey_R) || ImGui::IsKeyPressed(ImGuiKey_Home)) {
+            zoom.reset();
+            res.requested_reset = true; res.x_changed = true; res.y_changed = true; res.changed = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_A) && cfg.allow_y_zoom) {
+            zoom.auto_y();
+            res.requested_auto_y = true; res.y_changed = true; res.changed = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_H) && cfg.has_hi_focus) {
+            detail::plot_apply_hi_focus(zoom, cfg);
+            res.requested_hi_focus = true; res.x_changed = true; res.changed = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_F)) {
+            detail::plot_apply_full_view(zoom, cfg);
+            res.requested_full = true; res.x_changed = true; res.changed = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+            const double cur_span = zoom.x_active ? (zoom.x_max - zoom.x_min) : (cfg.def_xmax - cfg.def_xmin);
+            detail::plot_apply_pan_x(zoom, cfg, -0.15 * cur_span);
+            res.x_changed = true; res.changed = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+            const double cur_span = zoom.x_active ? (zoom.x_max - zoom.x_min) : (cfg.def_xmax - cfg.def_xmin);
+            detail::plot_apply_pan_x(zoom, cfg, +0.15 * cur_span);
+            res.x_changed = true; res.changed = true;
+        }
+    }
+
+    // 11. Right-Click Context Menu
+    if (ImGui::BeginPopup(popup_name)) {
+        if (cfg.has_hi_focus) {
+            if (ImGui::MenuItem("Focus H I Line", "H")) {
+                detail::plot_apply_hi_focus(zoom, cfg);
+                res.requested_hi_focus = true; res.x_changed = true; res.changed = true;
+            }
+        }
+        if (cfg.allow_y_zoom) {
+            const char* ay_lbl = (cfg.auto_y_label && cfg.auto_y_label[0]) ? cfg.auto_y_label : "Auto-Fit Y";
+            if (ImGui::MenuItem(ay_lbl, "A")) {
+                zoom.auto_y();
+                res.requested_auto_y = true; res.y_changed = true; res.changed = true;
+            }
+        }
+        if (cfg.show_full_btn) {
+            if (ImGui::MenuItem("Full Passband", "F")) {
+                detail::plot_apply_full_view(zoom, cfg);
+                res.requested_full = true; res.x_changed = true; res.changed = true;
+            }
+        }
+        if (ImGui::MenuItem("Reset View", "R")) {
+            zoom.reset();
+            res.requested_reset = true; res.x_changed = true; res.y_changed = true; res.changed = true;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Zoom In", "+")) {
+            detail::plot_apply_zoom_x(zoom, cfg, 0.72, 0.5);
+            res.x_changed = true; res.changed = true;
+        }
+        if (ImGui::MenuItem("Zoom Out", "-")) {
+            detail::plot_apply_zoom_x(zoom, cfg, 1.0 / 0.72, 0.5);
+            res.x_changed = true; res.changed = true;
+        }
+        if (extra_context_menu) {
+            ImGui::Separator();
+            extra_context_menu();
+        }
+        ImGui::EndPopup();
+    }
+
+    // 12. Axis Hover Cursor Affordances
+    if (can_interact && zoom.drag_mode == 0) {
+        if (in_y_axis && cfg.allow_y_zoom) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        } else if (in_x_axis) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        }
+    }
+
+    zoom.sync_active();
+    res.hovered_plot = can_interact && in_plot;
+    res.hovered_any = can_interact;
+    res.box_active = zoom.box_dragging;
+    res.context_open = popup_open;
+    return res;
+}
+
+// Legacy compatibility wrapper
 inline void handle_plot_zoom_pan(const ImVec2& plot_min, const ImVec2& plot_max,
                                  double def_xmin, double def_xmax,
                                  double def_ymin, double def_ymax,
@@ -699,79 +1647,36 @@ inline void handle_plot_zoom_pan(const ImVec2& plot_min, const ImVec2& plot_max,
     const float pw = std::max(1.0f, plot_max.x - plot_min.x);
     const float ph = std::max(1.0f, plot_max.y - plot_min.y);
     const ImGuiIO& io = ImGui::GetIO();
+    PlotInteractConfig cfg;
+    cfg.def_xmin = cfg.bound_xmin = def_xmin;
+    cfg.def_xmax = cfg.bound_xmax = def_xmax;
+    cfg.def_ymin = cfg.bound_ymin = def_ymin;
+    cfg.def_ymax = cfg.bound_ymax = def_ymax;
+    cfg.clamp_x = clamp_x_to_default;
+    cfg.clamp_y = clamp_y_to_default;
 
     if (ImGui::IsItemHovered()) {
         ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
-
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            zoom.active = false;
+            zoom.reset();
             return;
         }
-
-        const float wheel = (io.MouseWheel != 0.0f) ? io.MouseWheel : io.MouseWheelH;
-        if (wheel != 0.0f &&
+        if (io.MouseWheel != 0.0f &&
             io.MousePos.x >= plot_min.x && io.MousePos.x <= plot_max.x &&
             io.MousePos.y >= plot_min.y && io.MousePos.y <= plot_max.y) {
-            if (!zoom.active) {
-                zoom.x_min = def_xmin; zoom.x_max = def_xmax;
-                zoom.y_min = def_ymin; zoom.y_max = def_ymax;
-                zoom.active = true;
-            }
-            const double factor = std::pow(0.86, static_cast<double>(wheel));
-            const bool zoom_x = !io.KeyCtrl;
-            const bool zoom_y = !io.KeyShift;
-
+            const double factor = std::pow(0.85, static_cast<double>(io.MouseWheel));
             const double u = static_cast<double>(io.MousePos.x - plot_min.x) / pw;
             const double v = static_cast<double>(plot_max.y - io.MousePos.y) / ph;
-            const double ax = zoom.x_min + u * (zoom.x_max - zoom.x_min);
-            const double ay = zoom.y_min + v * (zoom.y_max - zoom.y_min);
-
-            if (zoom_x) {
-                double span = (zoom.x_max - zoom.x_min) * factor;
-                const double def_span = std::max(1e-9, def_xmax - def_xmin);
-                span = std::clamp(span, def_span * 0.002, clamp_x_to_default ? def_span : def_span * 2.0);
-                zoom.x_min = ax - u * span;
-                zoom.x_max = zoom.x_min + span;
-                if (clamp_x_to_default) {
-                    if (zoom.x_min < def_xmin) { zoom.x_max += (def_xmin - zoom.x_min); zoom.x_min = def_xmin; }
-                    if (zoom.x_max > def_xmax) { zoom.x_min -= (zoom.x_max - def_xmax); zoom.x_max = def_xmax; }
-                    zoom.x_min = std::max(def_xmin, zoom.x_min);
-                    zoom.x_max = std::min(def_xmax, zoom.x_max);
-                }
-            }
-            if (zoom_y) {
-                double span = (zoom.y_max - zoom.y_min) * factor;
-                const double def_span = std::max(1e-9, def_ymax - def_ymin);
-                span = std::clamp(span, def_span * 0.01, clamp_y_to_default ? def_span : def_span * 4.0);
-                zoom.y_min = ay - v * span;
-                zoom.y_max = zoom.y_min + span;
-                if (clamp_y_to_default) {
-                    if (zoom.y_min < def_ymin) { zoom.y_max += (def_ymin - zoom.y_min); zoom.y_min = def_ymin; }
-                    if (zoom.y_max > def_ymax) { zoom.y_min -= (zoom.y_max - def_ymax); zoom.y_max = def_ymax; }
-                }
-            }
+            if (!io.KeyShift) detail::plot_apply_zoom_x(zoom, cfg, factor, u);
+            if (io.KeyShift || io.KeyCtrl) detail::plot_apply_zoom_y(zoom, cfg, factor, v);
         }
     }
-
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) {
-        if (!zoom.active) {
-            zoom.x_min = def_xmin; zoom.x_max = def_xmax;
-            zoom.y_min = def_ymin; zoom.y_max = def_ymax;
-            zoom.active = true;
-        }
-        const double dx = -(static_cast<double>(io.MouseDelta.x) / pw) * (zoom.x_max - zoom.x_min);
-        const double dy =  (static_cast<double>(io.MouseDelta.y) / ph) * (zoom.y_max - zoom.y_min);
-        zoom.x_min += dx; zoom.x_max += dx;
-        zoom.y_min += dy; zoom.y_max += dy;
-        if (clamp_x_to_default) {
-            const double span = zoom.x_max - zoom.x_min;
-            if (zoom.x_min < def_xmin) { zoom.x_min = def_xmin; zoom.x_max = def_xmin + span; }
-            if (zoom.x_max > def_xmax) { zoom.x_max = def_xmax; zoom.x_min = def_xmax - span; }
-        }
-        if (clamp_y_to_default) {
-            const double span = zoom.y_max - zoom.y_min;
-            if (zoom.y_min < def_ymin) { zoom.y_min = def_ymin; zoom.y_max = def_ymin + span; }
-            if (zoom.y_max > def_ymax) { zoom.y_max = def_ymax; zoom.y_min = def_ymax - span; }
+        const double xs = zoom.x_active ? (zoom.x_max - zoom.x_min) : (def_xmax - def_xmin);
+        detail::plot_apply_pan_x(zoom, cfg, -(static_cast<double>(io.MouseDelta.x) / pw) * xs);
+        if (zoom.y_manual) {
+            const double ys = zoom.y_max - zoom.y_min;
+            detail::plot_apply_pan_y(zoom, cfg, (static_cast<double>(io.MouseDelta.y) / ph) * ys);
         }
     }
 }
@@ -839,13 +1744,20 @@ struct PlotViewport2D {
                                   ImFont* mono_font = nullptr) const {
         dl->AddRectFilled(plot_min, plot_max, palette::PlotBg32, dp(3.0f), ImDrawFlags_RoundAll);
 
+        int x_min_dec = 0, y_min_dec = 0;
+        bool x_sign = false, y_sign = false;
+        const char* x_sfx = "";
+        const char* y_sfx = "";
+        parse_tick_fmt_hint(x_fmt, x_min_dec, x_sign, x_sfx);
+        parse_tick_fmt_hint(y_fmt, y_min_dec, y_sign, y_sfx);
+
         float tick_h = dp(12.0f);
         {
             ScopedFont tick_f(mono_font, 12.0f);
             tick_h = ImGui::GetFontSize();
             const ImU32 text_col = palette::U32(palette::TextMuted);
 
-            // Horizontal gridlines & nice Y ticks
+            // Horizontal gridlines & adaptive nice Y ticks
             if (y_ticks > 1) {
                 const double y_span = y_max - y_min;
                 const double step = calc_nice_step(y_span, y_ticks);
@@ -858,14 +1770,16 @@ struct PlotViewport2D {
                     if (py < plot_min.y - 1.0f || py > plot_max.y + 1.0f) continue;
                     dl->AddLineH(plot_min.x, plot_max.x, py, palette::PlotGrid32, 1.0f);
 
-                    char buf[32];
-                    std::snprintf(buf, sizeof(buf), y_fmt, val);
+                    char num_buf[32], buf[40];
+                    format_adaptive_tick(val, step, num_buf, sizeof(num_buf), y_sign, y_min_dec);
+                    if (y_sfx && *y_sfx) std::snprintf(buf, sizeof(buf), "%s%s", num_buf, y_sfx);
+                    else                 std::snprintf(buf, sizeof(buf), "%s", num_buf);
                     const ImVec2 ts = ImGui::CalcTextSize(buf);
                     dl->AddText(ImVec2(std::floor(plot_min.x - ts.x - dp(6.0f)), std::floor(py - tick_h * 0.5f)), text_col, buf);
                 }
             }
 
-            // Vertical gridlines & nice X ticks
+            // Vertical gridlines & adaptive nice X ticks
             if (x_ticks > 1) {
                 const double x_span = x_max - x_min;
                 const double step = calc_nice_step(x_span, x_ticks);
@@ -879,8 +1793,10 @@ struct PlotViewport2D {
                     if (px < plot_min.x - 1.0f || px > plot_max.x + 1.0f) continue;
                     dl->AddLineV(px, plot_min.y, plot_max.y, palette::PlotGrid32, 1.0f);
 
-                    char buf[32];
-                    std::snprintf(buf, sizeof(buf), x_fmt, val);
+                    char num_buf[32], buf[40];
+                    format_adaptive_tick(val, step, num_buf, sizeof(num_buf), x_sign, x_min_dec);
+                    if (x_sfx && *x_sfx) std::snprintf(buf, sizeof(buf), "%s%s", num_buf, x_sfx);
+                    else                 std::snprintf(buf, sizeof(buf), "%s", num_buf);
                     const ImVec2 ts = ImGui::CalcTextSize(buf);
                     const float lx = std::clamp(px - ts.x * 0.5f, plot_min.x, plot_max.x - ts.x);
                     if (lx >= last_label_right + dp(6.0f)) {
@@ -914,6 +1830,12 @@ struct PlotViewport2D {
                        int ticks, const char* fmt, const char* suffix = nullptr,
                        ImFont* mono_font = nullptr) const {
         if (ticks <= 1) return;
+        int min_dec = 0;
+        bool sign = false;
+        const char* sfx = "";
+        parse_tick_fmt_hint(fmt, min_dec, sign, sfx);
+        const double step = std::abs(top_max - top_min) / static_cast<double>(ticks - 1);
+
         float tick_h = dp(12.0f);
         {
             ScopedFont tick_f(mono_font, 12.0f);
@@ -927,8 +1849,10 @@ struct PlotViewport2D {
                 const float px = plot_min.x + static_cast<float>(frac) * plot_w;
                 dl->AddLineV(px, plot_min.y - dp(3.5f), plot_min.y, tick_col, 1.0f);
 
-                char buf[40];
-                std::snprintf(buf, sizeof(buf), fmt, val);
+                char num_buf[36], buf[44];
+                format_adaptive_tick(val, step, num_buf, sizeof(num_buf), sign, min_dec);
+                if (sfx && *sfx) std::snprintf(buf, sizeof(buf), "%s%s", num_buf, sfx);
+                else             std::snprintf(buf, sizeof(buf), "%s", num_buf);
                 const ImVec2 ts = ImGui::CalcTextSize(buf);
                 const float lx = px - ts.x * 0.5f;
                 if (lx >= last_label_right + dp(6.0f) && lx + ts.x <= plot_max.x - dp(2.0f)) {
@@ -946,30 +1870,100 @@ struct PlotViewport2D {
         }
     }
 
+    template <typename XGetter>
+    bool find_visible_range_xy(size_t n_points, XGetter&& x_at, size_t& out_lo, size_t& out_hi) const {
+        if (n_points < 2) return false;
+        const double x_first = static_cast<double>(x_at(0));
+        const double x_last  = static_cast<double>(x_at(n_points - 1));
+        const bool ascending = (x_last >= x_first);
+
+        if (ascending) {
+            if (x_last < x_min || x_first > x_max) return false;
+            size_t lo = 0, hi = n_points;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (static_cast<double>(x_at(mid)) < x_min) lo = mid + 1;
+                else hi = mid;
+            }
+            const size_t first_ge = lo;
+            lo = 0; hi = n_points;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (static_cast<double>(x_at(mid)) <= x_max) lo = mid + 1;
+                else hi = mid;
+            }
+            const size_t first_gt = lo;
+            out_lo = (first_ge > 0) ? (first_ge - 1) : 0;
+            out_hi = (first_gt < n_points) ? first_gt : (n_points - 1);
+            return out_hi > out_lo;
+        } else {
+            if (x_first < x_min || x_last > x_max) return false;
+            size_t lo = 0, hi = n_points;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (static_cast<double>(x_at(mid)) > x_max) lo = mid + 1;
+                else hi = mid;
+            }
+            const size_t first_le = lo;
+            lo = 0; hi = n_points;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (static_cast<double>(x_at(mid)) >= x_min) lo = mid + 1;
+                else hi = mid;
+            }
+            const size_t first_lt = lo;
+            out_lo = (first_le > 0) ? (first_le - 1) : 0;
+            out_hi = (first_lt < n_points) ? first_lt : (n_points - 1);
+            return out_hi > out_lo;
+        }
+    }
+
     template <typename YGetter>
     void decimate_trace(size_t n_points, double trace_x_min, double trace_x_max,
                         YGetter&& y_at, std::vector<ImVec2>& out_pts) const {
         out_pts.clear();
         if (n_points < 2 || plot_w <= 1.0f) return;
 
-        const int num_cols = std::max(2, static_cast<int>(std::ceil(plot_w)));
         const double span = trace_x_max - trace_x_min;
-        if (span <= 0.0) return;
+        if (!(span > 0.0)) return;
+        if (trace_x_max < x_min || trace_x_min > x_max) return;
 
-        const double px_step = static_cast<double>(plot_w) / static_cast<double>(num_cols - 1);
         const double inv_step_x = static_cast<double>(n_points - 1) / span;
+        const double step_x = span / static_cast<double>(n_points - 1);
+        int idx_lo = static_cast<int>(std::floor((x_min - trace_x_min) * inv_step_x)) - 1;
+        int idx_hi = static_cast<int>(std::ceil((x_max - trace_x_min) * inv_step_x)) + 1;
+        idx_lo = std::clamp(idx_lo, 0, static_cast<int>(n_points) - 1);
+        idx_hi = std::clamp(idx_hi, 0, static_cast<int>(n_points) - 1);
+        if (idx_hi <= idx_lo) return;
+
+        const int num_cols = std::max(2, static_cast<int>(std::ceil(plot_w)));
+        const int visible_bins = idx_hi - idx_lo + 1;
+
+        if (visible_bins <= num_cols * 2) {
+            out_pts.reserve(static_cast<size_t>(visible_bins));
+            for (int i = idx_lo; i <= idx_hi; ++i) {
+                const double y = static_cast<double>(y_at(static_cast<size_t>(i)));
+                if (!std::isfinite(y)) continue;
+                const double x = trace_x_min + static_cast<double>(i) * step_x;
+                out_pts.emplace_back(map_x(x), map_y(y));
+            }
+            return;
+        }
+
+        const double view_span = x_max - x_min;
+        const double px_step = static_cast<double>(plot_w) / static_cast<double>(num_cols - 1);
         const double inv_cols = 1.0 / static_cast<double>(num_cols - 1);
 
         out_pts.reserve(static_cast<size_t>(num_cols));
         for (int col = 0; col < num_cols; ++col) {
-            const double x0 = trace_x_min + (static_cast<double>(col) * inv_cols) * span;
-            const double x1 = trace_x_min + (static_cast<double>(col + 1) * inv_cols) * span;
-            if (x1 < x_min || x0 > x_max) continue;
+            const double cx0 = x_min + (static_cast<double>(col) * inv_cols) * view_span;
+            const double cx1 = x_min + (static_cast<double>(col + 1) * inv_cols) * view_span;
+            if (cx1 < trace_x_min || cx0 > trace_x_max) continue;
 
-            const double cx0 = std::max(x0, x_min);
-            const double cx1 = std::min(x1, x_max);
-            int i0 = static_cast<int>(std::floor((cx0 - trace_x_min) * inv_step_x));
-            int i1 = static_cast<int>(std::ceil((cx1 - trace_x_min) * inv_step_x));
+            const double sx0 = std::max(cx0, trace_x_min);
+            const double sx1 = std::min(cx1, trace_x_max);
+            int i0 = static_cast<int>(std::floor((sx0 - trace_x_min) * inv_step_x));
+            int i1 = static_cast<int>(std::ceil((sx1 - trace_x_min) * inv_step_x));
             i0 = std::clamp(i0, 0, static_cast<int>(n_points) - 1);
             i1 = std::clamp(i1, i0, static_cast<int>(n_points) - 1);
 
@@ -1057,23 +2051,33 @@ struct PlotViewport2D {
         if (n_points < 2 || plot_w < 2.0f) return;
 
         scratch.clear();
+        const double span_x = trace_x_max - trace_x_min;
+        if (!(span_x > 0.0) || trace_x_max < x_min || trace_x_min > x_max) return;
+
+        const double inv_step_x = static_cast<double>(n_points - 1) / span_x;
+        const double step_x = span_x / static_cast<double>(n_points - 1);
+        int idx_lo = static_cast<int>(std::floor((x_min - trace_x_min) * inv_step_x)) - 1;
+        int idx_hi = static_cast<int>(std::ceil((x_max - trace_x_min) * inv_step_x)) + 1;
+        idx_lo = std::clamp(idx_lo, 0, static_cast<int>(n_points) - 1);
+        idx_hi = std::clamp(idx_hi, 0, static_cast<int>(n_points) - 1);
+        if (idx_hi <= idx_lo) return;
+
         const int max_cols = std::max(2, static_cast<int>(std::ceil(plot_w)));
-        const double span_x = (std::abs(trace_x_max - trace_x_min) < 1e-12) ? 1.0 : (trace_x_max - trace_x_min);
+        const int visible_bins = idx_hi - idx_lo + 1;
 
         dl->PushClipRect(plot_min, plot_max, true);
 
-        if (n_points <= static_cast<size_t>(max_cols * 2)) {
-            scratch.reserve(n_points);
-            for (size_t i = 0; i < n_points; ++i) {
-                double x = trace_x_min + (static_cast<double>(i) / static_cast<double>(n_points - 1)) * span_x;
-                double y = static_cast<double>(y_at(i));
+        if (visible_bins <= max_cols * 2) {
+            scratch.reserve(static_cast<size_t>(visible_bins));
+            for (int i = idx_lo; i <= idx_hi; ++i) {
+                const double y = static_cast<double>(y_at(static_cast<size_t>(i)));
                 if (std::isfinite(y)) {
+                    const double x = trace_x_min + static_cast<double>(i) * step_x;
                     scratch.emplace_back(map_x(x), map_y(y));
                 }
             }
         } else {
-            scratch.reserve(static_cast<size_t>(max_cols) * 2);
-            const double inv_n = 1.0 / static_cast<double>(n_points - 1);
+            scratch.reserve(static_cast<size_t>(max_cols) * 2 + 4);
             int current_col = -1;
             float col_x_first = 0.0f;
             float col_y_min = 0.0f;
@@ -1091,13 +2095,13 @@ struct PlotViewport2D {
                 has_sample = false;
             };
 
-            for (size_t i = 0; i < n_points; ++i) {
-                double y = static_cast<double>(y_at(i));
+            for (int i = idx_lo; i <= idx_hi; ++i) {
+                const double y = static_cast<double>(y_at(static_cast<size_t>(i)));
                 if (!std::isfinite(y)) continue;
-                double x = trace_x_min + (static_cast<double>(i) * inv_n) * span_x;
-                float px = map_x(x);
-                float py = map_y(y);
-                int col_idx = static_cast<int>(std::floor(px - plot_min.x));
+                const double x = trace_x_min + static_cast<double>(i) * step_x;
+                const float px = map_x(x);
+                const float py = map_y(y);
+                const int col_idx = static_cast<int>(std::floor(px - plot_min.x));
                 if (col_idx != current_col) {
                     flush_col();
                     current_col = col_idx;
@@ -1127,18 +2131,20 @@ struct PlotViewport2D {
                                   std::vector<ImVec2>& fill_scratch) const {
         if (n_points < 2 || plot_w < 2.0f || plot_h < 2.0f) return;
 
+        size_t i_lo = 0, i_hi = 0;
+        if (!find_visible_range_xy(n_points, x_at, i_lo, i_hi)) return;
+
         const float y_zero = std::clamp(map_y(y_ref), plot_min.y, plot_max.y);
         fill_scratch.clear();
         const int max_cols = std::max(2, static_cast<int>(std::ceil(plot_w)));
-        const double x_pad = 0.05 * (x_max - x_min);
+        const size_t visible_bins = i_hi - i_lo + 1;
 
-        if (n_points <= static_cast<size_t>(max_cols * 2)) {
-            fill_scratch.reserve(n_points);
-            for (size_t i = 0; i < n_points; ++i) {
+        if (visible_bins <= static_cast<size_t>(max_cols * 2)) {
+            fill_scratch.reserve(visible_bins);
+            for (size_t i = i_lo; i <= i_hi; ++i) {
                 const double x = static_cast<double>(x_at(i));
                 const double y = static_cast<double>(y_at(i));
                 if (!std::isfinite(x) || !std::isfinite(y)) continue;
-                if (x < x_min - x_pad || x > x_max + x_pad) continue;
                 fill_scratch.emplace_back(map_x(x), map_y(y));
             }
         } else {
@@ -1152,11 +2158,10 @@ struct PlotViewport2D {
                     has = false;
                 }
             };
-            for (size_t i = 0; i < n_points; ++i) {
+            for (size_t i = i_lo; i <= i_hi; ++i) {
                 const double x = static_cast<double>(x_at(i));
                 const double y = static_cast<double>(y_at(i));
                 if (!std::isfinite(x) || !std::isfinite(y)) continue;
-                if (x < x_min - x_pad || x > x_max + x_pad) continue;
                 const float px = map_x(x);
                 const float py = map_y(y);
                 const int c = static_cast<int>(std::floor(px - plot_min.x));
@@ -1234,22 +2239,25 @@ struct PlotViewport2D {
                            ImU32 col, float thickness,
                            std::vector<ImVec2>& scratch) const {
         if (n_points < 2 || plot_w < 2.0f) return;
+
+        size_t i_lo = 0, i_hi = 0;
+        if (!find_visible_range_xy(n_points, x_at, i_lo, i_hi)) return;
+
         scratch.clear();
         const int max_cols = std::max(2, static_cast<int>(std::ceil(plot_w)));
-        const double x_pad = 0.05 * (x_max - x_min);
+        const size_t visible_bins = i_hi - i_lo + 1;
         dl->PushClipRect(plot_min, plot_max, true);
 
-        if (n_points <= static_cast<size_t>(max_cols * 2)) {
-            scratch.reserve(n_points);
-            for (size_t i = 0; i < n_points; ++i) {
+        if (visible_bins <= static_cast<size_t>(max_cols * 2)) {
+            scratch.reserve(visible_bins);
+            for (size_t i = i_lo; i <= i_hi; ++i) {
                 const double x = static_cast<double>(x_at(i));
                 const double y = static_cast<double>(y_at(i));
                 if (!std::isfinite(x) || !std::isfinite(y)) continue;
-                if (x < x_min - x_pad || x > x_max + x_pad) continue;
                 scratch.emplace_back(map_x(x), map_y(y));
             }
         } else {
-            scratch.reserve(static_cast<size_t>(max_cols) * 2);
+            scratch.reserve(static_cast<size_t>(max_cols) * 2 + 4);
             int current_col = -1;
             float col_x = 0.0f, col_ymin = 0.0f, col_ymax = 0.0f;
             bool has_sample = false;
@@ -1261,11 +2269,10 @@ struct PlotViewport2D {
                 }
                 has_sample = false;
             };
-            for (size_t i = 0; i < n_points; ++i) {
+            for (size_t i = i_lo; i <= i_hi; ++i) {
                 const double x = static_cast<double>(x_at(i));
                 const double y = static_cast<double>(y_at(i));
                 if (!std::isfinite(x) || !std::isfinite(y)) continue;
-                if (x < x_min - x_pad || x > x_max + x_pad) continue;
                 const float px = map_x(x);
                 const float py = map_y(y);
                 const int c = static_cast<int>(std::floor(px - plot_min.x));

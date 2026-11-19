@@ -5,24 +5,38 @@
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <type_traits>
 #include "simd_dsp.h"
 
 // Single-Producer Single-Consumer (SPSC) Lock-Free Circular Ring Buffer
 // Engineered with 64-byte cache-line separation to eliminate false sharing.
 template <typename T>
 class LockFreeSpscRingBuffer {
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "LockFreeSpscRingBuffer requires a trivially copyable element type");
+
 public:
     explicit LockFreeSpscRingBuffer(size_t capacity_power_of_2 = 8388608) { // Default 8 MB (8,388,608 elements)
-        // Ensure capacity is a power of 2 (with overflow protection)
+        // Ensure capacity is a power of 2 with strict byte-size overflow protection
+        const size_t max_pow2 = static_cast<size_t>(1) << (sizeof(size_t) * 8 - 2);
+        const size_t max_by_type = std::numeric_limits<size_t>::max() / sizeof(T);
+        const size_t max_cap = std::min(max_pow2, max_by_type);
+
         size_t cap = 1024;
-        const size_t max_cap = static_cast<size_t>(1) << (sizeof(size_t) * 8 - 2);
-        while (cap < capacity_power_of_2 && cap < max_cap) {
+        if (cap > max_cap) {
+            cap = 1;
+            while (cap <= (max_cap >> 1)) {
+                cap <<= 1;
+            }
+        }
+        while (cap < capacity_power_of_2 && cap <= (max_cap >> 1)) {
             cap <<= 1;
         }
         capacity_ = cap;
         mask_ = capacity_ - 1;
 
-        // Allocate 64-byte aligned buffer
+        // Allocate 64-byte aligned buffer (guaranteed capacity_ * sizeof(T) does not overflow)
         buffer_ = static_cast<T*>(SimdDsp::aligned_alloc_64(capacity_ * sizeof(T)));
         if (buffer_) {
             is_custom_aligned_ = true;
@@ -76,6 +90,34 @@ public:
 
         write_idx_.store(current_write + to_write, std::memory_order_release);
         return to_write;
+    }
+
+    // Push all 'count' elements atomically (all-or-nothing). Returns true on full write, false if insufficient space.
+    bool write_exact(const T* src, size_t count) {
+        if (count == 0) return true;
+        if (!src || !buffer_ || count > capacity_) return false;
+
+        const size_t current_write = write_idx_.load(std::memory_order_relaxed);
+        size_t free_slots = capacity_ - (current_write - read_idx_cache_);
+        if (free_slots < count) {
+            read_idx_cache_ = read_idx_.load(std::memory_order_acquire);
+            free_slots = capacity_ - (current_write - read_idx_cache_);
+        }
+        if (free_slots < count) {
+            return false;
+        }
+
+        const size_t write_pos = current_write & mask_;
+        const size_t first_chunk = std::min(count, capacity_ - write_pos);
+        const size_t second_chunk = count - first_chunk;
+
+        std::memcpy(&buffer_[write_pos], src, first_chunk * sizeof(T));
+        if (second_chunk > 0) {
+            std::memcpy(&buffer_[0], src + first_chunk, second_chunk * sizeof(T));
+        }
+
+        write_idx_.store(current_write + count, std::memory_order_release);
+        return true;
     }
 
     // Real-time hardware write: writes what fits, and logs unwritten remainder as dropped
@@ -153,7 +195,8 @@ public:
     size_t available_read() const {
         const size_t current_read = read_idx_.load(std::memory_order_acquire);
         const size_t current_write = write_idx_.load(std::memory_order_acquire);
-        return current_write - current_read;
+        const size_t diff = current_write - current_read;
+        return (diff <= capacity_) ? diff : capacity_;
     }
 
     size_t available_write() const {
@@ -164,8 +207,8 @@ public:
     size_t capacity() const { return capacity_; }
 
     float fill_percentage() const {
-        const size_t avail = std::min(available_read(), capacity_);
-        return (static_cast<float>(avail) / static_cast<float>(capacity_)) * 100.0f;
+        const size_t avail = available_read();
+        return (capacity_ > 0) ? (static_cast<float>(avail) / static_cast<float>(capacity_)) * 100.0f : 0.0f;
     }
 
     uint64_t dropped_count() const {
@@ -173,11 +216,11 @@ public:
     }
 
     void reset() {
-        read_idx_.store(0, std::memory_order_relaxed);
-        write_idx_.store(0, std::memory_order_relaxed);
         read_idx_cache_ = 0;
         write_idx_cache_ = 0;
-        dropped_count_.store(0, std::memory_order_relaxed);
+        read_idx_.store(0, std::memory_order_release);
+        write_idx_.store(0, std::memory_order_release);
+        dropped_count_.store(0, std::memory_order_release);
     }
 
 private:

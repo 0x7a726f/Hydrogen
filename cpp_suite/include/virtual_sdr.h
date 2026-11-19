@@ -61,5 +61,5 @@ private:
     double adsb_phase_ = 0.0;
     double gen_phase_ = 0.0;
 
-    std::chrono::high_resolution_clock::time_point next_chunk_time_;
+    std::chrono::steady_clock::time_point next_chunk_time_;
 };

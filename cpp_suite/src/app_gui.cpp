@@ -170,15 +170,51 @@ void AppGui::render_top_navigation_bar(float width, float height) {
     dl->AddLineV(div_x, win_pos.y + ui_obs::dp(11.0f), win_pos.y + height - ui_obs::dp(11.0f),
                  ui_obs::palette::U32(ui_obs::palette::BorderSubtle), 1.0f);
 
-    // 2. Center Animated Segmented Mode Switcher
+    // 2. Right Global Status Indicator (computed first & always drawn so it never disappears)
+    const bool is_rec = state_.is_recording_active();
+    const bool is_ana = analyze_panel_.is_analyzing();
+    const bool is_live = sdr_.is_streaming();
+    const bool compact_status = (width < ui_obs::dp(760.0f));
+
+    const char* status_label = "IDLE";
+    ImVec4 status_col = ui_obs::palette::TextMuted;
+    if (is_rec) {
+        status_label = "REC ACTIVE";
+        status_col = ui_obs::palette::Red;
+    } else if (is_ana) {
+        status_label = "ANALYZING";
+        status_col = ui_obs::palette::Cyan;
+    } else if (is_live) {
+        status_label = sdr_.is_simulated()
+            ? (compact_status ? "SIM RX" : "SIMULATED RX")
+            : (compact_status ? "LIVE"   : "RTL-SDR LIVE");
+        status_col = sdr_.is_simulated() ? ui_obs::palette::Amber : ui_obs::palette::Emerald;
+    }
+
+    float right_limit = win_pos.x + width - ui_obs::dp(14.0f);
+    {
+        ui_obs::ScopedFont st_f(fonts_.mono, 12.0f);
+        const ImVec2 tsz = ImGui::CalcTextSize(status_label);
+        const float dot_r = ui_obs::dp(3.5f);
+        const float right_x = win_pos.x + width - ui_obs::dp(14.0f);
+        const float text_x = right_x - tsz.x;
+        const float dot_x = text_x - dot_r - ui_obs::dp(7.0f);
+        right_limit = dot_x - dot_r - ui_obs::dp(12.0f);
+        dl->AddCircleFilled(ImVec2(dot_x, mid_y), dot_r, ui_obs::palette::U32(status_col), 12);
+        dl->AddText(ImVec2(text_x, mid_y - tsz.y * 0.5f - 0.5f),
+                    ui_obs::palette::U32(ui_obs::palette::TextPrimary), status_label);
+    }
+
+    // 3. Center Animated Segmented Mode Switcher
     const AppSection active_sec = state_.get_section();
     const int active_tab = (active_sec == AppSection::Record) ? 0 : 1;
+    const bool compact_tabs = (width < ui_obs::dp(880.0f));
 
     const float seg_h = ui_obs::dp(34.0f);
     const float icon_slot = ui_obs::dp(22.0f);
-    const float pad_side = ui_obs::dp(14.0f);
-    const char* label_rec = "1. Live SDR & Record";
-    const char* label_ana = "2. H I Scientific Analysis";
+    const float pad_side = compact_tabs ? ui_obs::dp(10.0f) : ui_obs::dp(14.0f);
+    const char* label_rec = compact_tabs ? "1. Live SDR"     : "1. Live SDR & Record";
+    const char* label_ana = compact_tabs ? "2. H I Analysis" : "2. H I Scientific Analysis";
     float w_rec = 0.0f, w_ana = 0.0f;
     {
         ui_obs::ScopedFont seg_f(fonts_.semibold, 14.5f);
@@ -188,7 +224,9 @@ void AppGui::render_top_navigation_bar(float width, float height) {
     const float gap = ui_obs::dp(4.0f);
     const float inner_pad = ui_obs::dp(3.0f);
     const float trough_w = w_rec + w_ana + gap + inner_pad * 2.0f;
-    const float tabs_x = std::max(brand_right_local + ui_obs::dp(28.0f), (width - trough_w) * 0.5f);
+    const float min_tabs_x = brand_right_local + ui_obs::dp(18.0f);
+    const float max_tabs_x = std::max(min_tabs_x, (right_limit - win_pos.x) - trough_w);
+    const float tabs_x = std::clamp((width - trough_w) * 0.5f, min_tabs_x, max_tabs_x);
 
     const ImVec2 tr_min(win_pos.x + tabs_x, win_pos.y + (height - seg_h) * 0.5f);
     const ImVec2 tr_max(tr_min.x + trough_w, tr_min.y + seg_h);
@@ -212,6 +250,7 @@ void AppGui::render_top_navigation_bar(float width, float height) {
         *anim_x += (target_x - *anim_x) * k;
         *anim_w += (target_w - *anim_w) * k;
     }
+    *anim_x = std::clamp(*anim_x, slot0_x, slot1_x);
 
     const ImVec2 pill_min(*anim_x, tr_min.y + inner_pad);
     const ImVec2 pill_max(*anim_x + *anim_w, tr_max.y - inner_pad);
@@ -222,7 +261,7 @@ void AppGui::render_top_navigation_bar(float width, float height) {
                       ui_obs::palette::U32(ui_obs::palette::AccentBlue), ui_obs::dp(1.5f), ImDrawFlags_RoundAll);
 
     auto draw_seg_slot = [&](const char* btn_id, const char* label, float abs_x, float slot_w,
-                             bool selected, bool is_rec) -> bool {
+                             bool selected, bool is_rec_tab) -> bool {
         const float slot_h = seg_h - inner_pad * 2.0f;
         ImGui::SetCursorScreenPos(ImVec2(abs_x, tr_min.y + inner_pad));
         const bool clicked = ImGui::InvisibleButton(btn_id, ImVec2(slot_w, slot_h));
@@ -244,7 +283,7 @@ void AppGui::render_top_navigation_bar(float width, float height) {
         const float cx = abs_x + (slot_w - content_w) * 0.5f;
         const float cy = tr_min.y + seg_h * 0.5f;
 
-        if (is_rec) {
+        if (is_rec_tab) {
             ui_obs::icons::draw_dish(dl, ImVec2(cx + ui_obs::dp(8.0f), cy), ui_obs::dp(7.0f), fg);
         } else {
             ui_obs::icons::draw_spectrum_peak(dl, ImVec2(cx + ui_obs::dp(8.0f), cy), ui_obs::dp(7.5f), fg);
@@ -258,38 +297,6 @@ void AppGui::render_top_navigation_bar(float width, float height) {
     }
     if (draw_seg_slot("##TabAna", label_ana, slot1_x, w_ana, active_tab == 1, false)) {
         state_.set_section(AppSection::Analyze);
-    }
-
-    // 3. Right Global Status Indicator (clean flat dot + monospace text, no heavy glow pill)
-    const bool is_rec = state_.is_recording_active();
-    const bool is_ana = analyze_panel_.is_analyzing();
-    const bool is_live = sdr_.is_streaming();
-
-    const char* status_label = "IDLE";
-    ImVec4 status_col = ui_obs::palette::TextMuted;
-    if (is_rec) {
-        status_label = "REC ACTIVE";
-        status_col = ui_obs::palette::Red;
-    } else if (is_ana) {
-        status_label = "ANALYZING";
-        status_col = ui_obs::palette::Cyan;
-    } else if (is_live) {
-        status_label = sdr_.is_simulated() ? "SIMULATED RX" : "RTL-SDR LIVE";
-        status_col = sdr_.is_simulated() ? ui_obs::palette::Amber : ui_obs::palette::Emerald;
-    }
-
-    {
-        ui_obs::ScopedFont st_f(fonts_.mono, 12.0f);
-        const ImVec2 tsz = ImGui::CalcTextSize(status_label);
-        const float dot_r = ui_obs::dp(3.5f);
-        const float right_x = win_pos.x + width - ui_obs::dp(14.0f);
-        const float text_x = right_x - tsz.x;
-        const float dot_x = text_x - dot_r - ui_obs::dp(7.0f);
-        if (dot_x - dot_r > tr_max.x + ui_obs::dp(14.0f)) {
-            dl->AddCircleFilled(ImVec2(dot_x, mid_y), dot_r, ui_obs::palette::U32(status_col), 12);
-            dl->AddText(ImVec2(text_x, mid_y - tsz.y * 0.5f - 0.5f),
-                        ui_obs::palette::U32(ui_obs::palette::TextPrimary), status_label);
-        }
     }
 
     ImGui::EndChild();
@@ -362,7 +369,7 @@ void AppGui::render_status_bar(float width, float height) {
             right_cursor -= ui_obs::dp(6.0f);
             char ram_buf[32];
             std::snprintf(ram_buf, sizeof(ram_buf), "RAM %zu MB", poll_process_memory_mb());
-            draw_seg_right(right_cursor, ram_buf, ui_obs::palette::TextMuted, true);
+            draw_seg_right(right_cursor, ram_buf, ui_obs::palette::TextMuted, width > ui_obs::dp(820.0f));
         }
 
         if (width > ui_obs::dp(820.0f)) {
@@ -420,6 +427,7 @@ void AppGui::render_status_bar(float width, float height) {
             const char* mode_lbl = is_ana ? "PROCESSING" : "READY";
             const ImVec4 mode_col = is_ana ? ui_obs::palette::Cyan : ui_obs::palette::Emerald;
             draw_seg_left(mode_lbl, ui_obs::palette::TextPrimary, true, mode_col);
+            draw_seg_left("Wheel: Zoom X | Shift+Wheel: Y | R-Drag: Box Zoom | L-Drag: Pan | Dbl-Click/R: Reset", ui_obs::palette::TextMuted);
         }
     }
 

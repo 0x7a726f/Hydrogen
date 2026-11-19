@@ -62,8 +62,9 @@ int main() {
     std::cout << "\n[Step 1] Initializing SDR Controller in Record Mode (Virtual HI Simulator)...\n";
     ASSERT_EQ(app_state.get_section(), AppSection::Record, "State starts in Record section");
 
-    SdrController sdr;
+    // Declare writer BEFORE sdr so sdr is always shut down and destroyed before writer
     Cs16Writer writer(test_dir);
+    SdrController sdr;
 
     sdr.add_sample_callback([&writer](const uint8_t* data, size_t len) {
         writer.feed_samples(data, len);
@@ -77,9 +78,9 @@ int main() {
     uint32_t sample_rate_hz = 2400000;       // 2.4 MSPS
     float gain_db = 25.4f;
 
-    sdr.request_frequency(center_freq_hz);
-    sdr.request_sample_rate(sample_rate_hz);
-    sdr.request_gain(gain_db, false);
+    sdr.request_frequency(center_freq_hz).wait();
+    sdr.request_sample_rate(sample_rate_hz).wait();
+    sdr.request_gain(gain_db, false).wait();
 
     // Register active recording in AppState
     app_state.set_recording_active(true, test_cs16_file);
@@ -105,8 +106,10 @@ int main() {
     }
 
     sdr.stop_streaming();
+    sdr.clear_sample_callbacks();
     writer.stop_recording();
     sdr.shutdown();
+    ASSERT_FALSE(writer.has_io_error(), "Cs16Writer completed recording without I/O error");
 
     // Release recording state in AppState
     app_state.set_recording_active(false, "");
@@ -225,11 +228,12 @@ int main() {
     }
 
     double slope = 0.0, intercept = 0.0;
-    BaselineFitter::refine_local(v_kms, cal_k, cal_db, config, slope, intercept);
+    const auto* pb_mask = baseline.effective_passband_mask.empty() ? nullptr : &baseline.effective_passband_mask;
+    BaselineFitter::refine_local(v_kms, cal_k, cal_db, config, slope, intercept, pb_mask);
 
     // 4.6 Astrophysical Metrics & Gaussian Curve Fit
     AstrophysicalMetrics metrics = Astrophysics::calculate_metrics(
-        stream.freq_mhz, v_kms, cal_k, cal_db, config
+        stream.freq_mhz, v_kms, cal_k, cal_db, config, pb_mask
     );
 
     // 4.7 Publication-Grade PNG & CSV Export
@@ -274,8 +278,11 @@ int main() {
     // Doppler velocity should be physically reasonable (|v| < 100 km/s for local HI)
     ASSERT_TRUE(std::abs(metrics.peak_vel_kms) < 100.0, "Doppler velocity is within physical galactic envelope");
 
-    // SNR should demonstrate unambiguous detection
+    // SNR & matched-filter detection gate should confirm unambiguous 21cm H I detection
+    ASSERT_TRUE(metrics.is_detected, "Detection gate confirms H I 21cm line detection (is_detected == true)");
     ASSERT_TRUE(metrics.snr >= 1.5, "Detection SNR indicates statistically significant detection (>= 1.5 sigma)");
+    ASSERT_TRUE(metrics.snr_matched >= config.detection_snr_threshold,
+                "Matched-filter SNR exceeds detection threshold");
 
     // Integrated flux must be positive
     ASSERT_TRUE(metrics.integrated_flux_k_kms > 0.0, "Integrated flux is positive");
@@ -303,6 +310,17 @@ int main() {
         uint64_t sz = exists ? std::filesystem::file_size(art) : 0;
         std::cout << "  Artifact: " << art << " [" << (exists ? "OK" : "MISSING") << ", " << sz << " bytes]\n";
         ASSERT_TRUE(exists && sz > 0, "Artifact exists and has non-zero size: " + art);
+    }
+
+    // Verify new JSON report fields
+    {
+        std::ifstream rifs(output_dir + "/analysis_report.json");
+        std::string rtxt((std::istreambuf_iterator<char>(rifs)), std::istreambuf_iterator<char>());
+        ASSERT_TRUE(rtxt.find("\"is_detected\": true") != std::string::npos,
+                    "JSON report exports confirmed is_detected == true");
+        ASSERT_TRUE(rtxt.find("\"snr_matched\":") != std::string::npos &&
+                    rtxt.find("\"baseline_quality_ratio\":") != std::string::npos,
+                    "JSON report exports matched-filter SNR and baseline quality diagnostics");
     }
 
     // Cleanup test artifacts
