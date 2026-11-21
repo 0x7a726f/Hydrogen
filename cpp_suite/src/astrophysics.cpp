@@ -2197,6 +2197,12 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
     double best_vel_kms = m.peak_vel_kms;
     bool has_mf_eval = false;
 
+    // Normalize single-bin thermal noise to reference velocity resolution dv_ref = 0.125 km/s
+    // (N_fft = 4096 @ 2.4 MSPS) so gap-interpolation uncertainty and amplitude floor are resolution-invariant.
+    const double dv_norm_factor = std::sqrt(std::min(1.0, dv / 0.125));
+    const double sigma_th_norm_k = m.thermal_noise_std_k * dv_norm_factor;
+    const double eff_noise_norm_k = std::max(sigma_th_norm_k, std::hypot(sigma_th_norm_k, m.baseline_sys_error_k));
+
     if (v_hi.size() >= 3) {
         const size_t m_hi = v_hi.size();
         const double sigma_th2_fcorr = m.thermal_noise_std_k * m.thermal_noise_std_k * m.window_corr_factor;
@@ -2228,7 +2234,7 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
 
             const double template_fwhm_kms = GAUSSIAN_SIGMA_TO_FWHM * s_kms;
             const double gap_coupling = std::clamp(template_fwhm_kms / std::max(10.0, 0.5 * hi_span_kms), 0.15, 1.5);
-            const double sigma_gap = 0.42 * std::max(m.thermal_noise_std_k, m.off_line_rms_k) * gap_coupling;
+            const double sigma_gap = 0.42 * eff_noise_norm_k * gap_coupling;
             const double sigma_coherent2 = sigma_base2 + sigma_gap * sigma_gap;
 
             auto eval_center = [&](int c, double& out_amp, double& out_snr) {
@@ -2325,7 +2331,11 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
     const double eff_noise_k = std::max(m.thermal_noise_std_k, m.off_line_rms_k);
     const double model_amp_k = std::max(m.gauss_fit.amplitude_k, m.peak_temp_smoothed_k);
     const bool amp_above_floor = (eff_noise_k <= 1e-6) ||
-                                 (model_amp_k >= 2.85 * eff_noise_k && m.snr_single_bin >= 3.8);
+                                 (model_amp_k >= 2.85 * eff_noise_norm_k &&
+                                  (m.snr_single_bin >= 3.8 || (m.peak_temp_k >= 3.8 * eff_noise_norm_k))) ||
+                                 (m.snr_matched >= std::max(6.0, config.detection_snr_threshold + 1.5) &&
+                                  m.gauss_fit.delta_bic > 20.0 &&
+                                  model_amp_k >= 1.8 * eff_noise_norm_k);
     m.is_detected = (m.snr_matched >= config.detection_snr_threshold) &&
                     amp_above_floor &&
                     m.gauss_fit.success &&

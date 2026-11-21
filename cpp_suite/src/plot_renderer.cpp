@@ -962,10 +962,11 @@ bool PlotRenderer::render_calibrated_spectrum(
     for (char c : hud_str) {
         if (c == '\n') ++num_lines;
     }
-    const int hud_x = left + 16;
-    const int hud_y = top + 16;
     const int hud_w = std::min(plot_w - 32, std::max(360, canvas.measure_text_width(hud_str, 1) + 24));
     const int hud_h = std::min(plot_h - 32, num_lines * 14 + 20);
+    const bool peak_on_left = (safe_val(metrics.peak_vel_kms) < 0.5 * (v_min + v_max));
+    const int hud_x = peak_on_left ? (right - hud_w - 16) : (left + 16);
+    const int hud_y = top + 16;
     canvas.fill_rect_alpha(hud_x, hud_y, hud_w, hud_h, PixelColor(30, 39, 46, 232));
     canvas.draw_rect(hud_x, hud_y, hud_w, hud_h,
                      metrics.is_detected ? PixelColor(16, 185, 129) : PixelColor(0, 210, 211), 1);
@@ -1156,15 +1157,45 @@ bool PlotRenderer::render_raw_and_baseline(
                           xa, map_y1(base_db[i - 1]), xb, map_y1(base_db[i]), PixelColor(255, 159, 67), 2);
     }
 
-    // Bottom panel: Flattened Residuals (Emerald green) - clipped to plot box
+    // Bottom panel: Flattened Residuals (Emerald green) + +/-1 sigma off-line RMS envelope
     const int y2_zero = std::clamp(map_y2(0.0), top2, bottom2);
     canvas.draw_line(left, y2_zero, right, y2_zero, PixelColor(139, 148, 158), 1);
+    if (off_line_rms_db > 1e-5) {
+        const int y_sig_hi = map_y2(+off_line_rms_db);
+        const int y_sig_lo = map_y2(-off_line_rms_db);
+        if (y_sig_hi > top2 && y_sig_hi < bottom2) {
+            for (int x = left; x < right; x += 10) {
+                canvas.draw_line(x, y_sig_hi, std::min(right, x + 5), y_sig_hi, PixelColor(0, 210, 211), 1);
+            }
+        }
+        if (y_sig_lo > top2 && y_sig_lo < bottom2) {
+            for (int x = left; x < right; x += 10) {
+                canvas.draw_line(x, y_sig_lo, std::min(right, x + 5), y_sig_lo, PixelColor(0, 210, 211), 1);
+            }
+        }
+    }
     for (size_t i = 1; i < n; ++i) {
         if (!std::isfinite(freqs_mhz[i - 1]) || !std::isfinite(freqs_mhz[i])) continue;
         const int xa = map_x(freqs_mhz[i - 1]);
         const int xb = map_x(freqs_mhz[i]);
         draw_clipped_line(canvas, left, top2, right, bottom2,
                           xa, map_y2(flat_db[i - 1]), xb, map_y2(flat_db[i]), PixelColor(29, 209, 161), 1);
+    }
+
+    // Top-right compact color legend pill in top passband subplot
+    {
+        const int leg_w = 278;
+        const int leg_h = 24;
+        const int leg_x = right - leg_w - 12;
+        const int leg_y = top1 + 8;
+        canvas.fill_rect_alpha(leg_x, leg_y, leg_w, leg_h, PixelColor(15, 20, 25, 220));
+        canvas.draw_rect(leg_x, leg_y, leg_w, leg_h, PixelColor(48, 54, 61), 1);
+        canvas.draw_line(leg_x + 10, leg_y + 12, leg_x + 24, leg_y + 12, PixelColor(84, 160, 255), 2);
+        canvas.draw_text(leg_x + 28, leg_y + 8, "Raw PSD", PixelColor(210, 218, 226), 1);
+        canvas.draw_line(leg_x + 96, leg_y + 12, leg_x + 110, leg_y + 12, PixelColor(255, 159, 67), 2);
+        canvas.draw_text(leg_x + 114, leg_y + 8, "Baseline", PixelColor(210, 218, 226), 1);
+        canvas.draw_line(leg_x + 186, leg_y + 12, leg_x + 200, leg_y + 12, PixelColor(0, 210, 211), 2);
+        canvas.draw_text(leg_x + 204, leg_y + 8, "HI 21cm", PixelColor(210, 218, 226), 1);
     }
 
     // Re-stroke borders cleanly on top
@@ -1183,7 +1214,7 @@ bool PlotRenderer::render_raw_and_baseline(
     canvas.draw_text(left, 48, sub.str(), PixelColor(164, 176, 190), 1);
 
     canvas.draw_text(left + 14, top1 + 10, "Raw Averaged Spectrum (Blue) vs Baseline Model (Orange)", PixelColor(210, 218, 226), 1);
-    canvas.draw_text(left + 14, top2 + 10, "Flattened Residual Spectrum (P_raw - P_base, dB)", PixelColor(29, 209, 161), 1);
+    canvas.draw_text(left + 14, top2 + 10, "Flattened Residual Spectrum (P_raw - P_base, dB, +/-1 sigma dashed)", PixelColor(29, 209, 161), 1);
 
     canvas.draw_text(8, top1 - 20, "Power (dB)", PixelColor(84, 160, 255), 1);
     canvas.draw_text(8, top2 - 20, "Delta (dB)", PixelColor(29, 209, 161), 1);

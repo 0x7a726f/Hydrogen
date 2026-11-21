@@ -127,7 +127,10 @@ struct QuadSwatch {
 static void draw_quad_header(ImDrawList* dl, ImFont* semibold, ImFont* regular,
                              const char* title, const QuadSwatch* items, int count,
                              ui_obs::PlotZoomState* zoom_to_reset = nullptr,
-                             const char* reset_id = nullptr) {
+                             const char* reset_id = nullptr,
+                             int* out_open_tab = nullptr,
+                             int target_tab_idx = -1,
+                             const char* tab_btn_id = nullptr) {
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const float avail_w = ImGui::GetContentRegionAvail().x;
     float row_h = ui_obs::dp(18.0f);
@@ -141,6 +144,34 @@ static void draw_quad_header(ImDrawList* dl, ImFont* semibold, ImFont* regular,
     }
 
     float rx = pos.x + avail_w;
+
+    // Optional clickable [Tab] chip to jump to full-screen tab preserving current zoom
+    if (out_open_tab && target_tab_idx >= 0 && tab_btn_id) {
+        ui_obs::ScopedFont rf(semibold, 10.5f);
+        const char* t_lbl = "Expand";
+        const ImVec2 tsz = ImGui::CalcTextSize(t_lbl);
+        const float bw = tsz.x + ui_obs::dp(10.0f);
+        const float bh = row_h - ui_obs::dp(2.0f);
+        rx -= bw;
+        if (rx > title_right + ui_obs::dp(8.0f)) {
+            const ImVec2 bmin(rx, pos.y + ui_obs::dp(1.0f));
+            const ImVec2 bmax(rx + bw, bmin.y + bh);
+            ImGui::SetCursorScreenPos(bmin);
+            if (ImGui::InvisibleButton(tab_btn_id, ImVec2(bw, bh))) {
+                *out_open_tab = target_tab_idx;
+            }
+            const bool hov = ImGui::IsItemHovered();
+            if (hov) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("Open this plot in full-screen tab view (preserves zoom)");
+            }
+            dl->AddRectFilled(bmin, bmax, ui_obs::palette::U32(ui_obs::palette::AccentBlue, hov ? 0.28f : 0.14f), ui_obs::dp(3.0f));
+            dl->AddRect(bmin, bmax, ui_obs::palette::U32(ui_obs::palette::AccentBlue, 0.55f), ui_obs::dp(3.0f), 1.0f, ImDrawFlags_RoundAll);
+            dl->AddText(ImVec2(bmin.x + ui_obs::dp(5.0f), bmin.y + (bh - tsz.y) * 0.5f),
+                        ui_obs::palette::U32(ui_obs::palette::TextPrimary), t_lbl);
+        }
+        rx -= ui_obs::dp(6.0f);
+    }
 
     // Optional clickable Reset chip when quadrant is zoomed
     if (zoom_to_reset && zoom_to_reset->is_zoomed() && reset_id) {
@@ -477,6 +508,8 @@ StreamCacheKey UiAnalyzePanel::current_stream_key() const {
     key.sample_rate_msps = ui_sample_rate_msps_;
     key.fft_size_idx = ui_fft_size_idx_;
     key.duration_s = ui_duration_s_;
+    key.window = config_.window;
+    key.enable_welch_overlap = config_.enable_welch_overlap;
     return key;
 }
 
@@ -594,7 +627,7 @@ std::shared_ptr<AnalysisSnapshot> UiAnalyzePanel::run_post_processing(
     snap->rfi_mitigated_bins = num_rfi;
 
     snap->raw_db.resize(n);
-    SimdDsp::power_to_db_f64(snap->rfi_clean_power.data(), snap->raw_db.data(), n);
+    SimdDsp::power_to_db_f64(snap->rfi_clean_power.data(), snap->raw_db.data(), n, 1e-30);
 
     auto base_res = BaselineFitter::fit(snap->rfi_clean_power, snap->freq_mhz, run_cfg);
     snap->baseline_power = std::move(base_res.baseline_power);
@@ -1612,9 +1645,9 @@ void UiAnalyzePanel::render_sidebar_controls(float width, float height, const st
             param_gap();
             param_label("Polynomial Degree");
             ImGui::SetNextItemWidth(-1.0f);
-            ui_obs::widgets::SliderIntAccent("##PolyDeg", &ui_poly_deg_, 3, 16, "Deg %d",
-                                             ui_obs::palette::Orange, 0, true, 10);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Chebyshev QR continuum polynomial order. Right-click resets to 10.");
+            ui_obs::widgets::SliderIntAccent("##PolyDeg", &ui_poly_deg_, 3, 20, "Deg %d",
+                                             ui_obs::palette::Orange, 0, true, 12);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Chebyshev QR continuum polynomial order (3..20). Right-click resets to 12.");
         } else if (ui_baseline_idx_ == 4) {
             param_gap();
             param_label("Continuum Order");
@@ -2179,13 +2212,14 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
         dl->AddCircle(ImVec2(px, py), ui_obs::dp(4.2f), IM_COL32(255, 255, 255, 220), 16, 1.1f);
     }
 
-    // 6. Smart Fit Summary Card (full mode only, auto-placed opposite peak & clear of top-right toolbar)
+    // 6. Smart Fit Summary Card (full mode only, auto-placed opposite peak & guaranteed clear of top-right toolbar)
     if (!compact && vp.plot_w > ui_obs::dp(340.0f) && vp.plot_h > ui_obs::dp(180.0f)) {
-        const float cw = ui_obs::dp(212.0f);
-        const float ch = ui_obs::dp(128.0f);
+        const float cw = ui_obs::dp(224.0f);
+        const float ch = ui_collapse_fit_card_ ? ui_obs::dp(24.0f) : ui_obs::dp(130.0f);
         const bool peak_on_left = (pk_v < 0.5 * (x_min + x_max));
+        const bool clear_toolbar = peak_on_left || (vp.plot_w < ui_obs::dp(520.0f));
         const float cx = peak_on_left ? (vp.plot_max.x - cw - ui_obs::dp(10.0f)) : (vp.plot_min.x + ui_obs::dp(10.0f));
-        const float cy = peak_on_left ? (vp.plot_min.y + ui_obs::dp(36.0f)) : (vp.plot_min.y + ui_obs::dp(10.0f));
+        const float cy = clear_toolbar ? (vp.plot_min.y + ui_obs::dp(36.0f)) : (vp.plot_min.y + ui_obs::dp(10.0f));
         const ImVec2 cmin(cx, cy), cmax(cx + cw, cy + ch);
 
         dl->AddRectFilled(cmin, cmax, ui_obs::palette::CardBg32, ui_obs::dp(4.0f));
@@ -2195,75 +2229,100 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
         const char* card_hdr = "PEAK H I ESTIMATE";
         if (gfit.success) {
             switch (gfit.method) {
-                case LineAnalysisMethod::DoubleGaussian:  card_hdr = "DOUBLE GAUSSIAN (2-ARM)"; break;
-                case LineAnalysisMethod::TripleGaussian:  card_hdr = "TRIPLE GAUSSIAN (3-ARM)"; break;
-                case LineAnalysisMethod::VoigtProfile:    card_hdr = "PSEUDO-VOIGT PROFILE"; break;
-                case LineAnalysisMethod::GaussHermite:    card_hdr = "GAUSS-HERMITE (h3/h4)"; break;
-                case LineAnalysisMethod::SpectralMoments: card_hdr = "SPECTRAL MOMENTS (M0-M2)"; break;
-                case LineAnalysisMethod::BusyFunction:    card_hdr = "BUSY FUNCTION (WESTMEIER)"; break;
-                default:                                  card_hdr = "GAUSSIAN H I FIT (L-M)"; break;
+                case LineAnalysisMethod::DoubleGaussian:  card_hdr = "DOUBLE GAUSS (2-ARM)"; break;
+                case LineAnalysisMethod::TripleGaussian:  card_hdr = "TRIPLE GAUSS (3-ARM)"; break;
+                case LineAnalysisMethod::VoigtProfile:    card_hdr = "PSEUDO-VOIGT FIT"; break;
+                case LineAnalysisMethod::GaussHermite:    card_hdr = "GAUSS-HERMITE FIT"; break;
+                case LineAnalysisMethod::SpectralMoments: card_hdr = "SPECTRAL MOMENTS"; break;
+                case LineAnalysisMethod::BusyFunction:    card_hdr = "BUSY FUNCTION FIT"; break;
+                default:                                  card_hdr = "GAUSSIAN H I FIT"; break;
             }
         }
         {
             ui_obs::ScopedFont hf(fonts_.semibold, 11.0f);
-            dl->AddText(ImVec2(cmin.x + ui_obs::dp(10.0f), cmin.y + ui_obs::dp(7.0f)),
+            dl->AddText(ImVec2(cmin.x + ui_obs::dp(10.0f), cmin.y + ui_obs::dp(6.0f)),
                         ui_obs::palette::U32(title_col), card_hdr);
         }
 
-        char v1[32], v2[32], v3[32], v4[32], v5[32], v6[32];
-        const char* k6 = "RMSE";
-        std::snprintf(v1, sizeof(v1), "%.2f K", gfit.success ? gfit.amplitude_k : snap->metrics.peak_temp_k);
-        std::snprintf(v2, sizeof(v2), "%+.2f km/s", gfit.success ? gfit.v_center_kms : snap->metrics.peak_vel_kms);
-        std::snprintf(v3, sizeof(v3), "%.2f km/s", snap->metrics.fwhm_kms);
-        std::snprintf(v4, sizeof(v4), "%.2f sigma", snap->metrics.snr);
-        std::snprintf(v5, sizeof(v5), "%.2e", snap->metrics.column_density_cm2);
-        if (gfit.method == LineAnalysisMethod::TripleGaussian && gfit.has_tertiary) {
-            k6 = "Arm2/3";
-            std::snprintf(v6, sizeof(v6), "%+.1f / %+.1f", gfit.v2_center_kms, gfit.v3_center_kms);
-        } else if ((gfit.method == LineAnalysisMethod::DoubleGaussian ||
-                    gfit.method == LineAnalysisMethod::TripleGaussian) && gfit.has_secondary) {
-            k6 = "Arm 2";
-            std::snprintf(v6, sizeof(v6), "%.1fK @ %+.1f", gfit.amp2_k, gfit.v2_center_kms);
-        } else if (gfit.method == LineAnalysisMethod::VoigtProfile) {
-            k6 = "Wings";
-            std::snprintf(v6, sizeof(v6), "eta=%.2f g=%.1f", gfit.voigt_eta, gfit.lorentz_gamma_kms);
-        } else if (gfit.method == LineAnalysisMethod::GaussHermite) {
-            k6 = "h3/h4";
-            std::snprintf(v6, sizeof(v6), "%+.2f / %+.2f", gfit.gh_h3, gfit.gh_h4);
-        } else if (gfit.method == LineAnalysisMethod::SpectralMoments) {
-            k6 = "M1/M2";
-            std::snprintf(v6, sizeof(v6), "%+.1f / %.1f", gfit.moment1_kms, gfit.moment2_sigma_kms);
-        } else if (gfit.method == LineAnalysisMethod::BusyFunction) {
-            k6 = "Busy";
-            std::snprintf(v6, sizeof(v6), "w=%.1f c=%.4f", gfit.busy_half_width_kms, gfit.busy_trough_c);
-        } else {
-            std::snprintf(v6, sizeof(v6), "%.3f K", gfit.rmse_k);
+        // 6-gate verdict micro-badge in top-right of Fit Card header
+        {
+            const bool is_det = snap->metrics.is_detected;
+            const bool is_weak = (!is_det && snap->metrics.snr_matched >= 3.0);
+            const char* gate_txt = is_det ? "CONFIRMED" : (is_weak ? "WEAK" : "NOISE");
+            const ImVec4 gate_col = is_det ? ui_obs::palette::Emerald
+                                  : (is_weak ? ui_obs::palette::Amber : ui_obs::palette::Red);
+            ui_obs::ScopedFont bf(fonts_.semibold, 9.5f);
+            const ImVec2 gsz = ImGui::CalcTextSize(gate_txt);
+            const float gw = gsz.x + ui_obs::dp(8.0f);
+            const float gh = ui_obs::dp(14.0f);
+            const ImVec2 gmin(cmax.x - gw - ui_obs::dp(8.0f), cmin.y + ui_obs::dp(5.0f));
+            const ImVec2 gmax(gmin.x + gw, gmin.y + gh);
+            dl->AddRectFilled(gmin, gmax, ui_obs::palette::U32(gate_col, 0.18f), ui_obs::dp(3.0f));
+            dl->AddRect(gmin, gmax, ui_obs::palette::U32(gate_col, 0.60f), ui_obs::dp(3.0f), 1.0f, ImDrawFlags_RoundAll);
+            dl->AddText(ImVec2(gmin.x + ui_obs::dp(4.0f), gmin.y + (gh - gsz.y) * 0.5f),
+                        ui_obs::palette::U32(gate_col), gate_txt);
         }
 
-        const ImVec4 snr_c = snap->metrics.is_detected ? ui_obs::palette::Emerald
-                           : (snap->metrics.snr_matched >= 3.0 ? ui_obs::palette::Amber : ui_obs::palette::Red);
-        const struct { const char* k; const char* v; ImU32 c; } rows[6] = {
-            {"Amp",   v1, ui_obs::palette::TextPrimary32},
-            {"V_LSR", v2, ui_obs::palette::TextPrimary32},
-            {"FWHM",  v3, ui_obs::palette::TextPrimary32},
-            {k6,      v6, ui_obs::palette::U32(ui_obs::palette::Orange)},
-            {"SNR",   v4, ui_obs::palette::U32(snr_c)},
-            {"N_HI",  v5, ui_obs::palette::TextPrimary32}
-        };
+        if (!ui_collapse_fit_card_) {
+            char v1[32], v2[32], v3[32], v4[36], v5[32], v6[32];
+            const char* k6 = "RMSE";
+            std::snprintf(v1, sizeof(v1), "%.2f K", gfit.success ? gfit.amplitude_k : snap->metrics.peak_temp_k);
+            std::snprintf(v2, sizeof(v2), "%+.2f km/s", gfit.success ? gfit.v_center_kms : snap->metrics.peak_vel_kms);
+            std::snprintf(v3, sizeof(v3), "%.2f km/s", snap->metrics.fwhm_kms);
+            if (gfit.success && std::isfinite(gfit.delta_bic)) {
+                std::snprintf(v4, sizeof(v4), "%.1fs (BIC%+.0f)", snap->metrics.snr, gfit.delta_bic);
+            } else {
+                std::snprintf(v4, sizeof(v4), "%.2f sigma", snap->metrics.snr);
+            }
+            std::snprintf(v5, sizeof(v5), "%.2e", snap->metrics.column_density_cm2);
+            if (gfit.method == LineAnalysisMethod::TripleGaussian && gfit.has_tertiary) {
+                k6 = "Arm2/3";
+                std::snprintf(v6, sizeof(v6), "%+.1f / %+.1f", gfit.v2_center_kms, gfit.v3_center_kms);
+            } else if ((gfit.method == LineAnalysisMethod::DoubleGaussian ||
+                        gfit.method == LineAnalysisMethod::TripleGaussian) && gfit.has_secondary) {
+                k6 = "Arm 2";
+                std::snprintf(v6, sizeof(v6), "%.1fK @ %+.1f", gfit.amp2_k, gfit.v2_center_kms);
+            } else if (gfit.method == LineAnalysisMethod::VoigtProfile) {
+                k6 = "Wings";
+                std::snprintf(v6, sizeof(v6), "eta=%.2f g=%.1f", gfit.voigt_eta, gfit.lorentz_gamma_kms);
+            } else if (gfit.method == LineAnalysisMethod::GaussHermite) {
+                k6 = "h3/h4";
+                std::snprintf(v6, sizeof(v6), "%+.2f / %+.2f", gfit.gh_h3, gfit.gh_h4);
+            } else if (gfit.method == LineAnalysisMethod::SpectralMoments) {
+                k6 = "M1/M2";
+                std::snprintf(v6, sizeof(v6), "%+.1f / %.1f", gfit.moment1_kms, gfit.moment2_sigma_kms);
+            } else if (gfit.method == LineAnalysisMethod::BusyFunction) {
+                k6 = "Busy";
+                std::snprintf(v6, sizeof(v6), "w=%.1f c=%.4f", gfit.busy_half_width_kms, gfit.busy_trough_c);
+            } else {
+                std::snprintf(v6, sizeof(v6), "%.3f K", gfit.rmse_k);
+            }
 
-        float ry = cmin.y + ui_obs::dp(25.0f);
-        const float row_h = ui_obs::dp(16.0f);
-        for (int r = 0; r < 6; ++r) {
-            {
-                ui_obs::ScopedFont uf(fonts_.regular, 12.0f);
-                dl->AddText(ImVec2(cmin.x + ui_obs::dp(10.0f), ry), ui_obs::palette::TextMuted32, rows[r].k);
+            const ImVec4 snr_c = snap->metrics.is_detected ? ui_obs::palette::Emerald
+                               : (snap->metrics.snr_matched >= 3.0 ? ui_obs::palette::Amber : ui_obs::palette::Red);
+            const struct { const char* k; const char* v; ImU32 c; } rows[6] = {
+                {"Amp",   v1, ui_obs::palette::TextPrimary32},
+                {"V_LSR", v2, ui_obs::palette::TextPrimary32},
+                {"FWHM",  v3, ui_obs::palette::TextPrimary32},
+                {k6,      v6, ui_obs::palette::U32(ui_obs::palette::Orange)},
+                {"SNR",   v4, ui_obs::palette::U32(snr_c)},
+                {"N_HI",  v5, ui_obs::palette::TextPrimary32}
+            };
+
+            float ry = cmin.y + ui_obs::dp(25.0f);
+            const float row_h = ui_obs::dp(16.0f);
+            for (int r = 0; r < 6; ++r) {
+                {
+                    ui_obs::ScopedFont uf(fonts_.regular, 12.0f);
+                    dl->AddText(ImVec2(cmin.x + ui_obs::dp(10.0f), ry), ui_obs::palette::TextMuted32, rows[r].k);
+                }
+                {
+                    ui_obs::ScopedFont mf(fonts_.mono, 12.0f);
+                    const ImVec2 vsz = ImGui::CalcTextSize(rows[r].v);
+                    dl->AddText(ImVec2(cmax.x - ui_obs::dp(10.0f) - vsz.x, ry), rows[r].c, rows[r].v);
+                }
+                ry += row_h;
             }
-            {
-                ui_obs::ScopedFont mf(fonts_.mono, 12.0f);
-                const ImVec2 vsz = ImGui::CalcTextSize(rows[r].v);
-                dl->AddText(ImVec2(cmax.x - ui_obs::dp(10.0f) - vsz.x, ry), rows[r].c, rows[r].v);
-            }
-            ry += row_h;
         }
     }
     dl->PopClipRect();
@@ -2290,7 +2349,15 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
 
     const auto ires = ui_obs::handle_plot_interaction(
         hit_id, origin, avail, vp.plot_min, vp.plot_max,
-        icfg, zoom, dl, fonts_.semibold, fonts_.mono);
+        icfg, zoom, dl, fonts_.semibold, fonts_.mono,
+        [&]() {
+            if (!compact) {
+                ImGui::MenuItem("Collapse Fit Summary Card", nullptr, &ui_collapse_fit_card_);
+            } else {
+                ImGui::MenuItem("Link 2x2 Dashboard X-Zoom", nullptr, &ui_link_dashboard_x_);
+            }
+        },
+        true);
 
     if (ires.hovered_plot && !ires.over_toolbar && !ires.box_active && !ires.context_open) {
         const ImVec2 mp = ImGui::GetIO().MousePos;
@@ -2441,6 +2508,15 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
         }
 
         const double lo_mhz = snap->config_used.center_freq_hz / 1e6;
+        const double dc_half_mhz = std::max(0.0, snap->config_used.dc_clear_hz * 0.5e-6);
+        if (dc_half_mhz > 0.0 && lo_mhz + dc_half_mhz >= x_min && lo_mhz - dc_half_mhz <= x_max) {
+            const float dx0 = std::clamp(vp.map_x(lo_mhz - dc_half_mhz), vp.plot_min.x, vp.plot_max.x);
+            const float dx1 = std::clamp(vp.map_x(lo_mhz + dc_half_mhz), vp.plot_min.x, vp.plot_max.x);
+            if (dx1 > dx0 + 1.0f) {
+                dl->AddRectFilled(ImVec2(dx0, vp.plot_min.y), ImVec2(dx1, vp.plot_max.y),
+                                  ui_obs::palette::U32(ui_obs::palette::Red, 0.10f));
+            }
+        }
         if (lo_mhz >= x_min && lo_mhz <= x_max) {
             const float lox = vp.map_x(lo_mhz);
             ui_obs::widgets::draw_dashed_vline(dl, lox, vp.plot_min.y, vp.plot_max.y,
@@ -2481,7 +2557,11 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
 
         const auto ires = ui_obs::handle_plot_interaction(
             hit_id, origin, avail, vp.plot_min, vp.plot_max,
-            icfg, zoom_top, dl, fonts_.semibold, fonts_.mono);
+            icfg, zoom_top, dl, fonts_.semibold, fonts_.mono,
+            [&]() {
+                ImGui::MenuItem("Link 2x2 Dashboard X-Zoom", nullptr, &ui_link_dashboard_x_);
+            },
+            true);
 
         if (ires.hovered_plot && !ires.over_toolbar && !ires.box_active && !ires.context_open) {
             const ImVec2 mp = ImGui::GetIO().MousePos;
@@ -2567,6 +2647,22 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
     draw_passband_overlays(vp_bot, false, false);
 
     dl->PushClipRect(vp_bot.plot_min, vp_bot.plot_max, true);
+    if (snap->base_off_line_rms_db > 1e-5) {
+        const double sig_db = snap->base_off_line_rms_db;
+        const float y_hi = std::clamp(vp_bot.map_y(+sig_db), vp_bot.plot_min.y, vp_bot.plot_max.y);
+        const float y_lo = std::clamp(vp_bot.map_y(-sig_db), vp_bot.plot_min.y, vp_bot.plot_max.y);
+        if (y_lo > y_hi + 1.0f) {
+            dl->AddRectFilled(ImVec2(vp_bot.plot_min.x, y_hi), ImVec2(vp_bot.plot_max.x, y_lo),
+                              ui_obs::palette::U32(ui_obs::palette::Cyan, 0.05f));
+        }
+        const ImU32 sig_col = ui_obs::palette::U32(ui_obs::palette::Cyan, 0.42f);
+        if (+sig_db > plot_y2_min && +sig_db < plot_y2_max) {
+            ui_obs::widgets::draw_dashed_hline(dl, vp_bot.plot_min.x, vp_bot.plot_max.x, vp_bot.map_y(+sig_db), sig_col, 1.0f, 4.0f, 4.0f);
+        }
+        if (-sig_db > plot_y2_min && -sig_db < plot_y2_max) {
+            ui_obs::widgets::draw_dashed_hline(dl, vp_bot.plot_min.x, vp_bot.plot_max.x, vp_bot.map_y(-sig_db), sig_col, 1.0f, 4.0f, 4.0f);
+        }
+    }
     if (plot_y2_min < 0.0 && plot_y2_max > 0.0) {
         const float zy = vp_bot.map_y(0.0);
         dl->AddLine(ImVec2(vp_bot.plot_min.x, zy), ImVec2(vp_bot.plot_max.x, zy),
@@ -2607,11 +2703,11 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
         "##RawTopHit", origin, ImVec2(avail.x, top_h), vp_top.plot_min, vp_top.plot_max,
         cfg_top, zoom_top, dl, fonts_.semibold, fonts_.mono);
 
-    if (res_top.x_changed || res_top.requested_reset) {
+    if (res_top.x_changed || res_top.requested_reset || res_top.requested_hi_focus || res_top.requested_full) {
         z_bot.x_active = zoom_top.x_active;
         z_bot.x_min = zoom_top.x_min;
         z_bot.x_max = zoom_top.x_max;
-        if (res_top.requested_reset) z_bot.y_manual = false;
+        if (res_top.requested_reset || res_top.requested_hi_focus || res_top.requested_full) z_bot.y_manual = false;
         z_bot.sync_active();
     }
 
@@ -2636,11 +2732,11 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
         "##RawBotHit", bot_origin, ImVec2(avail.x, bot_h), vp_bot.plot_min, vp_bot.plot_max,
         cfg_bot, z_bot, dl, fonts_.semibold, fonts_.mono);
 
-    if (res_bot.x_changed || res_bot.requested_reset) {
+    if (res_bot.x_changed || res_bot.requested_reset || res_bot.requested_hi_focus || res_bot.requested_full) {
         zoom_top.x_active = z_bot.x_active;
         zoom_top.x_min = z_bot.x_min;
         zoom_top.x_max = z_bot.x_max;
-        if (res_bot.requested_reset) zoom_top.y_manual = false;
+        if (res_bot.requested_reset || res_bot.requested_hi_focus || res_bot.requested_full) zoom_top.y_manual = false;
         zoom_top.sync_active();
     }
 
@@ -2659,13 +2755,26 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
 
         const double freq_h = show_top_xhair ? vp_top.unmap_x(mp.x) : vp_bot.unmap_x(mp.x);
         const size_t idx = find_nearest_index(snap->freq_mhz, freq_h);
+        const double f_bin = snap->freq_mhz[idx];
         const double raw_v = snap->raw_db[idx];
         const double base_v = has_base ? snap->baseline_db[idx] : 0.0;
         char b_f[32], b_r[32], b_b[32], b_d[32];
-        std::snprintf(b_f, sizeof(b_f), "%.4f MHz", snap->freq_mhz[idx]);
+        std::snprintf(b_f, sizeof(b_f), "%.4f MHz", f_bin);
         std::snprintf(b_r, sizeof(b_r), "%.2f dB",  raw_v);
         std::snprintf(b_b, sizeof(b_b), "%.2f dB",  base_v);
         std::snprintf(b_d, sizeof(b_d), "%+.3f dB", raw_v - base_v);
+
+        const double lo_mhz = snap->config_used.center_freq_hz / 1e6;
+        const double dc_half_mhz = std::max(0.0, snap->config_used.dc_clear_hz * 0.5e-6);
+        const bool in_skirt = (snap->effective_passband_mask.size() == n && snap->effective_passband_mask[idx] == 0);
+        const bool in_dc = (dc_half_mhz > 0.0 && std::abs(f_bin - lo_mhz) <= dc_half_mhz);
+        const bool in_hi = (std::abs(f_bin - HYDROGEN_REST_FREQ_MHZ) <= hi_hw);
+        const char* reg_hdr = in_skirt ? "IF SKIRT (TRIMMED)"
+                            : (in_dc   ? "DC NOTCH (EXCISED)"
+                            : (in_hi   ? "H I PROTECTED GAP" : "CLEAN PASSBAND"));
+        const ImVec4 reg_col = in_skirt ? ui_obs::palette::TextMuted
+                             : (in_dc   ? ui_obs::palette::Red
+                             : (in_hi   ? ui_obs::palette::Amber : ui_obs::palette::Orange));
 
         const ui_obs::widgets::TelemetryRow rows[4] = {
             {"Freq",  b_f, ui_obs::palette::U32(ui_obs::palette::Cyan)},
@@ -2676,8 +2785,8 @@ void UiAnalyzePanel::render_raw_baseline_plot(const std::shared_ptr<const Analys
         const ImVec2 b_min = show_top_xhair ? vp_top.plot_min : vp_bot.plot_min;
         const ImVec2 b_max = show_top_xhair ? vp_top.plot_max : vp_bot.plot_max;
         ui_obs::widgets::draw_crosshair_card(dl, mp, b_min, b_max,
-                                             "BANDPASS & BASELINE",
-                                             ui_obs::palette::U32(ui_obs::palette::Orange),
+                                             reg_hdr,
+                                             ui_obs::palette::U32(reg_col),
                                              rows, has_base ? 4 : 2, fonts_.regular, fonts_.mono);
     }
 }
@@ -3001,14 +3110,23 @@ void UiAnalyzePanel::render_tab_master_dashboard(ID3D11DeviceContext* ctx, const
     const float cell_w = std::floor((avail.x - sp.x) * 0.5f);
     const float cell_h = std::floor((avail.y - sp.y) * 0.5f);
 
+    int open_tab = -1;
+    int open_from_quad = -1;
     auto begin_quad = [&](const char* child_id, const char* title, const QuadSwatch* sw, int sw_count,
-                          ui_obs::PlotZoomState* z_ptr, const char* rst_id) {
+                          ui_obs::PlotZoomState* z_ptr, const char* rst_id,
+                          int target_tab, int quad_id, const char* exp_id) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::BgDeep);
         ImGui::PushStyleColor(ImGuiCol_Border, ui_obs::palette::BorderSubtle);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_obs::dp(8.0f), ui_obs::dp(6.0f)));
         ImGui::BeginChild(child_id, ImVec2(cell_w, cell_h), ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        draw_quad_header(ImGui::GetWindowDrawList(), fonts_.semibold, fonts_.regular, title, sw, sw_count, z_ptr, rst_id);
+        int clicked_tab = -1;
+        draw_quad_header(ImGui::GetWindowDrawList(), fonts_.semibold, fonts_.regular, title, sw, sw_count,
+                         z_ptr, rst_id, &clicked_tab, target_tab, exp_id);
+        if (clicked_tab >= 0) {
+            open_tab = clicked_tab;
+            open_from_quad = quad_id;
+        }
     };
     auto end_quad = [&]() {
         ImGui::EndChild();
@@ -3016,29 +3134,99 @@ void UiAnalyzePanel::render_tab_master_dashboard(ID3D11DeviceContext* ctx, const
         ImGui::PopStyleColor(2);
     };
 
+    auto snapshot_x = [](const ui_obs::PlotZoomState& z) {
+        struct XSnap { bool active; double xmin; double xmax; };
+        return XSnap{z.x_active, z.x_min, z.x_max};
+    };
+    const auto q1_before = snapshot_x(zoom_q1_raw_);
+    const auto q2_before = snapshot_x(zoom_q2_db_);
+    const auto q3_before = snapshot_x(zoom_q3_cal_);
+    const auto q4_before = snapshot_x(zoom_q4_wf_);
+
     const QuadSwatch q1_sw[2] = {{"Raw", ui_obs::palette::Cyan}, {"Base", ui_obs::palette::Orange}};
-    begin_quad("##Q1", "Q1: PASSBAND & BASELINE", q1_sw, 2, &zoom_q1_raw_, "##Q1Rst");
+    begin_quad("##Q1", "Q1: PASSBAND & BASELINE", q1_sw, 2, &zoom_q1_raw_, "##Q1Rst", 1, 1, "##Q1Exp");
     render_raw_baseline_plot(snap, ImGui::GetContentRegionAvail(), true, "##Q1RawHit", zoom_q1_raw_, nullptr);
     end_quad();
 
     ImGui::SameLine();
 
     const QuadSwatch q2_sw[2] = {{"+dB", ui_obs::palette::Emerald}, {"1420.4", ui_obs::palette::Amber}};
-    begin_quad("##Q2", "Q2: CALIBRATED H I (dB)", q2_sw, 2, &zoom_q2_db_, "##Q2Rst");
+    begin_quad("##Q2", "Q2: CALIBRATED H I (dB)", q2_sw, 2, &zoom_q2_db_, "##Q2Rst", 0, 2, "##Q2Exp");
     render_q2_calibrated_db_plot(snap, ImGui::GetContentRegionAvail(), "##Q2DbHit", zoom_q2_db_);
     end_quad();
 
     const QuadSwatch q3_sw[2] = {{"T_A", ui_obs::palette::Cyan}, {"Fit", ui_obs::palette::Pink}};
-    begin_quad("##Q3", "Q3: DOPPLER PROFILE (T_A)", q3_sw, 2, &zoom_q3_cal_, "##Q3Rst");
+    begin_quad("##Q3", "Q3: DOPPLER PROFILE (T_A)", q3_sw, 2, &zoom_q3_cal_, "##Q3Rst", 0, 3, "##Q3Exp");
     render_calibrated_spectrum_plot(snap, ImGui::GetContentRegionAvail(), true, "##Q3CalHit", zoom_q3_cal_);
     end_quad();
 
     ImGui::SameLine();
 
     const QuadSwatch q4_sw[1] = {{"5%-99.5%", ui_obs::palette::Amber}};
-    begin_quad("##Q4", "Q4: WATERFALL HISTORY", q4_sw, 1, &zoom_q4_wf_, "##Q4Rst");
+    begin_quad("##Q4", "Q4: WATERFALL HISTORY", q4_sw, 1, &zoom_q4_wf_, "##Q4Rst", 2, 4, "##Q4Exp");
     render_waterfall_view(ctx, ImGui::GetContentRegionAvail(), snap, "##Q4WfImg", zoom_q4_wf_, true);
     end_quad();
+
+    // Synchronize frequency/velocity X-zoom across Q1, Q2, Q3, and Q4 when linked
+    if (ui_link_dashboard_x_ && snap && snap->freq_mhz.size() >= 2) {
+        auto x_diff = [](const auto& before, const ui_obs::PlotZoomState& cur) {
+            return (before.active != cur.x_active) ||
+                   (cur.x_active && (std::abs(before.xmin - cur.x_min) > 1e-9 || std::abs(before.xmax - cur.x_max) > 1e-9));
+        };
+        auto apply_freq_to_all = [&](bool active, double f0, double f1) {
+            auto set_f = [&](ui_obs::PlotZoomState& z) {
+                z.x_active = active;
+                z.x_min = f0;
+                z.x_max = f1;
+                z.sync_active();
+            };
+            set_f(zoom_q1_raw_);
+            set_f(zoom_q2_db_);
+            set_f(zoom_q4_wf_);
+            if (!active) {
+                zoom_q3_cal_.x_active = false;
+                zoom_q3_cal_.sync_active();
+            } else {
+                const double v_a = SPEED_OF_LIGHT_KMS * (1.0 - f1 / HYDROGEN_REST_FREQ_MHZ);
+                const double v_b = SPEED_OF_LIGHT_KMS * (1.0 - f0 / HYDROGEN_REST_FREQ_MHZ);
+                zoom_q3_cal_.x_active = true;
+                zoom_q3_cal_.x_min = std::min(v_a, v_b);
+                zoom_q3_cal_.x_max = std::max(v_a, v_b);
+                zoom_q3_cal_.sync_active();
+            }
+        };
+
+        if (x_diff(q1_before, zoom_q1_raw_)) {
+            apply_freq_to_all(zoom_q1_raw_.x_active, zoom_q1_raw_.x_min, zoom_q1_raw_.x_max);
+        } else if (x_diff(q2_before, zoom_q2_db_)) {
+            apply_freq_to_all(zoom_q2_db_.x_active, zoom_q2_db_.x_min, zoom_q2_db_.x_max);
+        } else if (x_diff(q4_before, zoom_q4_wf_)) {
+            apply_freq_to_all(zoom_q4_wf_.x_active, zoom_q4_wf_.x_min, zoom_q4_wf_.x_max);
+        } else if (x_diff(q3_before, zoom_q3_cal_)) {
+            if (!zoom_q3_cal_.x_active) {
+                apply_freq_to_all(false, 0.0, 0.0);
+            } else {
+                const double f_a = HYDROGEN_REST_FREQ_MHZ * (1.0 - zoom_q3_cal_.x_max / SPEED_OF_LIGHT_KMS);
+                const double f_b = HYDROGEN_REST_FREQ_MHZ * (1.0 - zoom_q3_cal_.x_min / SPEED_OF_LIGHT_KMS);
+                apply_freq_to_all(true, std::min(f_a, f_b), std::max(f_a, f_b));
+            }
+        }
+    }
+
+    if (open_tab >= 0) {
+        pending_tab_select_ = open_tab;
+        if (open_from_quad == 1) {
+            zoom_raw_top_ = zoom_q1_raw_;
+            zoom_raw_bot_.x_active = zoom_q1_raw_.x_active;
+            zoom_raw_bot_.x_min = zoom_q1_raw_.x_min;
+            zoom_raw_bot_.x_max = zoom_q1_raw_.x_max;
+            zoom_raw_bot_.sync_active();
+        } else if (open_from_quad == 2 || open_from_quad == 3) {
+            zoom_cal_spec_ = zoom_q3_cal_;
+        } else if (open_from_quad == 4) {
+            zoom_waterfall_ = zoom_q4_wf_;
+        }
+    }
 }
 
 void UiAnalyzePanel::update_waterfall_texture(ID3D11DeviceContext* ctx, const std::shared_ptr<const AnalysisSnapshot>& snap) {

@@ -1834,7 +1834,9 @@ struct PlotViewport2D {
         bool sign = false;
         const char* sfx = "";
         parse_tick_fmt_hint(fmt, min_dec, sign, sfx);
-        const double step = std::abs(top_max - top_min) / static_cast<double>(ticks - 1);
+        const double span = top_max - top_min;
+        const double abs_span = std::abs(span);
+        const double nice_step = (abs_span > 1e-12) ? calc_nice_step(abs_span, std::max(2, ticks)) : 1.0;
 
         float tick_h = dp(12.0f);
         {
@@ -1843,21 +1845,52 @@ struct PlotViewport2D {
             const ImU32 text_col = palette::U32(palette::Cyan, 0.88f);
             const ImU32 tick_col = palette::U32(palette::Cyan, 0.55f);
             float last_label_right = plot_min.x + dp(10.0f);
-            for (int i = 0; i < ticks; ++i) {
-                const double frac = static_cast<double>(i) / (ticks - 1);
-                const double val = top_min + frac * (top_max - top_min);
-                const float px = plot_min.x + static_cast<float>(frac) * plot_w;
-                dl->AddLineV(px, plot_min.y - dp(3.5f), plot_min.y, tick_col, 1.0f);
 
-                char num_buf[36], buf[44];
-                format_adaptive_tick(val, step, num_buf, sizeof(num_buf), sign, min_dec);
-                if (sfx && *sfx) std::snprintf(buf, sizeof(buf), "%s%s", num_buf, sfx);
-                else             std::snprintf(buf, sizeof(buf), "%s", num_buf);
-                const ImVec2 ts = ImGui::CalcTextSize(buf);
-                const float lx = px - ts.x * 0.5f;
-                if (lx >= last_label_right + dp(6.0f) && lx + ts.x <= plot_max.x - dp(2.0f)) {
-                    dl->AddText(ImVec2(std::floor(lx), std::floor(plot_min.y - tick_h - dp(4.0f))), text_col, buf);
-                    last_label_right = lx + ts.x;
+            if (abs_span > 1e-12 && nice_step > 0.0) {
+                const double lo_v = std::min(top_min, top_max);
+                const double hi_v = std::max(top_min, top_max);
+                const double first_k = std::ceil((lo_v - 1e-9 * nice_step) / nice_step);
+                const double last_k = std::floor((hi_v + 1e-9 * nice_step) / nice_step);
+                const int n_nice = static_cast<int>(std::max(0.0, last_k - first_k)) + 1;
+                if (n_nice >= 2 && n_nice <= 32) {
+                    for (int k = 0; k < n_nice; ++k) {
+                        const double idx_k = (span >= 0.0) ? (first_k + k) : (last_k - k);
+                        double val = idx_k * nice_step;
+                        if (std::abs(val) < 1e-12 * nice_step) val = 0.0;
+                        const double frac = (val - top_min) / span;
+                        if (frac < -1e-4 || frac > 1.0001) continue;
+                        const float px = plot_min.x + static_cast<float>(std::clamp(frac, 0.0, 1.0)) * plot_w;
+                        dl->AddLineV(px, plot_min.y - dp(3.5f), plot_min.y, tick_col, 1.0f);
+
+                        char num_buf[36], buf[44];
+                        format_adaptive_tick(val, nice_step, num_buf, sizeof(num_buf), sign, min_dec);
+                        if (sfx && *sfx) std::snprintf(buf, sizeof(buf), "%s%s", num_buf, sfx);
+                        else             std::snprintf(buf, sizeof(buf), "%s", num_buf);
+                        const ImVec2 ts = ImGui::CalcTextSize(buf);
+                        const float lx = px - ts.x * 0.5f;
+                        if (lx >= last_label_right + dp(6.0f) && lx + ts.x <= plot_max.x - dp(2.0f)) {
+                            dl->AddText(ImVec2(std::floor(lx), std::floor(plot_min.y - tick_h - dp(4.0f))), text_col, buf);
+                            last_label_right = lx + ts.x;
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < ticks; ++i) {
+                        const double frac = static_cast<double>(i) / (ticks - 1);
+                        const double val = top_min + frac * span;
+                        const float px = plot_min.x + static_cast<float>(frac) * plot_w;
+                        dl->AddLineV(px, plot_min.y - dp(3.5f), plot_min.y, tick_col, 1.0f);
+
+                        char num_buf[36], buf[44];
+                        format_adaptive_tick(val, abs_span / (ticks - 1), num_buf, sizeof(num_buf), sign, min_dec);
+                        if (sfx && *sfx) std::snprintf(buf, sizeof(buf), "%s%s", num_buf, sfx);
+                        else             std::snprintf(buf, sizeof(buf), "%s", num_buf);
+                        const ImVec2 ts = ImGui::CalcTextSize(buf);
+                        const float lx = px - ts.x * 0.5f;
+                        if (lx >= last_label_right + dp(6.0f) && lx + ts.x <= plot_max.x - dp(2.0f)) {
+                            dl->AddText(ImVec2(std::floor(lx), std::floor(plot_min.y - tick_h - dp(4.0f))), text_col, buf);
+                            last_label_right = lx + ts.x;
+                        }
+                    }
                 }
             }
         }

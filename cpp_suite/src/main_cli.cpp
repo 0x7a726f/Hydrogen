@@ -114,7 +114,7 @@ static void print_help(const char* prog) {
               << "  --filter-sigma-khz <kHz>  Gaussian/SavGol filter sigma in kHz (default: 35.0)\n"
               << "  --als-lambda <val>        Whittaker/ALS smoothness scale (default: 200.0)\n"
               << "  --als-p <0..1>            ALS asymmetry parameter (default: 0.50)\n"
-              << "  --poly-degree <int>       Chebyshev polynomial degree 2..20 (default: 10)\n"
+              << "  --poly-degree <int>       Chebyshev polynomial degree 2..20 (default: 12)\n"
               << "  --local-order <-1..2>     Local baseline order (-1=off, 0=const, 1=lin, 2=quad)\n"
               << "  --dc-clear-hz <Hz>        DC notch clear bandwidth around LO (default: 5000.0)\n"
               << "  --rfi-mad <sigma>         RFI outlier MAD threshold (default: 4.5)\n"

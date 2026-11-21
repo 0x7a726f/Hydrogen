@@ -912,6 +912,20 @@ void UiRecordPanel::render_recording_card() {
         }
         ImGui::PopStyleColor(3);
 
+        if (is_rec && record_duration_s_ > 0.0f) {
+            const float target_s = std::max(0.1f, record_duration_s_);
+            const float el_s = static_cast<float>(std::max(0.0, last_stats_.elapsed_seconds));
+            const float frac = std::clamp(el_s / target_s, 0.0f, 1.0f);
+            const float rem_s = std::max(0.0f, target_s - el_s);
+            char prog_lbl[64];
+            std::snprintf(prog_lbl, sizeof(prog_lbl), "%.1f / %.0f s (%.0f%%)  |  -%.1f s",
+                          el_s, target_s, frac * 100.0f, rem_s);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ui_obs::palette::Tint(ui_obs::palette::Red, 0.72f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ui_obs::palette::BgDeep);
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, ui_obs::dp(18.0f)), prog_lbl);
+            ImGui::PopStyleColor(2);
+        }
+
         if (ImGui::BeginTable("##RecStatsTbl", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame)) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
@@ -1229,6 +1243,16 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
                 if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
                     apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
                 }
+                if (peak_freq_hz_ > 0) {
+                    char pk_lbl[64];
+                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", static_cast<double>(peak_freq_hz_) * 1e-6);
+                    if (ImGui::MenuItem(pk_lbl)) {
+                        apply_tuned_frequency_hz(static_cast<double>(peak_freq_hz_));
+                    }
+                }
+                if (ImGui::MenuItem("Tune LO for 21cm H I (1420.5000 MHz, +94 kHz LO)")) {
+                    apply_tuned_frequency_hz(1420.5e6);
+                }
                 if (ImGui::MenuItem(show_peak_hold_ ? "Disable Peak Hold" : "Enable Peak Hold", "P")) {
                     show_peak_hold_ = !show_peak_hold_;
                 }
@@ -1474,6 +1498,7 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
         wcfg.has_hi_focus = (hi_mhz >= full_x_min && hi_mhz <= full_x_max);
         wcfg.hi_xmin = std::max(full_x_min, hi_mhz - 0.22);
         wcfg.hi_xmax = std::min(full_x_max, hi_mhz + 0.22);
+        wcfg.is_compact = true;
 
         wf_interact_zoom_.x_active = live_zoom_.x_active;
         wf_interact_zoom_.x_min = view_x_min;
@@ -1496,8 +1521,18 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
                 if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
                     apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
                 }
+                if (peak_freq_hz_ > 0) {
+                    char pk_lbl[64];
+                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", static_cast<double>(peak_freq_hz_) * 1e-6);
+                    if (ImGui::MenuItem(pk_lbl)) {
+                        apply_tuned_frequency_hz(static_cast<double>(peak_freq_hz_));
+                    }
+                }
+                if (ImGui::MenuItem("Tune LO for 21cm H I (1420.5000 MHz, +94 kHz LO)")) {
+                    apply_tuned_frequency_hz(1420.5e6);
+                }
             },
-            false
+            true
         );
 
         if (wres.x_changed) {

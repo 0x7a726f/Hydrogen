@@ -36,8 +36,8 @@ bool Exporter::export_csv(
                                raw_power.size(), baseline_power.size(),
                                calibrated_k.size(), calibrated_db.size()});
     std::vector<double> raw_db(n), base_db(n);
-    SimdDsp::power_to_db_f64(raw_power.data(), raw_db.data(), n, 1e-12);
-    SimdDsp::power_to_db_f64(baseline_power.data(), base_db.data(), n, 1e-12);
+    SimdDsp::power_to_db_f64(raw_power.data(), raw_db.data(), n, 1e-30);
+    SimdDsp::power_to_db_f64(baseline_power.data(), base_db.data(), n, 1e-30);
 
     std::string out_buf;
     out_buf.reserve(65536);

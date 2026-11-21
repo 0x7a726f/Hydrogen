@@ -806,7 +806,7 @@ std::vector<double> solve_whittaker_d3_gap_bridge(
         for (int i = 0; i < m - 3; ++i) A_e3[static_cast<size_t>(i)] = safe_lam * s_e3[static_cast<size_t>(i)];
     }
 
-    const bool huber_mode = use_huber || (std::abs(asym_p - 0.5) < 0.05);
+    const bool huber_mode = use_huber || (std::abs(asym_p - 0.5) < 0.005);
     const int iterations = huber_mode ? 4 : 8;
     const double p_asym = std::clamp(asym_p, 1e-4, 0.9999);
     w = base_w;
@@ -857,8 +857,9 @@ std::vector<double> solve_whittaker_d3_gap_bridge(
     }
 
     // Tukey twicing pass: solve for the smooth residual on clean macro-bins so transfer function
-    // becomes 2*H - H^2 = 1 - (1 - H)^2 (eliminating low-order curvature attenuation across crests)
-    {
+    // becomes 2*H - H^2 = 1 - (1 - H)^2 (scaled by symmetry so lower-envelope p << 0.5 is preserved)
+    const double twicing_scale = huber_mode ? 1.0 : std::clamp(1.0 - std::abs(1.0 - 2.0 * p_asym), 0.0, 1.0);
+    if (twicing_scale > 1e-4) {
         for (int b = 0; b < m; ++b) {
             A_d[static_cast<size_t>(b)] = w[static_cast<size_t>(b)] + safe_lam * s_d[static_cast<size_t>(b)] + 1e-12;
             rhs[static_cast<size_t>(b)] = w[static_cast<size_t>(b)] * (m_y[static_cast<size_t>(b)] - z[static_cast<size_t>(b)]);
@@ -870,7 +871,7 @@ std::vector<double> solve_whittaker_d3_gap_bridge(
             solve_heptadiagonal_symmetric(m, A_d.data(), A_e1.data(), A_e2.data(), A_e3.data(), rhs.data(), dz.data());
         }
         for (int b = 0; b < m; ++b) {
-            z[static_cast<size_t>(b)] += dz[static_cast<size_t>(b)];
+            z[static_cast<size_t>(b)] += twicing_scale * dz[static_cast<size_t>(b)];
         }
     }
 
@@ -1187,7 +1188,7 @@ std::vector<double> BaselineFitter::fit_als(
     const int diff_order = (config.als_diff_order == 2) ? 2 : 3;
     const double lam_scale = std::max(1e-3, config.als_lambda / 200.0);
     const double lam = compute_whittaker_lambda(m, passband_span_khz, config.als_cutoff_khz, diff_order, lam_scale);
-    const bool use_huber = (std::abs(config.als_p - 0.5) < 0.05);
+    const bool use_huber = (std::abs(config.als_p - 0.5) < 0.005);
 
     return solve_whittaker_d3_gap_bridge(p_db, passband_mask, hi_window, lam, config.als_p, use_huber, diff_order);
 }
@@ -1205,7 +1206,7 @@ std::vector<double> BaselineFitter::fit_poly(
     const int n = static_cast<int>(p_db.size());
     if (n < 4) return p_db;
 
-    const int deg = std::clamp(config.poly_degree, 2, 16);
+    const int deg = std::clamp(config.poly_degree, 2, 20);
     const int p = deg + 1;
 
     int first_pass = -1, last_pass = -1;
@@ -1242,8 +1243,8 @@ std::vector<double> BaselineFitter::fit_poly(
     }
 
     thread_local ChunkedHouseholderQR qr;
-    double coeffs[17] = {};
-    double phi[17] = {};
+    double coeffs[21] = {};
+    double phi[21] = {};
 
     // 5-iteration symmetric Huber MAD IRLS with curvature-regularized Householder QR
     constexpr int kIters = 5;

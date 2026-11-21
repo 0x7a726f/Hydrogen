@@ -31,13 +31,17 @@ struct StreamCacheKey {
     double sample_rate_msps = 2.4;
     int fft_size_idx = 2;
     float duration_s = 0.0f;
+    WindowType window = WindowType::Blackman;
+    bool enable_welch_overlap = true;
 
     bool operator==(const StreamCacheKey& o) const {
         return filepath == o.filepath &&
                file_size_bytes == o.file_size_bytes &&
                std::abs(sample_rate_msps - o.sample_rate_msps) < 1e-6 &&
                fft_size_idx == o.fft_size_idx &&
-               std::abs(duration_s - o.duration_s) < 1e-3f;
+               std::abs(duration_s - o.duration_s) < 1e-3f &&
+               window == o.window &&
+               enable_welch_overlap == o.enable_welch_overlap;
     }
     bool operator!=(const StreamCacheKey& o) const { return !(*this == o); }
 };
@@ -69,7 +73,7 @@ struct StageBParamsSig {
     bool auto_skirt_trim = true;
     float als_lambda = 200.0f;
     float als_p = 0.50f;
-    int poly_degree = 10;
+    int poly_degree = 12;
     int sw_continuum_order = 4;
     float line_free_velocity_kms = 40.0f;
     int line_method_idx = 0;
@@ -253,11 +257,13 @@ private:
     bool ui_auto_skirt_trim_ = true;
     float ui_als_lambda_ = 200.0f;
     float ui_als_p_ = 0.50f;
-    int ui_poly_deg_ = 10;
+    int ui_poly_deg_ = 12;
     int ui_sw_order_ = 4;
     float ui_line_free_vel_kms_ = 40.0f;
     int ui_colormap_idx_ = 0;       // Viridis
     bool ui_live_refit_enabled_ = true;
+    bool ui_collapse_fit_card_ = false;
+    bool ui_link_dashboard_x_ = true;
     int pending_tab_select_ = -1;
 
     // Asynchronous Stage-A Execution & Export Threads
