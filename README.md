@@ -1,4 +1,4 @@
-# Radio
+# Hydrogen
 
 C++17 RTL-SDR receiver, `CS16` I/Q recorder, and offline 21-cm Neutral Hydrogen (H I, 1420.40575 MHz) spectral analysis suite.
 
@@ -59,7 +59,7 @@ Prebuilt Windows x64 binaries are attached to GitHub Releases.
 ## Layout
 
 ```text
-Radio/
+Hydrogen/
 ├── README.md
 └── cpp_suite/
     ├── CMakeLists.txt
