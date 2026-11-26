@@ -518,7 +518,7 @@ void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double durat
       << "CLI Analysis Command\n"
       << "----------------------------------------------------------------------\n"
       << std::fixed << std::setprecision(6)
-      << "  radio_suite_cli analyze \"" << cs16_filename << "\" --fc " << fc_mhz << "M --fs "
+      << "  hydrogen_cli analyze \"" << cs16_filename << "\" --fc " << fc_mhz << "M --fs "
       << std::setprecision(3) << fs_msps << "M -o output\n";
     f.flush();
     f.close();

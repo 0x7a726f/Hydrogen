@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(RadioAstronomySuite VERSION 2.0.0 LANGUAGES C CXX)
+project(Hydrogen VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,7 +64,7 @@ if (WIN32)
     target_link_libraries(astro_core PUBLIC ole32 kernel32 user32 psapi)
 
     # 1. Desktop GUI Executable (Windows DX11 + Dear ImGui)
-    add_executable(radio_suite
+    add_executable(hydrogen
         lib/imgui/imgui.cpp
         lib/imgui/imgui_draw.cpp
         lib/imgui/imgui_widgets.cpp
@@ -75,28 +75,33 @@ if (WIN32)
         src/ui_analyze_panel.cpp
         src/app_gui.cpp
         src/main_gui.cpp
+        assets/hydrogen.rc
     )
-    target_include_directories(radio_suite PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib/imgui)
-    target_link_libraries(radio_suite PRIVATE astro_core ${WINDOWS_LIBS})
+    target_include_directories(hydrogen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib/imgui)
+    target_link_libraries(hydrogen PRIVATE astro_core ${WINDOWS_LIBS})
     if (MINGW)
-        target_link_options(radio_suite PRIVATE -static -static-libgcc -static-libstdc++ -mwindows)
+        target_link_options(hydrogen PRIVATE -static -static-libgcc -static-libstdc++ -mwindows)
     elseif (MSVC)
-        set_target_properties(radio_suite PROPERTIES LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
+        set_target_properties(hydrogen PROPERTIES LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
     endif()
 
-    add_custom_command(TARGET radio_suite POST_BUILD
+    add_custom_command(TARGET hydrogen POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/bin/rtlsdr.dll" $<TARGET_FILE_DIR:radio_suite>
+            "${CMAKE_CURRENT_SOURCE_DIR}/bin/rtlsdr.dll" $<TARGET_FILE_DIR:hydrogen>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/bin/libusb-1.0.dll" $<TARGET_FILE_DIR:radio_suite>
+            "${CMAKE_CURRENT_SOURCE_DIR}/bin/libusb-1.0.dll" $<TARGET_FILE_DIR:hydrogen>
     )
 endif()
 
 # 2. Headless CLI Executable
-add_executable(radio_suite_cli src/main_cli.cpp)
-target_link_libraries(radio_suite_cli PRIVATE astro_core)
+if (WIN32)
+    add_executable(hydrogen_cli src/main_cli.cpp assets/hydrogen.rc)
+else()
+    add_executable(hydrogen_cli src/main_cli.cpp)
+endif()
+target_link_libraries(hydrogen_cli PRIVATE astro_core)
 if (MINGW)
-    target_link_options(radio_suite_cli PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(hydrogen_cli PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
 # 3. Automated Tests
@@ -114,6 +119,6 @@ endfunction()
 add_astro_test(test_suite_state tests/test_suite_state.cpp)
 add_astro_test(test_end_to_end_bridge tests/test_end_to_end_bridge.cpp)
 add_astro_test(test_cli_commands tests/test_cli_commands.cpp)
-add_dependencies(test_cli_commands radio_suite_cli)
+add_dependencies(test_cli_commands hydrogen_cli)
 add_astro_test(test_performance_stress tests/test_performance_stress.cpp)
 add_astro_test(test_dsp_optimizations tests/test_dsp_optimizations.cpp)

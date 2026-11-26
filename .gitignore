@@ -18,8 +18,8 @@ cpp_suite/build*/
 cpp_suite/output/
 cpp_suite/recordings/
 cpp_suite/bin/*.exe
-cpp_suite/bin/radio_suite
-cpp_suite/bin/radio_suite_cli
+cpp_suite/bin/hydrogen
+cpp_suite/bin/hydrogen_cli
 cpp_suite/bin/recordings/
 cpp_suite/bin/test_*
 cpp_suite/bin/imgui.ini

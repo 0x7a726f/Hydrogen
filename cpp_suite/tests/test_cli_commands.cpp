@@ -34,22 +34,22 @@ static CommandResult run_cli(const std::string& args) {
     std::string exe_path;
 #ifdef _WIN32
     const std::vector<std::string> candidates = {
-        "bin\\radio_suite_cli.exe",
-        "bin\\Release\\radio_suite_cli.exe",
-        "bin\\Debug\\radio_suite_cli.exe",
-        "radio_suite_cli.exe",
-        "..\\bin\\radio_suite_cli.exe",
-        "..\\bin\\Release\\radio_suite_cli.exe",
-        "..\\bin\\Debug\\radio_suite_cli.exe"
+        "bin\\hydrogen_cli.exe",
+        "bin\\Release\\hydrogen_cli.exe",
+        "bin\\Debug\\hydrogen_cli.exe",
+        "hydrogen_cli.exe",
+        "..\\bin\\hydrogen_cli.exe",
+        "..\\bin\\Release\\hydrogen_cli.exe",
+        "..\\bin\\Debug\\hydrogen_cli.exe"
     };
 #else
     const std::vector<std::string> candidates = {
-        "bin/radio_suite_cli",
-        "bin/Release/radio_suite_cli",
-        "bin/Debug/radio_suite_cli",
-        "./radio_suite_cli",
-        "../bin/radio_suite_cli",
-        "build/bin/radio_suite_cli"
+        "bin/hydrogen_cli",
+        "bin/Release/hydrogen_cli",
+        "bin/Debug/hydrogen_cli",
+        "./hydrogen_cli",
+        "../bin/hydrogen_cli",
+        "build/bin/hydrogen_cli"
     };
 #endif
     for (const auto& c : candidates) {
@@ -105,7 +105,7 @@ int main() {
     {
         auto res = run_cli("--help");
         ASSERT_EQ(res.exit_code, 0, "CLI --help exits with code 0");
-        ASSERT_TRUE(res.output.find("radio_suite_cli") != std::string::npos, "Help identifies radio_suite_cli");
+        ASSERT_TRUE(res.output.find("hydrogen_cli") != std::string::npos, "Help identifies hydrogen_cli");
         ASSERT_TRUE(res.output.find("Record Options:") != std::string::npos, "Help lists record subcommand");
         ASSERT_TRUE(res.output.find("Analyze Options:") != std::string::npos, "Help lists analyze subcommand");
 

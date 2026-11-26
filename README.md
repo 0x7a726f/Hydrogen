@@ -4,8 +4,8 @@ C++17 RTL-SDR receiver, `CS16` I/Q recorder, and offline 21-cm Neutral Hydrogen 
 
 ## Executables
 
-- **`radio_suite_cli`** (Windows & Linux) — command-line recorder (`record`) and offline calibration/fitting pipeline (`analyze`).
-- **`radio_suite`** (Windows x64, DirectX 11 + Dear ImGui) — desktop app with live spectrum/waterfall display, timed CS16 recording, and interactive offline analysis.
+- **`hydrogen_cli`** (Windows & Linux) — command-line recorder (`record`) and offline calibration/fitting pipeline (`analyze`).
+- **`hydrogen`** (Windows x64, DirectX 11 + Dear ImGui) — desktop app with live spectrum/waterfall display, timed CS16 recording, and interactive offline analysis.
 
 ## Features
 
@@ -26,8 +26,8 @@ ctest --test-dir cpp_suite/build --output-on-failure
 ```
 
 Binaries are written to `cpp_suite/bin/`:
-- `radio_suite_cli` (`radio_suite_cli.exe` on Windows)
-- `radio_suite.exe` (Windows only)
+- `hydrogen_cli` (`hydrogen_cli.exe` on Windows)
+- `hydrogen.exe` (Windows only)
 
 Prebuilt Windows x64 binaries are attached to GitHub Releases.
 
@@ -37,23 +37,23 @@ Prebuilt Windows x64 binaries are attached to GitHub Releases.
 
 ```bash
 # 60s capture from RTL-SDR hardware
-./cpp_suite/bin/radio_suite_cli record --fc 1420.5M --fs 2.4M -d 60 -g 25.4 -o recordings/obs_001.cs16
+./cpp_suite/bin/hydrogen_cli record --fc 1420.5M --fs 2.4M -d 60 -g 25.4 -o recordings/obs_001.cs16
 
 # 5s capture from the built-in H I simulator
-./cpp_suite/bin/radio_suite_cli record --virtual --fc 1420.5M --fs 2.4M -d 5 -o recordings/sim_test.cs16
+./cpp_suite/bin/hydrogen_cli record --virtual --fc 1420.5M --fs 2.4M -d 5 -o recordings/sim_test.cs16
 ```
 
 ### Analyze a recording
 
 ```bash
 # Default pipeline (ripple_filter baseline + Gaussian fit; reads .json/.txt sidecars automatically)
-./cpp_suite/bin/radio_suite_cli analyze recordings/sim_test.cs16 -o output/sim_test
+./cpp_suite/bin/hydrogen_cli analyze recordings/sim_test.cs16 -o output/sim_test
 
 # ALS baseline + two-component Gaussian fit
-./cpp_suite/bin/radio_suite_cli analyze recordings/sim_test.cs16 --baseline als --line-method double_gaussian --tsys 100 -o output/sim_test_2arm
+./cpp_suite/bin/hydrogen_cli analyze recordings/sim_test.cs16 --baseline als --line-method double_gaussian --tsys 100 -o output/sim_test_2arm
 
 # Standing-wave baseline + three-component Gaussian fit
-./cpp_suite/bin/radio_suite_cli analyze recordings/sim_test.cs16 --baseline standing_wave --line-method triple_gaussian --spin-temp 135 -o output/sim_test_3arm
+./cpp_suite/bin/hydrogen_cli analyze recordings/sim_test.cs16 --baseline standing_wave --line-method triple_gaussian --spin-temp 135 -o output/sim_test_3arm
 ```
 
 ## Layout

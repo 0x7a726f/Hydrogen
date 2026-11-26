@@ -624,7 +624,7 @@ int run_analyze(int argc, char* argv[], int start_idx) {
             }
             filepath = discovered[0];
         } else {
-            std::cerr << "Error: No CS16 files found. Please provide a path using: radio_suite_cli analyze <file.cs16>\n";
+            std::cerr << "Error: No CS16 files found. Please provide a path using: hydrogen_cli analyze <file.cs16>\n";
             return 1;
         }
     }

@@ -34,17 +34,17 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item cpp_suite/bin/radio_suite.exe dist/
-          Copy-Item cpp_suite/bin/radio_suite_cli.exe dist/
+          Copy-Item cpp_suite/bin/hydrogen.exe dist/
+          Copy-Item cpp_suite/bin/hydrogen_cli.exe dist/
           Copy-Item cpp_suite/bin/rtlsdr.dll dist/
           Copy-Item cpp_suite/bin/libusb-1.0.dll dist/
           $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
-          Compress-Archive -Path dist/* -DestinationPath "RadioSuite-$tag-win64.zip" -Force
+          Compress-Archive -Path dist/* -DestinationPath "Hydrogen-$tag-win64.zip" -Force
 
       - name: Upload Windows x64 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RadioSuite-Windows-x64
+          name: Hydrogen-Windows-x64
           path: dist/
           if-no-files-found: error
 
@@ -54,11 +54,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $zip = "RadioSuite-$tag-win64.zip"
+          $zip = "Hydrogen-$tag-win64.zip"
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $zip --clobber
           } else {
-            gh release create $tag $zip --title "Radio Suite $tag" --generate-notes
+            gh release create $tag $zip --title "Hydrogen $tag" --generate-notes
           }
         shell: pwsh

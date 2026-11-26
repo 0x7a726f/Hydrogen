@@ -176,9 +176,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplWin32_EnableDpiAwareness();
 
     HBRUSH bg_brush = CreateSolidBrush(RGB(13, 17, 23)); // #0D1117 prevents white flash on startup/resize
+    HICON app_icon = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
     WNDCLASSEXW wc = {
-        sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, nullptr, nullptr, bg_brush, nullptr,
-        L"ObservatorySuiteClass", nullptr
+        sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, app_icon, nullptr, bg_brush, nullptr,
+        L"HydrogenWindowClass", app_icon
     };
     RegisterClassExW(&wc);
 
@@ -197,7 +198,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     HWND hwnd = CreateWindowW(
         wc.lpszClassName,
-        L"Observatory Suite - 21cm Hydrogen Line SDR & Analysis",
+        L"Hydrogen - 21cm H I SDR & Analysis",
         WS_OVERLAPPEDWINDOW, win_x, win_y, win_w, win_h, nullptr, nullptr, wc.hInstance, nullptr
     );
     apply_win32_dark_chrome(hwnd);

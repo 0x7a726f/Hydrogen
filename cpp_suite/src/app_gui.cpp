@@ -156,7 +156,7 @@ void AppGui::render_top_navigation_bar(float width, float height) {
     {
         ui_obs::ScopedFont title_f(fonts_.semibold, 15.0f);
         ImGui::SetCursorPos(ImVec2(ui_obs::dp(38.0f), (height - ImGui::GetTextLineHeight()) * 0.5f));
-        ImGui::TextColored(ui_obs::palette::TextPrimary, "OBSERVATORY SUITE");
+        ImGui::TextColored(ui_obs::palette::TextPrimary, "HYDROGEN");
     }
 
     ImGui::SameLine(0.0f, ui_obs::dp(10.0f));
