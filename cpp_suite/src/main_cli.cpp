@@ -28,6 +28,8 @@
 #include "baseline_fitter.h"
 #include "astrophysics.h"
 #include "exporter.h"
+#include "utf8_path.h"
+#include <exception>
 
 static std::atomic<bool> g_interrupted{false};
 
@@ -147,8 +149,8 @@ int run_record(int argc, char* argv[], int start_idx) {
                 std::cerr << "Error: Missing value for " << arg << "\n";
                 return 1;
             }
-            if (!parse_strict_double(argv[++i], duration_s) || duration_s < 0.0) {
-                std::cerr << "Error: Invalid duration value (must be a finite number >= 0).\n";
+            if (!parse_strict_double(argv[++i], duration_s) || duration_s < 0.0 || duration_s > 3.1536e7) {
+                std::cerr << "Error: Invalid duration value (must be finite in [0, 31536000] s).\n";
                 return 1;
             }
         } else if (arg == "--fc" || arg == "--center-freq") {
@@ -157,8 +159,8 @@ int run_record(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double parsed = 0.0;
-            if (!astro::try_parse_frequency_or_rate(argv[++i], parsed, true) || parsed <= 0.0 || parsed > 6e9) {
-                std::cerr << "Error: Invalid center frequency.\n";
+            if (!astro::try_parse_frequency_or_rate(argv[++i], parsed, true) || parsed < 1.0 || parsed > 6e9) {
+                std::cerr << "Error: Invalid center frequency (expected in [1 Hz, 6 GHz]).\n";
                 return 1;
             }
             center_freq_hz = static_cast<uint64_t>(std::llround(parsed));
@@ -168,8 +170,8 @@ int run_record(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double parsed = 0.0;
-            if (!astro::try_parse_sample_rate(argv[++i], parsed) || parsed <= 0.0 || parsed > 20e6) {
-                std::cerr << "Error: Invalid sample rate.\n";
+            if (!astro::try_parse_sample_rate(argv[++i], parsed) || parsed < 1.0 || parsed > 20e6) {
+                std::cerr << "Error: Invalid sample rate (expected in [1 Hz, 20 MSPS]).\n";
                 return 1;
             }
             sample_rate_hz = static_cast<uint32_t>(std::llround(parsed));
@@ -203,6 +205,10 @@ int run_record(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             output_path = argv[++i];
+            if (output_path.empty()) {
+                std::cerr << "Error: Output path for " << arg << " cannot be empty.\n";
+                return 1;
+            }
         } else if (arg == "--virtual") {
             force_virtual = true;
         } else if (arg == "-q" || arg == "--quiet") {
@@ -267,10 +273,17 @@ int run_record(int argc, char* argv[], int start_idx) {
         return 1;
     }
 
+    if (!sdr.start_streaming()) {
+        std::cerr << "Error: Failed to start SDR streaming.\n";
+        sdr.clear_sample_callbacks();
+        writer.stop_recording();
+        sdr.shutdown();
+        return 1;
+    }
+
     if (!quiet) {
         std::cout << "Recording started: " << actual_file << "\n";
     }
-    sdr.start_streaming();
 
     auto t0 = std::chrono::steady_clock::now();
     while (!g_interrupted.load() && writer.is_recording()) {
@@ -300,6 +313,11 @@ int run_record(int argc, char* argv[], int start_idx) {
     if (writer.has_io_error()) {
         std::cerr << "Error: Disk I/O write error occurred while recording to: " << actual_file << "\n";
         return 1;
+    }
+
+    if (g_interrupted.load()) {
+        std::cerr << "Recording interrupted by user (partial capture saved: " << actual_file << ").\n";
+        return 130;
     }
 
     if (!quiet) {
@@ -334,13 +352,18 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             filepath = argv[++i];
+            if (filepath.empty()) {
+                std::cerr << "Error: File path for " << arg << " cannot be empty.\n";
+                return 1;
+            }
         } else if (arg == "--fc" || arg == "--center-freq") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: Missing value for " << arg << "\n";
                 return 1;
             }
             fc_str = argv[++i];
-            if (!try_parse_frequency_or_rate(fc_str, parsed_fc_override, true) || parsed_fc_override <= 0.0) {
+            if (!try_parse_frequency_or_rate(fc_str, parsed_fc_override, true) ||
+                parsed_fc_override <= 0.0 || parsed_fc_override > 1e12) {
                 std::cerr << "Error: Invalid center frequency for " << arg << ": '" << fc_str << "'\n";
                 return 1;
             }
@@ -351,7 +374,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             fs_str = argv[++i];
-            if (!try_parse_sample_rate(fs_str, parsed_fs_override) || parsed_fs_override <= 0.0) {
+            if (!try_parse_sample_rate(fs_str, parsed_fs_override) ||
+                parsed_fs_override <= 0.0 || parsed_fs_override > 1e10) {
                 std::cerr << "Error: Invalid sample rate for " << arg << ": '" << fs_str << "'\n";
                 return 1;
             }
@@ -373,8 +397,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double v = 0.0;
-            if (!parse_strict_double(argv[++i], v) || v < 0.0) {
-                std::cerr << "Error: Invalid duration for " << arg << " (must be finite >= 0).\n";
+            if (!parse_strict_double(argv[++i], v) || v < 0.0 || v > 3.1536e7) {
+                std::cerr << "Error: Invalid duration for " << arg << " (must be finite in [0, 31536000] s).\n";
                 return 1;
             }
             config.max_duration_s = v;
@@ -423,8 +447,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double v = 0.0;
-            if (!parse_strict_double(argv[++i], v) || v <= 0.0) {
-                std::cerr << "Error: --tsys must be a finite number > 0 K.\n";
+            if (!parse_strict_double(argv[++i], v) || v <= 0.0 || v > 1e6) {
+                std::cerr << "Error: --tsys must be a finite number in (0, 1e6] K.\n";
                 return 1;
             }
             config.system_temp_k = v;
@@ -434,8 +458,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double v = 0.0;
-            if (!parse_strict_double(argv[++i], v) || v <= 0.0) {
-                std::cerr << "Error: --spin-temp must be a finite number > 0 K.\n";
+            if (!parse_strict_double(argv[++i], v) || v <= 0.0 || v > 1e6) {
+                std::cerr << "Error: --spin-temp must be a finite number in (0, 1e6] K.\n";
                 return 1;
             }
             config.spin_temp_k = v;
@@ -491,8 +515,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double v = 0.0;
-            if (!parse_strict_double(argv[++i], v) || v <= 0.0) {
-                std::cerr << "Error: --als-lambda must be finite > 0.\n";
+            if (!parse_strict_double(argv[++i], v) || v <= 0.0 || v > 1e12) {
+                std::cerr << "Error: --als-lambda must be finite in (0, 1e12].\n";
                 return 1;
             }
             config.als_lambda = v;
@@ -535,8 +559,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double v = 0.0;
-            if (!parse_strict_double(argv[++i], v) || v < 0.0) {
-                std::cerr << "Error: --dc-clear-hz must be finite >= 0.\n";
+            if (!parse_strict_double(argv[++i], v) || v < 0.0 || v > 1e8) {
+                std::cerr << "Error: --dc-clear-hz must be finite in [0, 1e8] Hz.\n";
                 return 1;
             }
             config.dc_clear_hz = v;
@@ -546,8 +570,8 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             double v = 0.0;
-            if (!parse_strict_double(argv[++i], v) || v <= 0.0) {
-                std::cerr << "Error: --rfi-mad must be finite > 0.\n";
+            if (!parse_strict_double(argv[++i], v) || v <= 0.0 || v > 1e4) {
+                std::cerr << "Error: --rfi-mad must be finite in (0, 10000].\n";
                 return 1;
             }
             config.rfi_threshold_mad = v;
@@ -557,6 +581,10 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 return 1;
             }
             config.output_dir = argv[++i];
+            if (config.output_dir.empty()) {
+                std::cerr << "Error: Output directory for " << arg << " cannot be empty.\n";
+                return 1;
+            }
         } else if (arg == "-q" || arg == "--quiet") {
             quiet = true;
             config.verbose = false;
@@ -588,7 +616,7 @@ int run_analyze(int argc, char* argv[], int start_idx) {
                 std::cout << "\nDiscovered CS16 files in workspace:\n";
                 for (size_t i = 0; i < std::min<size_t>(discovered.size(), 5); ++i) {
                     std::error_code ec;
-                    uint64_t sz = std::filesystem::file_size(discovered[i], ec);
+                    uint64_t sz = std::filesystem::file_size(astro_fs::utf8_path(discovered[i]), ec);
                     std::cout << "  [" << (i + 1) << "] " << discovered[i]
                               << " (" << std::fixed << std::setprecision(1) << static_cast<double>(sz) / (1024.0 * 1024.0) << " MB)\n";
                 }
@@ -603,11 +631,12 @@ int run_analyze(int argc, char* argv[], int start_idx) {
 
     {
         std::error_code ec;
-        if (!std::filesystem::exists(filepath, ec)) {
+        const std::filesystem::path fpath = astro_fs::utf8_path(filepath);
+        if (!std::filesystem::exists(fpath, ec)) {
             std::cerr << "Error: Specified file does not exist: " << filepath << "\n";
             return 1;
         }
-        if (!std::filesystem::is_regular_file(filepath, ec)) {
+        if (!std::filesystem::is_regular_file(fpath, ec)) {
             std::cerr << "Error: Specified path is not a regular file: " << filepath << "\n";
             return 1;
         }
@@ -794,83 +823,93 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::string cmd = argv[1];
-    std::transform(cmd.begin(), cmd.end(), cmd.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    try {
+        std::string cmd = argv[1];
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    if (cmd == "-h" || cmd == "--help" || cmd == "help") {
-        print_help(argv[0]);
-        return 0;
-    }
-
-    if (cmd == "record") {
-        return run_record(argc, argv, 2);
-    } else if (cmd == "analyze") {
-        return run_analyze(argc, argv, 2);
-    } else {
-        // Auto-detect mode based on flags or input file
-        bool has_record_flag = false;
-        bool has_analyze_flag = false;
-        bool is_cs16_file = false;
-
-        for (int i = 1; i < argc; ++i) {
-            std::string arg = argv[i];
-            if (arg == "-o" || arg == "--output" || arg == "--output-dir") {
-                ++i;
-                continue;
-            }
-            if (arg == "-q" || arg == "--quiet") {
-                continue;
-            }
-            if (arg == "-f" || arg == "--file") {
-                has_analyze_flag = true;
-                ++i;
-                continue;
-            }
-            if (arg == "--baseline" || arg == "--tsys" || arg == "--spin-temp" || arg == "--tspin" ||
-                arg == "-n" || arg == "--fft-size" || arg == "--line-method" || arg == "--fit" ||
-                arg == "--hi-window-khz" || arg == "--edge-fraction" || arg == "--line-free-vel" ||
-                arg == "--filter-sigma-khz" || arg == "--als-lambda" || arg == "--als-p" ||
-                arg == "--poly-degree" || arg == "--local-order" || arg == "--window" ||
-                arg == "--dc-clear-hz" || arg == "--rfi-mad") {
-                has_analyze_flag = true;
-                ++i;
-                continue;
-            }
-            if (arg == "--no-auto-skirt") {
-                has_analyze_flag = true;
-                continue;
-            }
-            if (arg == "--gain" || arg == "-g" || arg == "--ppm") {
-                has_record_flag = true;
-                ++i;
-                continue;
-            }
-            if (arg == "--bias-tee" || arg == "--virtual" || arg == "--auto-gain") {
-                has_record_flag = true;
-                continue;
-            }
-            if (arg == "--fc" || arg == "--center-freq" || arg == "--fs" || arg == "--sample-rate" ||
-                arg == "-d" || arg == "-t" || arg == "--duration") {
-                ++i;
-                continue;
-            }
-            if (has_cs16_extension(arg)) {
-                is_cs16_file = true;
-            }
-        }
-
-        std::error_code cli_ec;
-        if (has_record_flag && !is_cs16_file && !has_analyze_flag) {
-            return run_record(argc, argv, 1);
-        } else if (is_cs16_file || has_analyze_flag || std::filesystem::exists(argv[1], cli_ec)) {
-            return run_analyze(argc, argv, 1);
-        } else if (cmd.rfind("--fc", 0) == 0 || cmd.rfind("-d", 0) == 0 || cmd.rfind("-t", 0) == 0 || cmd.rfind("--fs", 0) == 0) {
-            return run_record(argc, argv, 1);
-        } else {
-            std::cerr << "Error: Unknown subcommand or file '" << argv[1] << "'.\n";
+        if (cmd == "-h" || cmd == "--help" || cmd == "help") {
             print_help(argv[0]);
-            return 1;
+            return 0;
         }
+
+        if (cmd == "record") {
+            return run_record(argc, argv, 2);
+        } else if (cmd == "analyze") {
+            return run_analyze(argc, argv, 2);
+        } else {
+            // Auto-detect mode based on flags or input file
+            bool has_record_flag = false;
+            bool has_analyze_flag = false;
+            bool is_cs16_file = false;
+
+            for (int i = 1; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "-o" || arg == "--output" || arg == "--output-dir") {
+                    ++i;
+                    continue;
+                }
+                if (arg == "-q" || arg == "--quiet") {
+                    continue;
+                }
+                if (arg == "-f" || arg == "--file") {
+                    has_analyze_flag = true;
+                    ++i;
+                    continue;
+                }
+                if (arg == "--baseline" || arg == "--tsys" || arg == "--spin-temp" || arg == "--tspin" ||
+                    arg == "-n" || arg == "--fft-size" || arg == "--line-method" || arg == "--fit" ||
+                    arg == "--hi-window-khz" || arg == "--edge-fraction" || arg == "--line-free-vel" ||
+                    arg == "--filter-sigma-khz" || arg == "--als-lambda" || arg == "--als-p" ||
+                    arg == "--poly-degree" || arg == "--local-order" || arg == "--window" ||
+                    arg == "--dc-clear-hz" || arg == "--rfi-mad") {
+                    has_analyze_flag = true;
+                    ++i;
+                    continue;
+                }
+                if (arg == "--no-auto-skirt") {
+                    has_analyze_flag = true;
+                    continue;
+                }
+                if (arg == "--gain" || arg == "-g" || arg == "--ppm") {
+                    has_record_flag = true;
+                    ++i;
+                    continue;
+                }
+                if (arg == "--bias-tee" || arg == "--virtual" || arg == "--auto-gain") {
+                    has_record_flag = true;
+                    continue;
+                }
+                if (arg == "--fc" || arg == "--center-freq" || arg == "--fs" || arg == "--sample-rate" ||
+                    arg == "-d" || arg == "-t" || arg == "--duration") {
+                    ++i;
+                    continue;
+                }
+                if (has_cs16_extension(arg)) {
+                    is_cs16_file = true;
+                }
+            }
+
+            std::error_code cli_ec;
+            if (has_record_flag && !is_cs16_file && !has_analyze_flag) {
+                return run_record(argc, argv, 1);
+            } else if (is_cs16_file || has_analyze_flag || std::filesystem::exists(astro_fs::utf8_path(argv[1]), cli_ec)) {
+                return run_analyze(argc, argv, 1);
+            } else if (cmd == "--fc" || cmd == "--center-freq" || cmd == "--fs" || cmd == "--sample-rate" ||
+                       cmd == "-d" || cmd == "-t" || cmd == "--duration" ||
+                       cmd == "-o" || cmd == "--output" || cmd == "--output-dir") {
+                return run_record(argc, argv, 1);
+            } else {
+                std::cerr << "Error: Unknown subcommand or file '" << argv[1] << "'.\n";
+                print_help(argv[0]);
+                return 1;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "Error: An unexpected fatal error occurred.\n";
+        return 1;
     }
 }

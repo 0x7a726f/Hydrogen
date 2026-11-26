@@ -1,5 +1,6 @@
 #pragma once
 
+#include "utf8_path.h"
 #include <string>
 #include <mutex>
 #include <filesystem>
@@ -45,10 +46,11 @@ struct AppState {
         cached_check_result = false;
         if (active && !path.empty()) {
             std::error_code ec;
-            active_recording_canonical = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+            const std::filesystem::path fs_p = astro_fs::utf8_path(path);
+            active_recording_canonical = std::filesystem::weakly_canonical(fs_p, ec);
             if (ec || active_recording_canonical.empty()) {
                 ec.clear();
-                active_recording_canonical = std::filesystem::absolute(std::filesystem::path(path), ec).lexically_normal();
+                active_recording_canonical = std::filesystem::absolute(fs_p, ec).lexically_normal();
             }
         } else {
             active_recording_canonical.clear();
@@ -72,17 +74,19 @@ struct AppState {
         if (path == cached_check_path) return cached_check_result;
 
         std::error_code ec;
-        std::filesystem::path cand = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+        const std::filesystem::path cand_fs = astro_fs::utf8_path(path);
+        std::filesystem::path cand = std::filesystem::weakly_canonical(cand_fs, ec);
         if (ec || cand.empty()) {
             ec.clear();
-            cand = std::filesystem::absolute(std::filesystem::path(path), ec).lexically_normal();
+            cand = std::filesystem::absolute(cand_fs, ec).lexically_normal();
         }
 
         bool match = (!active_recording_canonical.empty() && cand == active_recording_canonical);
         if (!match) {
             std::error_code ec_eq;
-            if (std::filesystem::exists(path, ec_eq) && std::filesystem::exists(active_recording_filepath, ec_eq)) {
-                match = std::filesystem::equivalent(path, active_recording_filepath, ec_eq);
+            const std::filesystem::path active_fs = astro_fs::utf8_path(active_recording_filepath);
+            if (std::filesystem::exists(cand_fs, ec_eq) && std::filesystem::exists(active_fs, ec_eq)) {
+                match = std::filesystem::equivalent(cand_fs, active_fs, ec_eq);
             }
         }
         cached_check_path = path;

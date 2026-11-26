@@ -33,7 +33,9 @@ AppGui::AppGui()
 }
 
 AppGui::~AppGui() {
-    sdr_.stop_streaming();
+    sdr_.clear_sample_callbacks();
+    sdr_.set_freq_changed_callback(nullptr);
+    sdr_.shutdown();
     writer_.stop_recording();
     release_d3d_resources();
 }

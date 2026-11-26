@@ -1,8 +1,10 @@
 #include "streaming_processor.h"
 #include "simd_dsp.h"
+#include "utf8_path.h"
 #include <fstream>
 #include <iostream>
 #include <cmath>
+#include <climits>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -260,22 +262,13 @@ inline void accumulate_double_from_float(double* __restrict dst, const float* __
     }
 }
 
-#ifdef _WIN32
-static std::wstring utf8_to_wide(const std::string& str) {
-    if (str.empty()) return std::wstring();
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
-    std::wstring res(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &res[0], size);
-    return res;
-}
-#endif
-
 } // namespace
 
 std::vector<float> StreamingProcessor::generate_window(WindowType type, int size) {
-    std::vector<float> win(size);
+    if (size <= 0) return {};
+    if (size == 1) return {1.0f};
+    std::vector<float> win(static_cast<size_t>(size));
     double n_minus_1 = static_cast<double>(size - 1);
-    if (n_minus_1 <= 0.0) n_minus_1 = 1.0;
 
     for (int i = 0; i < size; ++i) {
         double x = static_cast<double>(i) / n_minus_1;
@@ -312,14 +305,15 @@ StreamingProcessor::StreamingProcessor(const std::string& filepath, const AstroC
     if (!std::isfinite(config_.sample_rate_hz) || config_.sample_rate_hz <= 0.0) {
         throw std::invalid_argument("Invalid sample rate (must be > 0 Hz)");
     }
-    if (!std::filesystem::exists(filepath)) {
+    const std::filesystem::path fs_path = astro_fs::utf8_path(filepath);
+    if (!std::filesystem::exists(fs_path)) {
         throw std::runtime_error("IQ file does not exist: " + filepath);
     }
-    if (!std::filesystem::is_regular_file(filepath)) {
+    if (!std::filesystem::is_regular_file(fs_path)) {
         throw std::runtime_error("IQ path is not a regular file: " + filepath);
     }
 
-    uintmax_t raw_sz = std::filesystem::file_size(filepath);
+    uintmax_t raw_sz = std::filesystem::file_size(fs_path);
     if (raw_sz == 0) {
         throw std::runtime_error("IQ file is empty (0 bytes): " + filepath);
     }
@@ -347,15 +341,23 @@ StreamingProcessor::StreamingProcessor(const std::string& filepath, const AstroC
 
     total_duration_s_ = static_cast<double>(total_samples_) / config_.sample_rate_hz;
 
-    if (config_.max_duration_s > 0.0) {
-        uint64_t target_samples = static_cast<uint64_t>(config_.max_duration_s * config_.sample_rate_hz);
-        samples_to_process_ = std::min(total_samples_, target_samples);
+    if (std::isfinite(config_.max_duration_s) && config_.max_duration_s > 0.0) {
+        const double target_d = config_.max_duration_s * config_.sample_rate_hz;
+        if (std::isfinite(target_d) && target_d < static_cast<double>(total_samples_)) {
+            samples_to_process_ = static_cast<uint64_t>(std::max(0.0, target_d));
+        } else {
+            samples_to_process_ = total_samples_;
+        }
     } else {
         samples_to_process_ = total_samples_;
     }
 
     // Align samples to complete FFT blocks to discard trailing incomplete block cleanly
     samples_to_process_ = (samples_to_process_ / static_cast<uint64_t>(config_.fft_size)) * static_cast<uint64_t>(config_.fft_size);
+    if (samples_to_process_ < static_cast<uint64_t>(config_.fft_size)) {
+        throw std::runtime_error("Requested max_duration_s yields fewer than 1 complete FFT block (" +
+                                 std::to_string(config_.fft_size) + " samples) in " + filepath);
+    }
 
     bytes_to_process_ = samples_to_process_ * 4;
     duration_to_process_s_ = static_cast<double>(samples_to_process_) / config_.sample_rate_hz;
@@ -413,8 +415,14 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
     const size_t raw_buffer_bytes = chunk_samples * 4;
 
     // Waterfall decimation parameters (each block advances by hop_samples / sample_rate_hz)
-    double waterfall_dt = std::max(0.05, config_.waterfall_dt_s);
-    int blocks_per_waterfall_row = std::max(1, static_cast<int>(waterfall_dt * config_.sample_rate_hz / static_cast<double>(hop_samples)));
+    const double safe_wf_dt = (std::isfinite(config_.waterfall_dt_s) && config_.waterfall_dt_s > 0.0)
+        ? config_.waterfall_dt_s : 1.0;
+    const double waterfall_dt = std::max(0.05, safe_wf_dt);
+    const double raw_bpr = waterfall_dt * config_.sample_rate_hz / static_cast<double>(hop_samples);
+    const double clamped_bpr = std::isfinite(raw_bpr)
+        ? std::clamp(raw_bpr, 1.0, static_cast<double>(INT_MAX))
+        : static_cast<double>(INT_MAX);
+    const int blocks_per_waterfall_row = static_cast<int>(clamped_bpr);
 
     std::vector<double> current_row_accum(nfft, 0.0);
     int current_row_blocks = 0;
@@ -467,28 +475,7 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
     }
 #endif
 
-    // Validate file opens before spawning background reader
-#ifdef _WIN32
-    HANDLE h_file = CreateFileW(
-        utf8_to_wide(filepath_).c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-        nullptr
-    );
-    if (h_file == INVALID_HANDLE_VALUE) {
-        throw std::runtime_error("Failed to open IQ file for reading: " + filepath_);
-    }
-#else
-    std::ifstream file(filepath_, std::ios::binary);
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open IQ file for reading: " + filepath_);
-    }
-#endif
-
-    // Double-buffered async reader slot state
+    // Pre-allocate all dynamic buffers before opening OS file handles or spawning threads
     struct ReadSlot {
         std::vector<int16_t> buf;
         int blocks = 0;
@@ -500,9 +487,96 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
     slots[0].buf.resize(chunk_samples * 2);
     slots[1].buf.resize(chunk_samples * 2);
 
-    std::atomic<bool> io_stop{false};
+    std::vector<float> thread_power_blocks(chunk_blocks * static_cast<size_t>(nfft));
+    const int16_t* active_raw_buf = nullptr;
+    int active_blocks = 0;
 
-    std::thread reader_thread([&]() {
+    std::atomic<bool> io_stop{false};
+    std::atomic<bool> io_read_error{false};
+    std::thread reader_thread;
+
+    std::mutex pool_mutex;
+    std::condition_variable pool_cv_work;
+    std::condition_variable pool_cv_done;
+    uint64_t job_gen = 0;
+    unsigned int workers_active = 0;
+    bool pool_stop = false;
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    // Validate file opens before spawning background reader
+#ifdef _WIN32
+    HANDLE h_file = CreateFileW(
+        astro_fs::utf8_to_wide(filepath_).c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr
+    );
+    if (h_file == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("Failed to open IQ file for reading: " + filepath_);
+    }
+#else
+    std::ifstream file(astro_fs::utf8_path(filepath_), std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open IQ file for reading: " + filepath_);
+    }
+#endif
+
+    // Construct RAII CleanupGuard immediately after opening file and BEFORE spawning any threads
+    struct CleanupGuard {
+#ifdef _WIN32
+        HANDLE* win_file;
+#else
+        std::ifstream* cpp_file;
+#endif
+        std::mutex& io_m;
+        std::condition_variable& io_cv;
+        std::atomic<bool>& io_stop;
+        std::thread& reader;
+        std::mutex& p_m;
+        std::condition_variable& p_cv;
+        bool& p_stop;
+        std::vector<std::thread>& workers;
+
+        ~CleanupGuard() {
+            {
+                std::lock_guard<std::mutex> lock(io_m);
+                io_stop.store(true, std::memory_order_release);
+            }
+            io_cv.notify_all();
+            if (reader.joinable()) reader.join();
+
+            {
+                std::lock_guard<std::mutex> lock(p_m);
+                p_stop = true;
+            }
+            p_cv.notify_all();
+            for (auto& w : workers) {
+                if (w.joinable()) w.join();
+            }
+#ifdef _WIN32
+            if (win_file && *win_file != INVALID_HANDLE_VALUE) {
+                CloseHandle(*win_file);
+                *win_file = INVALID_HANDLE_VALUE;
+            }
+#else
+            if (cpp_file && cpp_file->is_open()) cpp_file->close();
+#endif
+        }
+    } cleanup{
+#ifdef _WIN32
+        &h_file,
+#else
+        &file,
+#endif
+        io_mutex_, io_cv_, io_stop, reader_thread,
+        pool_mutex, pool_cv_work, pool_stop, workers
+    };
+
+    reader_thread = std::thread([&]() {
         int w_idx = 0;
         uint64_t bytes_fed = 0;
         uint64_t carried_new_bytes = 0;
@@ -543,12 +617,17 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
             size_t space = raw_buffer_bytes - carry_sz;
             size_t to_read = static_cast<size_t>(std::min<uint64_t>(space, rem_target));
             size_t got = 0;
+            bool read_failed = false;
 
 #ifdef _WIN32
             while (got < to_read && !io_stop.load(std::memory_order_acquire) && !is_cancelled()) {
                 DWORD chunk = static_cast<DWORD>(std::min<size_t>(to_read - got, 64ULL * 1024ULL * 1024ULL));
                 DWORD br = 0;
-                if (!ReadFile(h_file, dst + carry_sz + got, chunk, &br, nullptr) || br == 0) {
+                if (!ReadFile(h_file, dst + carry_sz + got, chunk, &br, nullptr)) {
+                    read_failed = true;
+                    break;
+                }
+                if (br == 0) {
                     break;
                 }
                 got += br;
@@ -557,7 +636,23 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
             file.read(reinterpret_cast<char*>(dst + carry_sz), static_cast<std::streamsize>(to_read));
             std::streamsize gr = file.gcount();
             if (gr > 0) got = static_cast<size_t>(gr);
+            if (file.bad()) {
+                read_failed = true;
+            }
 #endif
+            if (read_failed) {
+                io_read_error.store(true, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(io_mutex_);
+                    s.blocks = 0;
+                    s.bytes_consumed = 0;
+                    s.eof = true;
+                    s.ready = true;
+                }
+                io_cv_.notify_all();
+                break;
+            }
+
             bytes_fed += got;
             carried_new_bytes += got;
             size_t total_avail = carry_sz + got;
@@ -593,20 +688,6 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         }
     });
 
-    // Persistent worker pool with RAII teardown
-    std::vector<float> thread_power_blocks(chunk_blocks * static_cast<size_t>(nfft));
-    const int16_t* active_raw_buf = nullptr;
-    int active_blocks = 0;
-
-    std::mutex pool_mutex;
-    std::condition_variable pool_cv_work;
-    std::condition_variable pool_cv_done;
-    uint64_t job_gen = 0;
-    unsigned int workers_active = 0;
-    bool pool_stop = false;
-
-    std::vector<std::thread> workers;
-    workers.reserve(num_threads);
     for (unsigned int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
             uint64_t seen_gen = 0;
@@ -676,56 +757,6 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
             }
         });
     }
-
-    struct CleanupGuard {
-#ifdef _WIN32
-        HANDLE* win_file;
-#else
-        std::ifstream* cpp_file;
-#endif
-        std::mutex& io_m;
-        std::condition_variable& io_cv;
-        std::atomic<bool>& io_stop;
-        std::thread& reader;
-        std::mutex& p_m;
-        std::condition_variable& p_cv;
-        bool& p_stop;
-        std::vector<std::thread>& workers;
-
-        ~CleanupGuard() {
-            {
-                std::lock_guard<std::mutex> lock(io_m);
-                io_stop.store(true, std::memory_order_release);
-            }
-            io_cv.notify_all();
-            if (reader.joinable()) reader.join();
-
-            {
-                std::lock_guard<std::mutex> lock(p_m);
-                p_stop = true;
-            }
-            p_cv.notify_all();
-            for (auto& w : workers) {
-                if (w.joinable()) w.join();
-            }
-#ifdef _WIN32
-            if (win_file && *win_file != INVALID_HANDLE_VALUE) {
-                CloseHandle(*win_file);
-                *win_file = INVALID_HANDLE_VALUE;
-            }
-#else
-            if (cpp_file && cpp_file->is_open()) cpp_file->close();
-#endif
-        }
-    } cleanup{
-#ifdef _WIN32
-        &h_file,
-#else
-        &file,
-#endif
-        io_mutex_, io_cv_, io_stop, reader_thread,
-        pool_mutex, pool_cv_work, pool_stop, workers
-    };
 
     auto append_shifted_waterfall_row = [&](int row_blocks, double timestamp_s) {
         size_t old_sz = flat_waterfall.size();
@@ -827,11 +858,13 @@ StreamingResults StreamingProcessor::process(ProgressCallback progress_cb) {
         }
     }
 
-    const double processed_duration_s = static_cast<double>(bytes_read_so_far / 4) / config_.sample_rate_hz;
-    if (is_cancelled()) {
-        res.total_samples = bytes_read_so_far / 4;
-        res.total_duration_s = processed_duration_s;
+    if (io_read_error.load(std::memory_order_acquire) && !is_cancelled()) {
+        throw std::runtime_error("I/O error while reading IQ file: " + filepath_);
     }
+
+    const double processed_duration_s = static_cast<double>(bytes_read_so_far / 4) / config_.sample_rate_hz;
+    res.total_samples = bytes_read_so_far / 4;
+    res.total_duration_s = processed_duration_s;
 
     // Flush final partial waterfall row only if it covers at least 50% of a row interval
     // (or if no full rows exist yet), recording actual processed integration time (accurate on cancel).

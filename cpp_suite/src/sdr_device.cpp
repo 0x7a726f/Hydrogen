@@ -406,15 +406,15 @@ bool RtlSdrDevice::set_frequency(uint64_t freq_hz) {
     if (fn_get_center_freq) {
         const uint32_t actual = fn_get_center_freq(dev_);
         if (actual == 0) {
-            set_status_detail("Warning: rtlsdr_get_center_freq returned 0 (Tuner PLL lock check failed)");
+            set_status_detail("Error: rtlsdr_get_center_freq returned 0 (Tuner PLL lock check failed)");
+            return false;
+        }
+        center_freq_hz_.store(actual);
+        if (std::abs(static_cast<int64_t>(actual) - static_cast<int64_t>(freq_hz)) > 200000LL) {
+            set_status_detail("Tuned to " + std::to_string(static_cast<double>(actual) / 1e6) + " MHz (PLL clamped/quantized)");
         } else {
-            center_freq_hz_.store(actual);
-            if (std::abs(static_cast<int64_t>(actual) - static_cast<int64_t>(freq_hz)) > 200000LL) {
-                set_status_detail("Tuned to " + std::to_string(static_cast<double>(actual) / 1e6) + " MHz (PLL clamped/quantized)");
-            } else {
-                std::lock_guard<std::mutex> lk(info_mutex_);
-                status_detail_ = "Connected: " + device_name_;
-            }
+            std::lock_guard<std::mutex> lk(info_mutex_);
+            status_detail_ = "Connected: " + device_name_;
         }
     } else {
         center_freq_hz_.store(freq_hz);
@@ -427,7 +427,7 @@ bool RtlSdrDevice::set_frequency(uint64_t freq_hz) {
 }
 
 bool RtlSdrDevice::set_gain(float gain_db, bool auto_gain) {
-    if (!dev_ || !fn_set_tuner_gain_mode) {
+    if (!dev_ || !fn_set_tuner_gain_mode || !std::isfinite(gain_db)) {
         return false;
     }
 
@@ -438,6 +438,10 @@ bool RtlSdrDevice::set_gain(float gain_db, bool auto_gain) {
         auto_gain_.store(true);
         gain_db_.store(gain_db);
         return true;
+    }
+
+    if (!fn_set_tuner_gain) {
+        return false;
     }
 
     // Snap requested gain to closest discrete hardware gain step from cached table
@@ -457,9 +461,6 @@ bool RtlSdrDevice::set_gain(float gain_db, bool auto_gain) {
     }
 
     if (fn_set_tuner_gain_mode(dev_, 1) != 0) {
-        return false;
-    }
-    if (!fn_set_tuner_gain) {
         return false;
     }
     if (fn_set_tuner_gain(dev_, static_cast<int>(std::lround(target_gain * 10.0f))) != 0) {
@@ -486,7 +487,9 @@ bool RtlSdrDevice::set_ppm(int ppm) {
     if (!dev_ || !fn_set_freq_correction) {
         return false;
     }
-    if (fn_set_freq_correction(dev_, ppm) != 0) {
+    // librtlsdr returns -2 when the requested PPM equals the currently active correction (no-op)
+    const int ret = fn_set_freq_correction(dev_, ppm);
+    if (ret != 0 && ret != -2) {
         return false;
     }
     ppm_.store(ppm);

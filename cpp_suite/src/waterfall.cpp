@@ -17,8 +17,8 @@ static inline uint32_t make_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 25
 static constexpr float kEmptyDbSentinel = -1.0e9f;
 
 Waterfall::Waterfall(int width, int height)
-    : width_(width), height_(height) {
-    const size_t total = static_cast<size_t>(std::max(1, width_)) * static_cast<size_t>(std::max(1, height_));
+    : width_(std::max(1, width)), height_(std::max(1, height)) {
+    const size_t total = static_cast<size_t>(width_) * static_cast<size_t>(height_);
     ring_.assign(total, make_rgba(13, 17, 23));
     db_ring_.assign(total, kEmptyDbSentinel);
     head_row_ = 0;
@@ -100,6 +100,7 @@ void Waterfall::recolor_all_rows() {
 }
 
 void Waterfall::recolor(float min_db, float max_db) {
+    if (!std::isfinite(min_db) || !std::isfinite(max_db)) return;
     if (std::abs(min_db - last_min_db_) < 1e-4f && std::abs(max_db - last_max_db_) < 1e-4f) {
         return;
     }
@@ -154,7 +155,19 @@ void Waterfall::resize_preserving_history(int width, int height) {
                 const int x0 = static_cast<int>(fx);
                 const int x1 = std::min(x0 + 1, width_ - 1);
                 const float t = fx - static_cast<float>(x0);
-                dst_db[x] = src_db[x0] + t * (src_db[x1] - src_db[x0]);
+                const float v0 = src_db[x0];
+                const float v1 = src_db[x1];
+                const bool ok0 = std::isfinite(v0) && v0 > kEmptyDbSentinel * 0.5f;
+                const bool ok1 = std::isfinite(v1) && v1 > kEmptyDbSentinel * 0.5f;
+                if (ok0 && ok1) {
+                    dst_db[x] = v0 + t * (v1 - v0);
+                } else if (ok0) {
+                    dst_db[x] = v0;
+                } else if (ok1) {
+                    dst_db[x] = v1;
+                } else {
+                    dst_db[x] = last_min_db_;
+                }
             }
         }
         map_db_row_to_rgba(dst_db, dst_px, width, last_min_db_, last_max_db_);
@@ -287,14 +300,17 @@ void Waterfall::rebuild_palette_lut() {
 void Waterfall::add_line(const std::vector<float>& power_db, float min_db, float max_db) {
     if (width_ <= 0 || height_ <= 0 || power_db.empty() || ring_.empty()) return;
 
+    const float safe_min = std::isfinite(min_db) ? min_db : last_min_db_;
+    const float safe_max = std::isfinite(max_db) ? max_db : last_max_db_;
+
     if (filled_rows_ > 0 &&
-        (std::abs(min_db - last_min_db_) > 1e-4f || std::abs(max_db - last_max_db_) > 1e-4f)) {
-        last_min_db_ = min_db;
-        last_max_db_ = max_db;
+        (std::abs(safe_min - last_min_db_) > 1e-4f || std::abs(safe_max - last_max_db_) > 1e-4f)) {
+        last_min_db_ = safe_min;
+        last_max_db_ = safe_max;
         recolor_all_rows();
     } else {
-        last_min_db_ = min_db;
-        last_max_db_ = max_db;
+        last_min_db_ = safe_min;
+        last_max_db_ = safe_max;
     }
 
     // Step newest row pointer backwards in O(1) instead of memmoving entire history
@@ -309,9 +325,14 @@ void Waterfall::add_line(const std::vector<float>& power_db, float min_db, float
             size_t b0 = static_cast<size_t>(x) * n_pwr / static_cast<size_t>(width_);
             size_t b1 = static_cast<size_t>(x + 1) * n_pwr / static_cast<size_t>(width_);
             if (b1 <= b0) b1 = std::min(b0 + 1, n_pwr);
-            float peak = power_db[b0];
-            for (size_t b = b0 + 1; b < b1; ++b) {
-                if (power_db[b] > peak) peak = power_db[b];
+            float peak = safe_min;
+            bool has_finite = false;
+            for (size_t b = b0; b < b1; ++b) {
+                const float v = power_db[b];
+                if (std::isfinite(v) && (!has_finite || v > peak)) {
+                    peak = v;
+                    has_finite = true;
+                }
             }
             dst_db[x] = peak;
         }
@@ -323,11 +344,21 @@ void Waterfall::add_line(const std::vector<float>& power_db, float min_db, float
             const size_t b0 = static_cast<size_t>(pos);
             const size_t b1 = std::min(b0 + 1, n_pwr - 1);
             const float frac = pos - static_cast<float>(b0);
-            dst_db[x] = power_db[b0] + frac * (power_db[b1] - power_db[b0]);
+            const float v0 = power_db[b0];
+            const float v1 = power_db[b1];
+            if (std::isfinite(v0) && std::isfinite(v1)) {
+                dst_db[x] = v0 + frac * (v1 - v0);
+            } else if (std::isfinite(v0)) {
+                dst_db[x] = v0;
+            } else if (std::isfinite(v1)) {
+                dst_db[x] = v1;
+            } else {
+                dst_db[x] = safe_min;
+            }
         }
     }
 
-    map_db_row_to_rgba(dst_db, dst_row, width_, min_db, max_db);
+    map_db_row_to_rgba(dst_db, dst_row, width_, safe_min, safe_max);
     if (filled_rows_ < height_) {
         ++filled_rows_;
     }

@@ -282,7 +282,9 @@ static void test_streaming_fft_parity_and_sidecar_dedup() {
         writer.feed_samples(chunk.data(), chunk.size());
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    for (int wait_ms = 0; wait_ms < 1000 && writer.is_recording(); wait_ms += 10) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     TEST_ASSERT(!writer.is_recording(), "Cs16Writer auto-stopped non-blockingly after max_duration_s");
     TEST_ASSERT(fs::exists(tmp_dir / "autostop_cap.json") && fs::exists(tmp_dir / "autostop_cap.txt"),
                 "Cs16Writer flushed both .json and .txt sidecars on auto-stop");
@@ -294,18 +296,28 @@ static void test_simd_fft_and_rfi_kernels() {
     std::cout << "[Test 6] AVX2 exp/FFT, Batcher median-15 & O(N log N) Filter...\n";
 
 #ifdef __AVX2__
-    // 1. fast_exp_pd_avx2 precision & underflow handling
-    alignas(32) const double exp_in[8] = {-800.0, -708.1, -50.0, -0.5, 0.0, 0.5, 10.0, 300.0};
+    // 1. fast_exp_pd_avx2 precision, near-DBL_MAX/DBL_MIN accuracy, & underflow handling
+    alignas(32) const double exp_in[8] = {-800.0, -746.0, -708.1, -50.0, 0.0, 10.0, 300.0, 709.5};
     alignas(32) double exp_out[8] = {};
     _mm256_storeu_pd(exp_out,     SimdDsp::fast_exp_pd_avx2(_mm256_loadu_pd(exp_in)));
     _mm256_storeu_pd(exp_out + 4, SimdDsp::fast_exp_pd_avx2(_mm256_loadu_pd(exp_in + 4)));
-    TEST_ASSERT(exp_out[0] == 0.0 && exp_out[1] == 0.0, "fast_exp_pd_avx2 flushes <= -708 safely to 0");
+    TEST_ASSERT(exp_out[0] == 0.0 && exp_out[1] == 0.0, "fast_exp_pd_avx2 flushes <= -745.2 safely to 0");
     double max_exp_rel_err = 0.0;
     for (int k = 2; k < 8; ++k) {
         double ref = std::exp(exp_in[k]);
         max_exp_rel_err = std::max(max_exp_rel_err, std::abs(exp_out[k] - ref) / ref);
     }
-    TEST_ASSERT(max_exp_rel_err < 1e-13, "fast_exp_pd_avx2 matches std::exp to < 1e-13 relative error");
+    TEST_ASSERT(max_exp_rel_err < 1e-13, "fast_exp_pd_avx2 matches std::exp to < 1e-13 relative error across normal range");
+
+    // fast_log10_pd_avx2 subnormal accuracy
+    alignas(32) const double sub_in[4] = {1e-320, 1e-315, 1e-310, 2.2250738585072014e-308};
+    alignas(32) double sub_out[4] = {};
+    _mm256_storeu_pd(sub_out, SimdDsp::fast_log10_pd_avx2(_mm256_loadu_pd(sub_in)));
+    double max_sub_err = 0.0;
+    for (int k = 0; k < 4; ++k) {
+        max_sub_err = std::max(max_sub_err, std::abs(sub_out[k] - std::log10(sub_in[k])));
+    }
+    TEST_ASSERT(max_sub_err < 1e-11, "fast_log10_pd_avx2 accurately handles positive subnormals");
 #endif
 
     // 2. SimdDsp::fft_cpx_f32_avx2 parity against KissFFT for sizes 8..4096
@@ -780,7 +792,7 @@ static void test_math_accuracy_and_solvers() {
         TEST_ASSERT(sm.success && std::abs(sm.moment0_k_kms - expected_m0) < 3.0 &&
                     std::abs(sm.moment1_kms - 9.5) < 0.3 &&
                     std::abs(sm.moment2_sigma_kms - 6.0) < 0.4,
-                    "SpectralMoments recovered exact analytical M0, M1, and sqrt(M2)");
+                    "SpectralMoments recovered exact analytical M0, M1, and sqrt");
 
         // 5e. TripleGaussian: 3 distinct Galactic spiral arms at -30, +2, and +34 km/s
         for (int i = 0; i < n; ++i) {

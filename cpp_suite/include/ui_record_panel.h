@@ -110,7 +110,7 @@ private:
     std::vector<float> peak_hold_data_;
     std::vector<ImVec2> peak_scratch_;
     bool pending_wf_sample_ = false;
-    float peak_freq_hz_ = 0.0f;
+    double peak_freq_hz_ = 0.0;
     float peak_dbfs_ = -110.0f;
     bool show_peak_hold_ = false;
     double peak_hold_freq_hz_ = 0.0;

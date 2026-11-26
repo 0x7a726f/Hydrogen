@@ -37,11 +37,11 @@ private:
     AppState state_;
     ui_obs::UiFonts fonts_;
 
-    // Core SDR & DSP Subsystems
-    SdrController sdr_;
+    // Core SDR & DSP Subsystems (sdr_ declared last so it is destroyed before dsp_/writer_/waterfall_)
     DspPipeline dsp_;
     Cs16Writer writer_;
     Waterfall waterfall_;
+    SdrController sdr_;
 
     // Section Panels
     UiRecordPanel record_panel_;

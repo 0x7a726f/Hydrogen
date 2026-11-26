@@ -1,4 +1,5 @@
 #include "sidecar_reader.h"
+#include "utf8_path.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -17,6 +18,11 @@ static std::string trim(const std::string& str) {
     return str.substr(start, end - start + 1);
 }
 
+static std::string ltrim_ws(const std::string& str) {
+    size_t start = str.find_first_not_of(" \t\r\n");
+    return (start == std::string::npos) ? "" : str.substr(start);
+}
+
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -24,12 +30,37 @@ static int hex_nibble(char c) {
     return -1;
 }
 
-// JSON key-value scanner that properly parses and skips quoted string literals
+static void append_utf8_codepoint(std::string& out, uint32_t cp) {
+    if (cp < 0x80u) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800u) {
+        out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp < 0x10000u) {
+        out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0x10FFFFu) {
+        out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+}
+
+// JSON key-value scanner that skips quoted string literals and tracks {} object depth
 static size_t find_json_value_start(const std::string& content, const std::string& key) {
     const size_t n = content.size();
     size_t i = 0;
+    int brace_depth = 0;
+    int bracket_depth = 0;
     while (i < n) {
-        if (content[i] == '"') {
+        char ch = content[i];
+        if (ch == '{') { ++brace_depth; ++i; continue; }
+        if (ch == '}') { if (brace_depth > 0) --brace_depth; ++i; continue; }
+        if (ch == '[') { ++bracket_depth; ++i; continue; }
+        if (ch == ']') { if (bracket_depth > 0) --bracket_depth; ++i; continue; }
+        if (ch == '"') {
             ++i;
             std::string decoded_token;
             bool closed = false;
@@ -65,7 +96,7 @@ static size_t find_json_value_start(const std::string& content, const std::strin
             if (p < n && content[p] == ':') {
                 ++p;
                 while (p < n && std::isspace(static_cast<unsigned char>(content[p]))) ++p;
-                if (decoded_token == key) {
+                if (brace_depth == 1 && bracket_depth == 0 && decoded_token == key) {
                     return p;
                 }
                 i = p;
@@ -78,13 +109,50 @@ static size_t find_json_value_start(const std::string& content, const std::strin
     return std::string::npos;
 }
 
+// Strict RFC 8259 JSON number syntax (rejects hex, leading '+', NaN/Inf, trailing junk)
 static bool json_extract_number(const std::string& content, const std::string& key, double& out_val) {
     size_t p = find_json_value_start(content, key);
     if (p == std::string::npos || p >= content.size()) return false;
-    const char* start = content.c_str() + p;
+
+    const size_t n = content.size();
+    size_t cur = p;
+    if (cur < n && content[cur] == '-') ++cur;
+    if (cur >= n || !std::isdigit(static_cast<unsigned char>(content[cur]))) return false;
+
+    if (content[cur] == '0') {
+        ++cur;
+        // Leading zeros like 00 or 0x10 are invalid JSON numbers
+        if (cur < n && std::isdigit(static_cast<unsigned char>(content[cur]))) return false;
+    } else {
+        while (cur < n && std::isdigit(static_cast<unsigned char>(content[cur]))) ++cur;
+    }
+
+    if (cur < n && content[cur] == '.') {
+        ++cur;
+        if (cur >= n || !std::isdigit(static_cast<unsigned char>(content[cur]))) return false;
+        while (cur < n && std::isdigit(static_cast<unsigned char>(content[cur]))) ++cur;
+    }
+
+    if (cur < n && (content[cur] == 'e' || content[cur] == 'E')) {
+        ++cur;
+        if (cur < n && (content[cur] == '+' || content[cur] == '-')) ++cur;
+        if (cur >= n || !std::isdigit(static_cast<unsigned char>(content[cur]))) return false;
+        while (cur < n && std::isdigit(static_cast<unsigned char>(content[cur]))) ++cur;
+    }
+
+    // Must be followed by a valid JSON value delimiter or EOF
+    if (cur < n) {
+        char delim = content[cur];
+        if (!std::isspace(static_cast<unsigned char>(delim)) &&
+            delim != ',' && delim != '}' && delim != ']') {
+            return false;
+        }
+    }
+
+    const std::string token = content.substr(p, cur - p);
     char* end = nullptr;
-    double val = std::strtod(start, &end);
-    if (end != start && std::isfinite(val)) {
+    double val = std::strtod(token.c_str(), &end);
+    if (end == token.c_str() + token.size() && std::isfinite(val)) {
         out_val = val;
         return true;
     }
@@ -115,13 +183,24 @@ static bool json_extract_string(const std::string& content, const std::string& k
                         int h2 = hex_nibble(content[i + 3]);
                         int h3 = hex_nibble(content[i + 4]);
                         if (h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0) {
-                            int cp = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
-                            if (cp < 0x80) {
-                                decoded.push_back(static_cast<char>(cp));
-                            } else {
-                                decoded.push_back('?');
-                            }
+                            uint32_t cp = static_cast<uint32_t>((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
                             i += 4;
+                            // Handle UTF-16 surrogate pair if present
+                            if (cp >= 0xD800u && cp <= 0xDBFFu && i + 6 < content.size() &&
+                                content[i + 1] == '\\' && content[i + 2] == 'u') {
+                                int l0 = hex_nibble(content[i + 3]);
+                                int l1 = hex_nibble(content[i + 4]);
+                                int l2 = hex_nibble(content[i + 5]);
+                                int l3 = hex_nibble(content[i + 6]);
+                                if (l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0) {
+                                    uint32_t low = static_cast<uint32_t>((l0 << 12) | (l1 << 8) | (l2 << 4) | l3);
+                                    if (low >= 0xDC00u && low <= 0xDFFFu) {
+                                        cp = 0x10000u + (((cp - 0xD800u) << 10) | (low - 0xDC00u));
+                                        i += 6;
+                                    }
+                                }
+                            }
+                            append_utf8_codepoint(decoded, cp);
                         } else {
                             decoded.push_back('u');
                         }
@@ -156,7 +235,7 @@ static bool json_extract_bool(const std::string& content, const std::string& key
 }
 
 bool SidecarReader::parse_json_sidecar(const std::string& json_path, ObservationMetadata& meta) {
-    std::ifstream file(json_path);
+    std::ifstream file(astro_fs::utf8_path(json_path));
     if (!file.is_open()) return false;
 
     std::stringstream buffer;
@@ -165,15 +244,15 @@ bool SidecarReader::parse_json_sidecar(const std::string& json_path, Observation
 
     bool has_data = false;
     double val = 0.0;
-    if (json_extract_number(content, "center_freq_hz", val) ||
-        json_extract_number(content, "center_frequency_hz", val) ||
-        json_extract_number(content, "fc_hz", val)) {
+    if ((json_extract_number(content, "center_freq_hz", val) ||
+         json_extract_number(content, "center_frequency_hz", val) ||
+         json_extract_number(content, "fc_hz", val)) && val > 0.0) {
         meta.center_freq_hz = val;
         has_data = true;
     }
-    if (json_extract_number(content, "sample_rate_hz", val) ||
-        json_extract_number(content, "sampling_rate_hz", val) ||
-        json_extract_number(content, "fs_hz", val)) {
+    if ((json_extract_number(content, "sample_rate_hz", val) ||
+         json_extract_number(content, "sampling_rate_hz", val) ||
+         json_extract_number(content, "fs_hz", val)) && val > 0.0) {
         meta.sample_rate_hz = val;
         has_data = true;
     }
@@ -203,45 +282,52 @@ bool SidecarReader::parse_json_sidecar(const std::string& json_path, Observation
 
     if (has_data) {
         meta.found_sidecar = true;
-        meta.sidecar_source = std::filesystem::path(json_path).filename().string();
+        meta.sidecar_source = astro_fs::path_to_utf8(astro_fs::utf8_path(json_path).filename());
         return true;
     }
     return false;
 }
 
 bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMetadata& meta) {
-    std::ifstream file(txt_path);
+    std::ifstream file(astro_fs::utf8_path(txt_path));
     if (!file.is_open()) return false;
 
-    std::string line;
+    auto starts_with = [](const std::string& s, const char* prefix) {
+        return s.rfind(prefix, 0) == 0;
+    };
+
+    std::string raw_line;
     bool has_data = false;
 
-    while (std::getline(file, line)) {
-        if (line.find("Tuned SDR Center LO:") != std::string::npos ||
-            line.find("Center Frequency (LO):") != std::string::npos ||
-            line.find("Center Frequency:") != std::string::npos) {
+    while (std::getline(file, raw_line)) {
+        const std::string line = ltrim_ws(raw_line);
+        if (line.empty()) continue;
+
+        if (starts_with(line, "Tuned SDR Center LO:") ||
+            starts_with(line, "Center Frequency (LO):") ||
+            starts_with(line, "Center Frequency:")) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
                 double parsed_fc = 0.0;
-                if (try_parse_frequency_or_rate(val_str, parsed_fc, true)) {
+                if (try_parse_frequency_or_rate(val_str, parsed_fc, true) && parsed_fc > 0.0) {
                     meta.center_freq_hz = parsed_fc;
                     has_data = true;
                 }
             }
-        } else if (line.find("Sampling Rate (Fs):") != std::string::npos ||
-                   line.find("SDR Sample Rate:") != std::string::npos ||
-                   line.find("Sample Rate:") != std::string::npos) {
+        } else if (starts_with(line, "Sampling Rate (Fs):") ||
+                   starts_with(line, "SDR Sample Rate:") ||
+                   starts_with(line, "Sample Rate:")) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
                 double parsed_fs = 0.0;
-                if (try_parse_sample_rate(val_str, parsed_fs)) {
+                if (try_parse_sample_rate(val_str, parsed_fs) && parsed_fs > 0.0) {
                     meta.sample_rate_hz = parsed_fs;
                     has_data = true;
                 }
             }
-        } else if (line.find("RF Gain:") != std::string::npos || line.find("Gain:") != std::string::npos) {
+        } else if (starts_with(line, "RF Gain:") || starts_with(line, "Gain:")) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
@@ -254,7 +340,7 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
                     }
                 } catch (...) {}
             }
-        } else if (line.find("Bias-Tee") != std::string::npos || line.find("Bias Tee") != std::string::npos) {
+        } else if (starts_with(line, "Bias-Tee") || starts_with(line, "Bias Tee")) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
@@ -270,23 +356,36 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
                                               val_str.find("true") != std::string::npos);
                 has_data = true;
             }
-        } else if (line.find("LO Frequency Offset:") != std::string::npos ||
-                   line.find("LO Offset") != std::string::npos ||
-                   line.find("Offset Shift:") != std::string::npos) {
+        } else if (starts_with(line, "LO Frequency Offset:") ||
+                   starts_with(line, "LO Offset") ||
+                   starts_with(line, "Offset Shift:")) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string val_str = trim(line.substr(colon + 1));
                 val_str.erase(std::remove(val_str.begin(), val_str.end(), ','), val_str.end());
                 try {
-                    double parsed_off = std::stod(val_str);
+                    size_t idx = 0;
+                    double parsed_off = std::stod(val_str, &idx);
                     if (std::isfinite(parsed_off)) {
+                        std::string unit_tail = val_str.substr(idx);
+                        std::transform(unit_tail.begin(), unit_tail.end(), unit_tail.begin(),
+                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        // Strip leading spaces to inspect the immediate unit token
+                        unit_tail = ltrim_ws(unit_tail);
+                        if (unit_tail.rfind("mhz", 0) == 0) {
+                            parsed_off *= 1e3;
+                        } else if (unit_tail.rfind("ghz", 0) == 0) {
+                            parsed_off *= 1e6;
+                        } else if (unit_tail.rfind("hz", 0) == 0) {
+                            parsed_off *= 1e-3;
+                        }
                         meta.lo_offset_khz = parsed_off;
                         has_data = true;
                     }
                 } catch (...) {}
             }
-        } else if (line.find("Capture Timestamp:") != std::string::npos ||
-                   line.find("Timestamp:") != std::string::npos) {
+        } else if (starts_with(line, "Capture Timestamp:") ||
+                   starts_with(line, "Timestamp:")) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string ts = trim(line.substr(colon + 1));
@@ -295,8 +394,8 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
                     has_data = true;
                 }
             }
-        } else if (line.find("Device:") != std::string::npos || line.find("Frontend Device:") != std::string::npos ||
-                   line.find("Device Name:") != std::string::npos || line.find("Receiver Hardware:") != std::string::npos) {
+        } else if (starts_with(line, "Device:") || starts_with(line, "Frontend Device:") ||
+                   starts_with(line, "Device Name:") || starts_with(line, "Receiver Hardware:")) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string dev = trim(line.substr(colon + 1));
@@ -310,14 +409,14 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
 
     if (has_data) {
         meta.found_sidecar = true;
-        meta.sidecar_source = std::filesystem::path(txt_path).filename().string();
+        meta.sidecar_source = astro_fs::path_to_utf8(astro_fs::utf8_path(txt_path).filename());
         return true;
     }
     return false;
 }
 
 bool SidecarReader::parse_filename_fallback(const std::string& cs16_path, ObservationMetadata& meta) {
-    std::string fname = std::filesystem::path(cs16_path).filename().string();
+    std::string fname = astro_fs::path_to_utf8(astro_fs::utf8_path(cs16_path).filename());
     // Supported patterns include:
     //   2026-11-11_17-47-26_2400000SPS_1420410000Hz.cs16
     //   hi_capture_20261118_120000_1420.500MHz_2.40MSPS.cs16
@@ -363,38 +462,84 @@ bool SidecarReader::parse_filename_fallback(const std::string& cs16_path, Observ
 
 ObservationMetadata SidecarReader::parse(const std::string& cs16_path) {
     ObservationMetadata meta;
-    std::filesystem::path p(cs16_path);
+    std::filesystem::path p = astro_fs::utf8_path(cs16_path);
     std::filesystem::path base_path = p.parent_path() / p.stem();
+
+    auto merge_missing = [](ObservationMetadata& dst, const ObservationMetadata& src) {
+        if (!src.found_sidecar) return;
+        bool merged_any = false;
+        if (dst.center_freq_hz <= 0.0 && src.center_freq_hz > 0.0) {
+            dst.center_freq_hz = src.center_freq_hz;
+            merged_any = true;
+        }
+        if (dst.sample_rate_hz <= 0.0 && src.sample_rate_hz > 0.0) {
+            dst.sample_rate_hz = src.sample_rate_hz;
+            merged_any = true;
+        }
+        if (!dst.has_gain && src.has_gain) {
+            dst.gain_db = src.gain_db;
+            dst.has_gain = true;
+            merged_any = true;
+        }
+        if (dst.device_name.empty() && !src.device_name.empty()) {
+            dst.device_name = src.device_name;
+            merged_any = true;
+        }
+        if (dst.timestamp.empty() && !src.timestamp.empty()) {
+            dst.timestamp = src.timestamp;
+            merged_any = true;
+        }
+        if (!dst.found_sidecar) {
+            dst = src;
+        } else if (merged_any && !src.sidecar_source.empty() &&
+                   dst.sidecar_source.find(src.sidecar_source) == std::string::npos) {
+            dst.sidecar_source += " + " + src.sidecar_source;
+        }
+    };
 
     std::error_code ec;
     // 1. Try .json sidecar
     std::filesystem::path json_path = base_path;
     json_path += ".json";
-    if (std::filesystem::exists(json_path, ec) && parse_json_sidecar(json_path.string(), meta)) {
-        return meta;
+    if (std::filesystem::exists(json_path, ec)) {
+        parse_json_sidecar(astro_fs::path_to_utf8(json_path), meta);
     }
 
-    // 2. Try .txt sidecar
-    std::filesystem::path txt_path = base_path;
-    txt_path += ".txt";
-    if (std::filesystem::exists(txt_path, ec) && parse_txt_sidecar(txt_path.string(), meta)) {
-        return meta;
+    // If JSON was missing or lacked core RF fields, merge from .txt sidecar
+    if (meta.center_freq_hz <= 0.0 || meta.sample_rate_hz <= 0.0) {
+        std::filesystem::path txt_path = base_path;
+        txt_path += ".txt";
+        if (std::filesystem::exists(txt_path, ec)) {
+            ObservationMetadata txt_meta;
+            if (parse_txt_sidecar(astro_fs::path_to_utf8(txt_path), txt_meta)) {
+                merge_missing(meta, txt_meta);
+            }
+        }
     }
 
-    // 3. Fallback: Parse from filename tokens
-    parse_filename_fallback(cs16_path, meta);
+    // 3. Fallback: Merge any still-missing RF fields from filename tokens
+    if (meta.center_freq_hz <= 0.0 || meta.sample_rate_hz <= 0.0) {
+        ObservationMetadata fname_meta;
+        if (parse_filename_fallback(cs16_path, fname_meta)) {
+            merge_missing(meta, fname_meta);
+        }
+    }
+
     return meta;
 }
 
 bool SidecarReader::apply_to_config(const ObservationMetadata& meta, AstroConfig& config) {
     if (!meta.found_sidecar) return false;
-    if (meta.center_freq_hz > 1e5) {
+    bool applied = false;
+    if (std::isfinite(meta.center_freq_hz) && meta.center_freq_hz > 1e5) {
         config.center_freq_hz = meta.center_freq_hz;
+        applied = true;
     }
-    if (meta.sample_rate_hz > 1e4) {
+    if (std::isfinite(meta.sample_rate_hz) && meta.sample_rate_hz > 1e4) {
         config.sample_rate_hz = meta.sample_rate_hz;
+        applied = true;
     }
-    return true;
+    return applied;
 }
 
 std::vector<std::string> SidecarReader::scan_cs16_files(const std::vector<std::string>& search_paths) {
@@ -407,10 +552,11 @@ std::vector<std::string> SidecarReader::scan_cs16_files(const std::vector<std::s
 
     for (const auto& path_str : search_paths) {
         std::error_code ec;
-        if (!std::filesystem::exists(path_str, ec) || ec) continue;
+        const std::filesystem::path search_fs = astro_fs::utf8_path(path_str);
+        if (!std::filesystem::exists(search_fs, ec) || ec) continue;
 
         std::filesystem::recursive_directory_iterator it(
-            path_str, std::filesystem::directory_options::skip_permission_denied, ec);
+            search_fs, std::filesystem::directory_options::skip_permission_denied, ec);
         std::filesystem::recursive_directory_iterator end;
         if (ec) continue;
 
@@ -419,7 +565,7 @@ std::vector<std::string> SidecarReader::scan_cs16_files(const std::vector<std::s
             std::error_code file_ec;
             if (!entry.is_regular_file(file_ec) || file_ec) continue;
 
-            std::string ext = entry.path().extension().string();
+            std::string ext = astro_fs::path_to_utf8(entry.path().extension());
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (ext != ".cs16") continue;
@@ -427,10 +573,12 @@ std::vector<std::string> SidecarReader::scan_cs16_files(const std::vector<std::s
             std::error_code canon_ec;
             auto canon = std::filesystem::weakly_canonical(entry.path(), canon_ec);
             std::error_code abs_ec;
-            std::string abs_path = std::filesystem::absolute(entry.path(), abs_ec).string();
-            if (abs_ec || abs_path.empty()) abs_path = entry.path().string();
+            std::string abs_path = astro_fs::path_to_utf8(std::filesystem::absolute(entry.path(), abs_ec));
+            if (abs_ec || abs_path.empty()) abs_path = astro_fs::path_to_utf8(entry.path());
 
-            std::string canon_key = canon_ec ? std::filesystem::path(abs_path).generic_string() : canon.generic_string();
+            std::string canon_key = canon_ec
+                ? astro_fs::path_to_generic_utf8(astro_fs::utf8_path(abs_path))
+                : astro_fs::path_to_generic_utf8(canon);
 #ifdef _WIN32
             std::transform(canon_key.begin(), canon_key.end(), canon_key.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });

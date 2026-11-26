@@ -114,8 +114,17 @@ std::vector<double> RFIFilter::mitigate(
     out_num_rfi = 0;
     if (nfft < 32 || static_cast<int>(freqs_mhz.size()) != nfft) return clean_power;
 
-    const double hi_half_width_mhz = config.hi_protection_half_width_khz / 1e3;
-    const int edge_bins = static_cast<int>(nfft * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
+    if (!std::isfinite(config.rfi_threshold_mad) || config.rfi_threshold_mad <= 0.0) {
+        return clean_power;
+    }
+
+    const double hi_half_width_mhz = std::isfinite(config.hi_protection_half_width_khz)
+        ? (std::max(0.0, config.hi_protection_half_width_khz) / 1e3)
+        : 0.0;
+    const double safe_edge_frac = std::isfinite(config.passband_edge_fraction)
+        ? std::clamp(config.passband_edge_fraction, 0.0, 0.45)
+        : 0.08;
+    const int edge_bins = static_cast<int>(nfft * safe_edge_frac);
 
     thread_local std::vector<uint8_t> passband_mask;
     thread_local std::vector<uint8_t> hi_window;
@@ -155,6 +164,12 @@ std::vector<double> RFIFilter::mitigate(
     tl_p_db.resize(static_cast<size_t>(nfft));
     tl_residuals.resize(static_cast<size_t>(nfft));
     SimdDsp::power_to_db_f64(power.data(), tl_p_db.data(), static_cast<size_t>(nfft), 1e-30);
+    // Clamp +Inf/NaN dB values to finite range so (pdb - median) never creates NaN for nth_element
+    for (int idx = 0; idx < nfft; ++idx) {
+        if (!std::isfinite(tl_p_db[static_cast<size_t>(idx)])) {
+            tl_p_db[static_cast<size_t>(idx)] = (tl_p_db[static_cast<size_t>(idx)] > 0.0) ? 3000.0 : -300.0;
+        }
+    }
 
     const double* pdb_ptr = tl_p_db.data();
     double* res_ptr = tl_residuals.data();
@@ -184,7 +199,7 @@ std::vector<double> RFIFilter::mitigate(
         tl_residuals_valid.reserve(static_cast<size_t>(nfft));
     }
     for (int idx = 0; idx < nfft; ++idx) {
-        if (valid_mask[static_cast<size_t>(idx)]) {
+        if (valid_mask[static_cast<size_t>(idx)] && std::isfinite(res_ptr[idx])) {
             tl_residuals_valid.push_back(res_ptr[idx]);
         }
     }
@@ -202,7 +217,7 @@ std::vector<double> RFIFilter::mitigate(
     // Floor at 1e-4 dB so smooth noiseless synthetic passband curvature cannot false-trigger
     const double sigma_est = std::max(1e-4, 1.4826 * mad);
 
-    const double threshold = std::max(0.0, config.rfi_threshold_mad) * sigma_est;
+    const double threshold = config.rfi_threshold_mad * sigma_est;
     core_rfi.assign(static_cast<size_t>(nfft), 0);
     is_rfi.assign(static_cast<size_t>(nfft), 0);
 

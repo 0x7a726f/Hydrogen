@@ -10,6 +10,11 @@ SdrController::SdrController()
 }
 
 SdrController::~SdrController() {
+    {
+        std::lock_guard<std::mutex> clk(cb_mutex_);
+        sample_callbacks_.clear();
+        freq_changed_cb_ = nullptr;
+    }
     shutdown();
 }
 

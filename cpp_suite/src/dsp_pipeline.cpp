@@ -22,7 +22,9 @@ DspPipeline::~DspPipeline() {
 }
 
 void DspPipeline::set_fft_size(int size) {
-    size = std::max(16, (size + 1) & ~1);
+    // M8: Clamp before rounding up to even to prevent signed int overflow at INT_MAX
+    size = std::clamp(size, 16, 1 << 20);
+    size = (size + 1) & ~1;
     std::lock_guard<std::mutex> dsp_lock(dsp_mutex_);
     if (size != fft_size_.load(std::memory_order_relaxed)) {
         fft_size_.store(size, std::memory_order_release);
@@ -38,6 +40,7 @@ void DspPipeline::set_fft_size(int size) {
 }
 
 void DspPipeline::set_averaging(float factor) {
+    if (!std::isfinite(factor)) return;
     avg_factor_.store(std::clamp(factor, 0.0f, 0.95f), std::memory_order_relaxed);
 }
 
@@ -86,6 +89,8 @@ void DspPipeline::update_window() {
 }
 
 void DspPipeline::feed_samples(const uint8_t* data, size_t length) {
+    // M8: Enforce even I/Q byte alignment so odd transfers never swap I and Q channels
+    length &= ~size_t(1);
     if (!data || length == 0) return;
 
     std::lock_guard<std::mutex> lock(sample_mutex_);
@@ -100,9 +105,10 @@ void DspPipeline::feed_samples(const uint8_t* data, size_t length) {
         // Accumulate small chunks into a rolling buffer bounded to needed_bytes
         sample_buffer_.insert(sample_buffer_.end(), data, data + length);
         if (sample_buffer_.size() > needed_bytes) {
-            const size_t excess = sample_buffer_.size() - needed_bytes;
-            std::memmove(sample_buffer_.data(), sample_buffer_.data() + excess, needed_bytes);
-            sample_buffer_.resize(needed_bytes);
+            const size_t excess = (sample_buffer_.size() - needed_bytes) & ~size_t(1);
+            const size_t keep = sample_buffer_.size() - excess;
+            std::memmove(sample_buffer_.data(), sample_buffer_.data() + excess, keep);
+            sample_buffer_.resize(keep);
         }
         if (sample_buffer_.size() >= needed_bytes) {
             has_new_samples_ = true;
@@ -174,6 +180,9 @@ bool DspPipeline::get_power_spectrum(std::vector<float>& out_power, double& out_
         SimdDsp::fft_cpx_f32_avx2(reinterpret_cast<float*>(fft_in_.data()), n_pts)) {
         fft_power_src = reinterpret_cast<const float*>(fft_in_.data());
     } else {
+        if (!fft_cfg_) {
+            return false;
+        }
         kiss_fft(fft_cfg_, fft_in_.data(), fft_out_.data());
         fft_power_src = reinterpret_cast<const float*>(fft_out_.data());
     }

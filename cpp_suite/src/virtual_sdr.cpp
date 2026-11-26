@@ -108,11 +108,13 @@ bool VirtualSdrDevice::set_sample_rate(uint32_t rate_hz) {
 }
 
 bool VirtualSdrDevice::set_frequency(uint64_t freq_hz) {
+    if (freq_hz == 0) return false;
     center_freq_hz_.store(freq_hz);
     return true;
 }
 
 bool VirtualSdrDevice::set_gain(float gain_db, bool auto_gain) {
+    if (!std::isfinite(gain_db)) return false;
     gain_db_.store(gain_db);
     auto_gain_.store(auto_gain);
     return true;
@@ -143,13 +145,17 @@ int VirtualSdrDevice::read_samples(uint8_t* buffer, int length, int* bytes_read)
     const uint64_t fc = center_freq_hz_.load();
     const double span = static_cast<double>(fs);
 
-    // Real-time pacing with drift compensation
+    // Interruptible real-time pacing (bounded slices so shutdown/close never hangs on low Fs)
     auto now = std::chrono::steady_clock::now();
-    if (next_chunk_time_ > now) {
-        std::this_thread::sleep_until(next_chunk_time_);
+    while (next_chunk_time_ > now) {
+        if (!is_open_) return -1;
+        auto step = std::min(next_chunk_time_, now + std::chrono::milliseconds(10));
+        std::this_thread::sleep_until(step);
         now = std::chrono::steady_clock::now();
     }
-    double chunk_duration_sec = static_cast<double>(chunk_samples) / static_cast<double>(fs);
+    if (!is_open_) return -1;
+
+    double chunk_duration_sec = std::min(1.0, static_cast<double>(chunk_samples) / static_cast<double>(fs));
     auto chunk_duration = std::chrono::microseconds(static_cast<int64_t>(chunk_duration_sec * 1000000.0));
     if (next_chunk_time_ + chunk_duration * 2 < now) {
         next_chunk_time_ = now + chunk_duration;

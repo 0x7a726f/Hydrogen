@@ -48,6 +48,7 @@ struct StreamCacheKey {
 
 // Immutable Stage-A cached FFT & pre-normalized waterfall data shared across live Stage-B re-fits
 struct CachedStreamData {
+    uint64_t stream_id = 0;
     StreamCacheKey key;
     StreamingResults stream;
     double base_center_freq_hz = 1420.5e6;
@@ -228,7 +229,7 @@ private:
     ID3D11ShaderResourceView* waterfall_srv_ = nullptr;
     int tex_width_ = 0;
     int tex_height_ = 0;
-    const CachedStreamData* last_uploaded_stream_ = nullptr;
+    uint64_t last_uploaded_stream_id_ = 0;
     int last_colormap_idx_ = -1;
 
     // File Selection State
@@ -315,8 +316,10 @@ private:
     ui_obs::PlotZoomState zoom_q2_db_;
     ui_obs::PlotZoomState zoom_q3_cal_;
     ui_obs::PlotZoomState zoom_q4_wf_;
-    const CachedStreamData* last_zoom_stream_ = nullptr;
+    uint64_t last_zoom_stream_id_ = 0;
     double last_zoom_center_freq_hz_ = 0.0;
+    std::atomic<uint64_t> next_stream_id_{1};
+    bool numeric_input_active_ = false;
 
     // Reusable UI plot vertex & colormap scratch buffers
     std::vector<ImVec2> trace_scratch_;

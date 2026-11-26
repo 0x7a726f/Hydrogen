@@ -487,22 +487,50 @@ inline void EndCard() {
 inline void draw_dashed_vline(ImDrawList* dl, float x, float y0, float y1,
                               ImU32 col, float thickness = 1.0f,
                               float dash = 5.0f, float gap = 4.0f) {
-    if (y1 <= y0) return;
-    const float period = dash + gap;
-    for (float y = y0; y < y1; y += period) {
-        const float y_end = std::min(y + dash, y1);
-        dl->AddLineV(x, y, y_end, col, thickness);
+    if (!dl || !std::isfinite(x) || !std::isfinite(y0) || !std::isfinite(y1) || y1 <= y0) return;
+    if (!std::isfinite(dash) || !std::isfinite(gap) || dash <= 0.0f) return;
+    const float period = dash + std::max(0.0f, gap);
+    if (period <= 1e-3f) return;
+
+    const ImVec2 cmin = dl->GetClipRectMin();
+    const ImVec2 cmax = dl->GetClipRectMax();
+    if (x < cmin.x - thickness || x > cmax.x + thickness) return;
+    const float cy0 = std::max(y0, cmin.y - period);
+    const float cy1 = std::min(y1, cmax.y + period);
+    if (cy1 <= cy0) return;
+
+    float y = y0 + std::floor((cy0 - y0) / period) * period;
+    for (; y < cy1; y += period) {
+        const float seg_start = std::max(y, y0);
+        const float seg_end = std::min(y + dash, cy1);
+        if (seg_end > seg_start) {
+            dl->AddLineV(x, seg_start, seg_end, col, thickness);
+        }
     }
 }
 
 inline void draw_dashed_hline(ImDrawList* dl, float x0, float x1, float y,
                               ImU32 col, float thickness = 1.0f,
                               float dash = 5.0f, float gap = 4.0f) {
-    if (x1 <= x0) return;
-    const float period = dash + gap;
-    for (float x = x0; x < x1; x += period) {
-        const float x_end = std::min(x + dash, x1);
-        dl->AddLineH(x, x_end, y, col, thickness);
+    if (!dl || !std::isfinite(y) || !std::isfinite(x0) || !std::isfinite(x1) || x1 <= x0) return;
+    if (!std::isfinite(dash) || !std::isfinite(gap) || dash <= 0.0f) return;
+    const float period = dash + std::max(0.0f, gap);
+    if (period <= 1e-3f) return;
+
+    const ImVec2 cmin = dl->GetClipRectMin();
+    const ImVec2 cmax = dl->GetClipRectMax();
+    if (y < cmin.y - thickness || y > cmax.y + thickness) return;
+    const float cx0 = std::max(x0, cmin.x - period);
+    const float cx1 = std::min(x1, cmax.x + period);
+    if (cx1 <= cx0) return;
+
+    float x = x0 + std::floor((cx0 - x0) / period) * period;
+    for (; x < cx1; x += period) {
+        const float seg_start = std::max(x, x0);
+        const float seg_end = std::min(x + dash, cx1);
+        if (seg_end > seg_start) {
+            dl->AddLineH(seg_start, seg_end, y, col, thickness);
+        }
     }
 }
 
@@ -654,7 +682,7 @@ inline std::string get_default_recordings_dir() {
     std::filesystem::path p = get_exe_dir() / "recordings";
     std::error_code ec;
     std::filesystem::create_directories(p, ec);
-    return p.string();
+    return wide_to_utf8(p.c_str());
 }
 
 inline bool browse_for_cs16_file(HWND owner, const std::string& initial_dir, std::string& out_path) {
@@ -680,9 +708,10 @@ inline bool browse_for_cs16_file(HWND owner, const std::string& initial_dir, std
 
 inline void open_folder_in_explorer(const std::string& dir) {
     if (dir.empty()) return;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
     std::wstring wdir = utf8_to_wide(dir);
+    if (wdir.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(wdir), ec);
     ShellExecuteW(nullptr, L"open", wdir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
@@ -1226,6 +1255,12 @@ inline PlotInteractResult handle_plot_interaction(
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
     const bool item_hovered = ImGui::IsItemHovered();
     const bool item_focused = ImGui::IsItemFocused();
+    // Claim mouse wheel ownership on the canvas InvisibleButton BEFORE draw_plot_zoom_toolbar
+    // overwrites g.LastItemData.ID.
+    if (item_hovered) {
+        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelX);
+    }
 
     char popup_buf[96];
     const char* popup_name = cfg.popup_id;
@@ -1265,8 +1300,6 @@ inline PlotInteractResult handle_plot_interaction(
 
     // 3. Scroll Wheel & Horizontal Wheel
     if (can_interact) {
-        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
-        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelX);
 
         if (io.MouseWheel != 0.0f) {
             const double factor = std::pow(0.85, static_cast<double>(io.MouseWheel));
@@ -1544,8 +1577,8 @@ inline PlotInteractResult handle_plot_interaction(
         dl->PopClipRect();
     }
 
-    // 10. Plot-local Keyboard Shortcuts (when hovered or focused & not typing)
-    if ((can_interact || item_focused) && !io.WantTextInput && !any_popup_open && !io.KeyCtrl && !io.KeyAlt) {
+    // 10. Plot-local Keyboard Shortcuts (when hovered, or focused with no sibling hovered)
+    if ((can_interact || (item_focused && !ImGui::IsAnyItemHovered())) && !io.WantTextInput && !any_popup_open && !io.KeyCtrl && !io.KeyAlt) {
         const double anchor_u = in_plot
             ? std::clamp(static_cast<double>(mp.x - plot_min.x) / static_cast<double>(pw), 0.0, 1.0)
             : 0.5;
@@ -1798,7 +1831,7 @@ struct PlotViewport2D {
                     if (x_sfx && *x_sfx) std::snprintf(buf, sizeof(buf), "%s%s", num_buf, x_sfx);
                     else                 std::snprintf(buf, sizeof(buf), "%s", num_buf);
                     const ImVec2 ts = ImGui::CalcTextSize(buf);
-                    const float lx = std::clamp(px - ts.x * 0.5f, plot_min.x, plot_max.x - ts.x);
+                    const float lx = std::clamp(px - ts.x * 0.5f, plot_min.x, std::max(plot_min.x, plot_max.x - ts.x));
                     if (lx >= last_label_right + dp(6.0f)) {
                         dl->AddText(ImVec2(std::floor(lx), std::floor(plot_max.y + dp(3.5f))), text_col, buf);
                         last_label_right = lx + ts.x;
@@ -2425,7 +2458,7 @@ inline void draw_signal_level_bar(
     bool has_hold, const uint32_t* lut256, ImFont* mono_font = nullptr) {
     const float h = bar_max.y - bar_min.y;
     const double span = std::max(1e-3, db_max - db_min);
-    if (!lut256 || h < 12.0f) return;
+    if (!lut256 || h < dp(14.0f)) return;
 
     dl->AddRectFilled(bar_min, bar_max, palette::BezelBg32, dp(2.0f), ImDrawFlags_RoundAll);
 
@@ -2468,7 +2501,7 @@ inline void draw_signal_level_bar(
     std::snprintf(buf, sizeof(buf), "%.1f", live_peak_db);
     dl->AddText(f, fs, ImVec2(std::floor(bar_min.x - 1.0f), std::floor(bar_min.y - dp(14.0f))), palette::U32(palette::Cyan), buf);
     std::snprintf(buf, sizeof(buf), "N %.0f", floor_db);
-    dl->AddText(f, fs, ImVec2(std::floor(bar_max.x + dp(5.0f)), std::floor(std::clamp(y_floor - dp(6.0f), bar_min.y, bar_max.y - dp(12.0f)))),
+    dl->AddText(f, fs, ImVec2(std::floor(bar_max.x + dp(5.0f)), std::floor(std::clamp(y_floor - dp(6.0f), bar_min.y, std::max(bar_min.y, bar_max.y - dp(12.0f))))),
                 palette::TextMuted32, buf);
     if (live_norm > 0.02f) {
         dl->AddLineH(bar_min.x, bar_max.x, y_live, IM_COL32(255, 255, 255, 220), 1.5f);

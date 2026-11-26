@@ -61,14 +61,22 @@ static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 static UINT g_ResizeWidth = 0, g_ResizeHeight = 0;
+static float g_PendingDpiScale = 0.0f;
 
-static void CreateRenderTarget() {
+static bool CreateRenderTarget() {
+    if (!g_pSwapChain || !g_pd3dDevice) return false;
     ID3D11Texture2D* pBackBuffer = nullptr;
-    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
-    if (pBackBuffer) {
-        g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
-        pBackBuffer->Release();
+    HRESULT hr = g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    if (FAILED(hr) || !pBackBuffer) {
+        return false;
     }
+    hr = g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    pBackBuffer->Release();
+    if (FAILED(hr)) {
+        g_mainRenderTargetView = nullptr;
+        return false;
+    }
+    return true;
 }
 
 static void CleanupRenderTarget() {
@@ -113,10 +121,9 @@ static bool CreateDeviceD3D(HWND hWnd) {
             &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext
         );
     }
-    if (res != S_OK) return false;
+    if (FAILED(res)) return false;
 
-    CreateRenderTarget();
-    return true;
+    return CreateRenderTarget();
 }
 
 static void CleanupDeviceD3D() {
@@ -138,10 +145,11 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_ResizeHeight = (UINT)HIWORD(lParam);
             return 0;
         case WM_DPICHANGED: {
-            if (ImGui::GetCurrentContext() != nullptr) {
-                const float new_dpi = static_cast<float>(LOWORD(wParam)) / 96.0f;
-                ImGui::GetStyle().FontScaleDpi = new_dpi;
-                ui_obs::apply_observatory_slate_style(new_dpi);
+            // Defer ImGui style mutation until outside any active ImGui frame
+            // (prevents style corruption if WM_DPICHANGED fires during synchronous GetOpenFileNameW).
+            const float new_dpi = static_cast<float>(LOWORD(wParam)) / 96.0f;
+            if (new_dpi >= 0.5f && new_dpi <= 8.0f) {
+                g_PendingDpiScale = new_dpi;
             }
             RECT* const suggested = reinterpret_cast<RECT*>(lParam);
             if (suggested) {
@@ -220,8 +228,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     gui.set_owner_hwnd(hwnd);
     gui.init_d3d_resources(g_pd3dDevice);
 
+    auto recover_d3d_device = [&]() -> bool {
+        gui.release_d3d_resources();
+        ImGui_ImplDX11_Shutdown();
+        CleanupDeviceD3D();
+        if (!CreateDeviceD3D(hwnd)) {
+            return false;
+        }
+        ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+        gui.init_d3d_resources(g_pd3dDevice);
+        return true;
+    };
+
     bool done = false;
     bool occluded = false;
+    bool device_lost = false;
     while (!done) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
@@ -231,6 +252,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 done = true;
         }
         if (done) break;
+
+        if (g_PendingDpiScale > 0.0f) {
+            ImGui::GetStyle().FontScaleDpi = g_PendingDpiScale;
+            ui_obs::apply_observatory_slate_style(g_PendingDpiScale);
+            g_PendingDpiScale = 0.0f;
+        }
+
+        if (device_lost) {
+            if (!recover_d3d_device()) {
+                Sleep(100);
+                continue;
+            }
+            device_lost = false;
+        }
 
         if (IsIconic(hwnd)) {
             Sleep(50);
@@ -242,14 +277,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 Sleep(50);
                 continue;
             }
+            if (hr_test == DXGI_ERROR_DEVICE_REMOVED || hr_test == DXGI_ERROR_DEVICE_RESET) {
+                device_lost = true;
+                continue;
+            }
             occluded = false;
         }
 
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0) {
             CleanupRenderTarget();
-            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
-            CreateRenderTarget();
+            HRESULT hr_resize = g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = g_ResizeHeight = 0;
+            if (hr_resize == DXGI_ERROR_DEVICE_REMOVED || hr_resize == DXGI_ERROR_DEVICE_RESET) {
+                device_lost = true;
+                continue;
+            }
+            if (SUCCEEDED(hr_resize)) {
+                CreateRenderTarget();
+            }
         }
 
         ImGui_ImplDX11_NewFrame();
@@ -270,12 +315,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (g_mainRenderTargetView) {
             g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
             g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         }
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         HRESULT hr_pres = g_pSwapChain->Present(1, 0);
         if (hr_pres == DXGI_STATUS_OCCLUDED) {
             occluded = true;
+        } else if (hr_pres == DXGI_ERROR_DEVICE_REMOVED || hr_pres == DXGI_ERROR_DEVICE_RESET) {
+            device_lost = true;
         }
     }
 

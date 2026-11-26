@@ -35,12 +35,18 @@ static CommandResult run_cli(const std::string& args) {
 #ifdef _WIN32
     const std::vector<std::string> candidates = {
         "bin\\radio_suite_cli.exe",
+        "bin\\Release\\radio_suite_cli.exe",
+        "bin\\Debug\\radio_suite_cli.exe",
         "radio_suite_cli.exe",
-        "..\\bin\\radio_suite_cli.exe"
+        "..\\bin\\radio_suite_cli.exe",
+        "..\\bin\\Release\\radio_suite_cli.exe",
+        "..\\bin\\Debug\\radio_suite_cli.exe"
     };
 #else
     const std::vector<std::string> candidates = {
         "bin/radio_suite_cli",
+        "bin/Release/radio_suite_cli",
+        "bin/Debug/radio_suite_cli",
         "./radio_suite_cli",
         "../bin/radio_suite_cli",
         "build/bin/radio_suite_cli"

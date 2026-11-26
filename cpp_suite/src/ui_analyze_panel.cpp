@@ -3,6 +3,7 @@
 #include "exporter.h"
 #include "rfi_filter.h"
 #include "simd_dsp.h"
+#include "utf8_path.h"
 
 #include <algorithm>
 #include <cmath>
@@ -19,7 +20,7 @@ static std::string get_exe_parent_output_dir() {
     fs::path dir = ui_obs::win_fs::get_exe_dir() / "output";
     std::error_code ec;
     fs::create_directories(dir, ec);
-    return dir.string();
+    return astro_fs::path_to_utf8(dir);
 }
 
 static void build_normalized_waterfall(const StreamingResults& stream,
@@ -316,7 +317,7 @@ void UiAnalyzePanel::release_d3d_resources() {
     }
     tex_width_ = 0;
     tex_height_ = 0;
-    last_uploaded_stream_ = nullptr;
+    last_uploaded_stream_id_ = 0;
 }
 
 std::shared_ptr<const AnalysisSnapshot> UiAnalyzePanel::get_snapshot() {
@@ -376,9 +377,9 @@ void UiAnalyzePanel::scan_files() {
 
     if (custom_file_path_[0] != '\0') {
         std::error_code ec;
-        fs::path p(custom_file_path_);
+        fs::path p = astro_fs::utf8_path(custom_file_path_);
         if (p.has_parent_path() && fs::exists(p.parent_path(), ec)) {
-            search_dirs.push_back(p.parent_path().string());
+            search_dirs.push_back(astro_fs::path_to_utf8(p.parent_path()));
         }
     }
 
@@ -387,10 +388,10 @@ void UiAnalyzePanel::scan_files() {
     selected_file_idx_ = -1;
     if (custom_file_path_[0] != '\0') {
         std::error_code ec;
-        fs::path cur_can = fs::weakly_canonical(fs::path(custom_file_path_), ec);
+        fs::path cur_can = fs::weakly_canonical(astro_fs::utf8_path(custom_file_path_), ec);
         for (size_t i = 0; i < discovered_files_.size(); ++i) {
             std::error_code ec2;
-            fs::path cand = fs::weakly_canonical(fs::path(discovered_files_[i]), ec2);
+            fs::path cand = fs::weakly_canonical(astro_fs::utf8_path(discovered_files_[i]), ec2);
             if ((!ec && !ec2 && cur_can == cand) || discovered_files_[i] == custom_file_path_) {
                 selected_file_idx_ = static_cast<int>(i);
                 break;
@@ -405,10 +406,10 @@ void UiAnalyzePanel::select_and_run_file(const std::string& path, bool auto_run)
 
     selected_file_idx_ = -1;
     std::error_code ec;
-    fs::path target_can = fs::weakly_canonical(fs::path(path), ec);
+    fs::path target_can = fs::weakly_canonical(astro_fs::utf8_path(path), ec);
     for (size_t i = 0; i < discovered_files_.size(); ++i) {
         std::error_code ec2;
-        fs::path cand = fs::weakly_canonical(fs::path(discovered_files_[i]), ec2);
+        fs::path cand = fs::weakly_canonical(astro_fs::utf8_path(discovered_files_[i]), ec2);
         if ((!ec && !ec2 && target_can == cand) || discovered_files_[i] == path) {
             selected_file_idx_ = static_cast<int>(i);
             break;
@@ -427,8 +428,8 @@ void UiAnalyzePanel::on_file_selected(const std::string& path) {
     selected_file_size_bytes_ = 0;
     if (!path.empty()) {
         std::error_code ec;
-        fs::path p(path);
-        const std::string fn = p.filename().string();
+        fs::path p = astro_fs::utf8_path(path);
+        const std::string fn = astro_fs::path_to_utf8(p.filename());
         std::snprintf(selected_filename_, sizeof(selected_filename_), "%s", fn.c_str());
         const auto sz = fs::file_size(p, ec);
         if (!ec) {
@@ -493,7 +494,7 @@ AstroConfig UiAnalyzePanel::build_run_config() const {
     run_cfg.baseline_method = kBaseMethods[std::clamp(ui_baseline_idx_, 0, 4)];
     run_cfg.poly_degree = (run_cfg.baseline_method == BaselineMethod::StandingWave)
         ? std::clamp(ui_sw_order_, 4, 6)
-        : std::clamp(ui_poly_deg_, 3, 16);
+        : std::clamp(ui_poly_deg_, 3, 20);
     run_cfg.line_free_velocity_kms = static_cast<double>(std::clamp(ui_line_free_vel_kms_, 15.0f, 120.0f));
     run_cfg.line_method = kLineMethods[std::clamp(ui_line_method_idx_, 0, 6)];
     run_cfg.output_dir = get_output_dir_for_source(custom_file_path_);
@@ -558,7 +559,8 @@ bool UiAnalyzePanel::validate_inputs_cached(std::string& out_error) const {
 #endif
     if (target != val_cache_path_ || (now_ms - val_cache_tick_ms_) >= 500ULL) {
         std::error_code ec;
-        val_cache_file_ok_ = fs::exists(target, ec) && !fs::is_directory(target, ec);
+        const fs::path tp = astro_fs::utf8_path(target);
+        val_cache_file_ok_ = fs::exists(tp, ec) && !fs::is_directory(tp, ec);
         val_cache_path_ = target;
         val_cache_tick_ms_ = now_ms;
     }
@@ -566,15 +568,15 @@ bool UiAnalyzePanel::validate_inputs_cached(std::string& out_error) const {
         out_error = "Input .cs16 file does not exist on disk.";
         return false;
     }
-    if (ui_center_freq_mhz_ < 1.0 || ui_center_freq_mhz_ > 6000.0) {
+    if (!std::isfinite(ui_center_freq_mhz_) || ui_center_freq_mhz_ < 1.0 || ui_center_freq_mhz_ > 6000.0) {
         out_error = "Center frequency must be between 1 and 6000 MHz.";
         return false;
     }
-    if (ui_sample_rate_msps_ < 0.1 || ui_sample_rate_msps_ > 20.0) {
+    if (!std::isfinite(ui_sample_rate_msps_) || ui_sample_rate_msps_ < 0.1 || ui_sample_rate_msps_ > 20.0) {
         out_error = "Sample rate must be between 0.1 and 20.0 MSPS.";
         return false;
     }
-    if (ui_tsys_k_ < 1.0f) {
+    if (!std::isfinite(ui_tsys_k_) || ui_tsys_k_ < 1.0f) {
         out_error = "System Temperature T_sys must be >= 1.0 K.";
         return false;
     }
@@ -582,12 +584,12 @@ bool UiAnalyzePanel::validate_inputs_cached(std::string& out_error) const {
 }
 
 std::string UiAnalyzePanel::get_output_dir_for_source(const std::string& src_path) const {
-    std::string stem = fs::path(src_path).stem().string();
+    std::string stem = astro_fs::path_to_utf8(astro_fs::utf8_path(src_path).stem());
     if (stem.empty()) stem = "analysis";
-    fs::path out_dir = fs::path(get_exe_parent_output_dir()) / stem;
+    fs::path out_dir = astro_fs::utf8_path(get_exe_parent_output_dir()) / astro_fs::utf8_path(stem);
     std::error_code ec;
     fs::create_directories(out_dir, ec);
-    return out_dir.string();
+    return astro_fs::path_to_utf8(out_dir);
 }
 
 std::shared_ptr<AnalysisSnapshot> UiAnalyzePanel::run_post_processing(
@@ -749,7 +751,7 @@ void UiAnalyzePanel::start_analysis() {
     // Refresh actual file size from disk so modified files always re-stream
     {
         std::error_code ec;
-        const auto sz = fs::file_size(fs::path(custom_file_path_), ec);
+        const auto sz = fs::file_size(astro_fs::utf8_path(custom_file_path_), ec);
         if (!ec) selected_file_size_bytes_ = static_cast<uint64_t>(sz);
     }
 
@@ -784,6 +786,7 @@ void UiAnalyzePanel::start_analysis() {
             processor.set_cancel_token(&cancel_requested_);
 
             auto cached = std::make_shared<CachedStreamData>();
+            cached->stream_id = next_stream_id_.fetch_add(1, std::memory_order_relaxed);
             cached->key = target_key;
             cached->base_center_freq_hz = run_cfg.center_freq_hz;
             cached->stream = processor.process([this](double pct, double mbps, double eta) {
@@ -859,38 +862,53 @@ void UiAnalyzePanel::start_export(const std::shared_ptr<const AnalysisSnapshot>&
     is_exporting_ = true;
     set_export_message("Exporting 8 scientific artifacts...");
 
-    export_thread_ = std::make_unique<std::thread>([this, snap]() {
-        const auto& base_stream = snap->stream_data->stream;
-        FileMetadata meta;
-        meta.filepath = snap->source_filepath;
-        meta.filesize = base_stream.file_size_bytes;
-        meta.total_samples = base_stream.total_samples;
-        meta.duration_s = base_stream.total_duration_s;
-        meta.processing_time_s = base_stream.elapsed_processing_time_s;
-        meta.throughput_mb_s = base_stream.throughput_mb_s;
+    try {
+        export_thread_ = std::make_unique<std::thread>([this, snap]() {
+            struct ExportGuard {
+                std::atomic<bool>& flag;
+                ~ExportGuard() { flag.store(false); }
+            } guard{is_exporting_};
 
-        std::string out_dir = get_output_dir_for_source(snap->source_filepath);
-        bool ok = false;
-        const bool freq_shifted = std::abs(snap->config_used.center_freq_hz - snap->stream_data->base_center_freq_hz) >= 1e-6;
-        if (!freq_shifted) {
-            ok = Exporter::export_all_artifacts(
-                out_dir, snap->source_filepath, snap->config_used, meta,
-                base_stream, snap->rfi_clean_power, snap->baseline_power,
-                snap->calibrated_k, snap->calibrated_db, snap->metrics);
-        } else {
-            StreamingResults shifted = base_stream;
-            shifted.freq_hz = snap->freq_hz;
-            shifted.freq_mhz = snap->freq_mhz;
-            ok = Exporter::export_all_artifacts(
-                out_dir, snap->source_filepath, snap->config_used, meta,
-                shifted, snap->rfi_clean_power, snap->baseline_power,
-                snap->calibrated_k, snap->calibrated_db, snap->metrics);
-        }
+            try {
+                const auto& base_stream = snap->stream_data->stream;
+                FileMetadata meta;
+                meta.filepath = snap->source_filepath;
+                meta.filesize = base_stream.file_size_bytes;
+                meta.total_samples = base_stream.total_samples;
+                meta.duration_s = base_stream.total_duration_s;
+                meta.processing_time_s = base_stream.elapsed_processing_time_s;
+                meta.throughput_mb_s = base_stream.throughput_mb_s;
 
-        set_export_message(ok ? ("Exported 8 artifacts to " + out_dir)
-                              : "Export failed (check write permissions).");
+                std::string out_dir = get_output_dir_for_source(snap->source_filepath);
+                bool ok = false;
+                const bool freq_shifted = std::abs(snap->config_used.center_freq_hz - snap->stream_data->base_center_freq_hz) >= 1e-6;
+                if (!freq_shifted) {
+                    ok = Exporter::export_all_artifacts(
+                        out_dir, snap->source_filepath, snap->config_used, meta,
+                        base_stream, snap->rfi_clean_power, snap->baseline_power,
+                        snap->calibrated_k, snap->calibrated_db, snap->metrics);
+                } else {
+                    StreamingResults shifted = base_stream;
+                    shifted.freq_hz = snap->freq_hz;
+                    shifted.freq_mhz = snap->freq_mhz;
+                    ok = Exporter::export_all_artifacts(
+                        out_dir, snap->source_filepath, snap->config_used, meta,
+                        shifted, snap->rfi_clean_power, snap->baseline_power,
+                        snap->calibrated_k, snap->calibrated_db, snap->metrics);
+                }
+
+                set_export_message(ok ? ("Exported 8 artifacts to " + out_dir)
+                                      : "Export failed (check write permissions).");
+            } catch (const std::exception& ex) {
+                set_export_message(std::string("Export error: ") + ex.what());
+            } catch (...) {
+                set_export_message("Export failed with unexpected error.");
+            }
+        });
+    } catch (const std::exception& ex) {
         is_exporting_ = false;
-    });
+        set_export_message(std::string("Failed to start export thread: ") + ex.what());
+    }
 }
 
 void UiAnalyzePanel::render_panel(ID3D11DeviceContext* ctx, float width, float height) {
@@ -899,7 +917,7 @@ void UiAnalyzePanel::render_panel(ID3D11DeviceContext* ctx, float width, float h
     // Preserve plot zoom states across Stage-B live re-fits; only reset when stream domain changes!
     if (snap && snap->stream_data) {
         const bool domain_changed =
-            (snap->stream_data.get() != last_zoom_stream_) ||
+            (snap->stream_data->stream_id != last_zoom_stream_id_) ||
             (std::abs(snap->config_used.center_freq_hz - last_zoom_center_freq_hz_) > 1.0);
         if (domain_changed) {
             zoom_cal_spec_.reset();
@@ -910,7 +928,7 @@ void UiAnalyzePanel::render_panel(ID3D11DeviceContext* ctx, float width, float h
             zoom_q2_db_.reset();
             zoom_q3_cal_.reset();
             zoom_q4_wf_.reset();
-            last_zoom_stream_ = snap->stream_data.get();
+            last_zoom_stream_id_ = snap->stream_data->stream_id;
             last_zoom_center_freq_hz_ = snap->config_used.center_freq_hz;
         }
     }
@@ -953,8 +971,13 @@ void UiAnalyzePanel::render_panel(ID3D11DeviceContext* ctx, float width, float h
     render_sidebar_controls(sidebar_w, rem_h, snap);
 
     // Coalesced <5ms Stage-B Live Re-Fit whenever Stage-A stream is cached & Stage-B params changed
+    // (skip while numeric Freq/Tsys fields are actively being typed or out-of-range)
     auto cached_stream = get_cached_stream();
-    if (cached_stream && !is_analyzing_.load() && current_stream_key() == cached_stream->key) {
+    const bool stage_b_inputs_valid =
+        !numeric_input_active_ &&
+        std::isfinite(ui_center_freq_mhz_) && ui_center_freq_mhz_ >= 1.0 && ui_center_freq_mhz_ <= 6000.0 &&
+        std::isfinite(ui_tsys_k_) && ui_tsys_k_ >= 1.0f;
+    if (cached_stream && !is_analyzing_.load() && stage_b_inputs_valid && current_stream_key() == cached_stream->key) {
         const StageBParamsSig cur_b = current_stage_b_sig();
         if (ui_live_refit_enabled_ && cur_b != last_submitted_stage_b_sig_) {
             schedule_live_refit(cached_stream, build_run_config(), cur_b);
@@ -1293,7 +1316,8 @@ void UiAnalyzePanel::render_top_bar(float width, float height, const std::shared
     ImGui::SetNextItemWidth(combo_w);
     if (ImGui::BeginCombo("##Cs16Selector", disp_name)) {
         for (int i = 0; i < static_cast<int>(discovered_files_.size()); ++i) {
-            std::string fn = fs::path(discovered_files_[static_cast<size_t>(i)]).filename().string();
+            ImGui::PushID(i);
+            std::string fn = astro_fs::path_to_utf8(astro_fs::utf8_path(discovered_files_[static_cast<size_t>(i)]).filename());
             bool active_rec = app_state_.is_file_actively_recording(discovered_files_[static_cast<size_t>(i)]);
             std::string label = active_rec ? (fn + " [RECORDING]") : fn;
             bool is_sel = (selected_file_idx_ == i);
@@ -1302,6 +1326,7 @@ void UiAnalyzePanel::render_top_bar(float width, float height, const std::shared
                 on_file_selected(discovered_files_[static_cast<size_t>(i)]);
             }
             if (is_sel) ImGui::SetItemDefaultFocus();
+            ImGui::PopID();
         }
         ImGui::EndCombo();
     }
@@ -1496,12 +1521,14 @@ void UiAnalyzePanel::render_sidebar_controls(float width, float height, const st
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui_obs::dp(6.0f), ui_obs::dp(2.5f)));
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ui_obs::dp(3.0f), ui_obs::dp(2.0f)));
 
+        numeric_input_active_ = false;
         if (ImGui::BeginTable("##CalibGrid", 2, ImGuiTableFlags_SizingStretchSame)) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             param_label("Freq (MHz)");
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputDouble("##AnaFreq", &ui_center_freq_mhz_, 0.0, 0.0, "%.4f");
+            if (ImGui::IsItemActive()) numeric_input_active_ = true;
 
             ImGui::TableSetColumnIndex(1);
             param_label("Rate (MSPS)");
@@ -1513,14 +1540,21 @@ void UiAnalyzePanel::render_sidebar_controls(float width, float height, const st
             param_label("T_sys (K)");
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::InputFloat("##AnaTsys", &ui_tsys_k_, 0.0f, 0.0f, "%.1f")) {
-                if (ui_tsys_k_ < 1.0f) ui_tsys_k_ = 1.0f;
+                if (std::isfinite(ui_tsys_k_) && ui_tsys_k_ < 1.0f && !ImGui::IsItemActive()) {
+                    ui_tsys_k_ = 1.0f;
+                }
+            }
+            if (ImGui::IsItemActive()) {
+                numeric_input_active_ = true;
+            } else if (!std::isfinite(ui_tsys_k_) || ui_tsys_k_ < 1.0f) {
+                ui_tsys_k_ = 1.0f;
             }
 
             ImGui::TableSetColumnIndex(1);
             param_label("Window (s, 0=All)");
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::InputFloat("##AnaDur", &ui_duration_s_, 0.0f, 0.0f, "%.1f")) {
-                if (ui_duration_s_ < 0.0f) ui_duration_s_ = 0.0f;
+                if (!std::isfinite(ui_duration_s_) || ui_duration_s_ < 0.0f) ui_duration_s_ = 0.0f;
             }
 
             ImGui::EndTable();
@@ -2086,8 +2120,11 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
     const double v_hi_valid = std::max(v_a, v_b);
     const double v_lo_full = std::min(snap->vel_kms.front(), snap->vel_kms.back());
     const double v_hi_full = std::max(snap->vel_kms.front(), snap->vel_kms.back());
-    const double def_xmin = (v_hi_valid - v_lo_valid > 400.0) ? std::max(v_lo_valid, -200.0) : v_lo_valid;
-    const double def_xmax = (v_hi_valid - v_lo_valid > 400.0) ? std::min(v_hi_valid,  200.0) : v_hi_valid;
+    const double crop_lo = std::max(v_lo_valid, -200.0);
+    const double crop_hi = std::min(v_hi_valid,  200.0);
+    const bool can_crop_hi = (v_hi_valid - v_lo_valid > 400.0) && (crop_hi - crop_lo > 20.0);
+    const double def_xmin = can_crop_hi ? crop_lo : v_lo_valid;
+    const double def_xmax = can_crop_hi ? crop_hi : v_hi_valid;
 
     const double x_min = zoom.x_active ? zoom.x_min : def_xmin;
     const double x_max = zoom.x_active ? zoom.x_max : def_xmax;
@@ -2191,10 +2228,12 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
             const float hy = vp.map_y(has_exact_bracket ? gfit.fwhm_half_temp_k : (0.5 * gfit.amplitude_k));
             const float x_l = vp.map_x(has_exact_bracket ? gfit.fwhm_left_kms : (gfit.v_center_kms - 0.5 * gfit.fwhm_kms));
             const float x_r = vp.map_x(has_exact_bracket ? gfit.fwhm_right_kms : (gfit.v_center_kms + 0.5 * gfit.fwhm_kms));
-            const ImU32 brk_col = ui_obs::palette::U32(ui_obs::palette::Pink, 0.80f);
-            ui_obs::widgets::draw_dashed_hline(dl, std::min(x_l, x_r), std::max(x_l, x_r), hy, brk_col, 1.3f, 4.0f, 3.0f);
-            dl->AddLine(ImVec2(x_l, hy - ui_obs::dp(4.0f)), ImVec2(x_l, hy + ui_obs::dp(4.0f)), brk_col, 1.3f);
-            dl->AddLine(ImVec2(x_r, hy - ui_obs::dp(4.0f)), ImVec2(x_r, hy + ui_obs::dp(4.0f)), brk_col, 1.3f);
+            if (std::isfinite(hy) && std::isfinite(x_l) && std::isfinite(x_r)) {
+                const ImU32 brk_col = ui_obs::palette::U32(ui_obs::palette::Pink, 0.80f);
+                ui_obs::widgets::draw_dashed_hline(dl, std::min(x_l, x_r), std::max(x_l, x_r), hy, brk_col, 1.3f, 4.0f, 3.0f);
+                dl->AddLine(ImVec2(x_l, hy - ui_obs::dp(4.0f)), ImVec2(x_l, hy + ui_obs::dp(4.0f)), brk_col, 1.3f);
+                dl->AddLine(ImVec2(x_r, hy - ui_obs::dp(4.0f)), ImVec2(x_r, hy + ui_obs::dp(4.0f)), brk_col, 1.3f);
+            }
         }
     }
 
@@ -2244,10 +2283,10 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
                         ui_obs::palette::U32(title_col), card_hdr);
         }
 
-        // 6-gate verdict micro-badge in top-right of Fit Card header
+        // 6-gate verdict micro-badge in top-right of Fit Card header (aligned with KPI strip)
+        const bool is_det = snap->metrics.is_detected;
+        const bool is_weak = (!is_det && (snap->metrics.snr_matched >= 3.0 || snap->metrics.snr >= 3.0));
         {
-            const bool is_det = snap->metrics.is_detected;
-            const bool is_weak = (!is_det && snap->metrics.snr_matched >= 3.0);
             const char* gate_txt = is_det ? "CONFIRMED" : (is_weak ? "WEAK" : "NOISE");
             const ImVec4 gate_col = is_det ? ui_obs::palette::Emerald
                                   : (is_weak ? ui_obs::palette::Amber : ui_obs::palette::Red);
@@ -2275,7 +2314,10 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
                 std::snprintf(v4, sizeof(v4), "%.2f sigma", snap->metrics.snr);
             }
             std::snprintf(v5, sizeof(v5), "%.2e", snap->metrics.column_density_cm2);
-            if (gfit.method == LineAnalysisMethod::TripleGaussian && gfit.has_tertiary) {
+            if (!gfit.success) {
+                k6 = "W50/20";
+                std::snprintf(v6, sizeof(v6), "%.1f / %.1f", snap->metrics.w50_kms, snap->metrics.w20_kms);
+            } else if (gfit.method == LineAnalysisMethod::TripleGaussian && gfit.has_tertiary) {
                 k6 = "Arm2/3";
                 std::snprintf(v6, sizeof(v6), "%+.1f / %+.1f", gfit.v2_center_kms, gfit.v3_center_kms);
             } else if ((gfit.method == LineAnalysisMethod::DoubleGaussian ||
@@ -2298,8 +2340,8 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
                 std::snprintf(v6, sizeof(v6), "%.3f K", gfit.rmse_k);
             }
 
-            const ImVec4 snr_c = snap->metrics.is_detected ? ui_obs::palette::Emerald
-                               : (snap->metrics.snr_matched >= 3.0 ? ui_obs::palette::Amber : ui_obs::palette::Red);
+            const ImVec4 snr_c = is_det ? ui_obs::palette::Emerald
+                               : (is_weak ? ui_obs::palette::Amber : ui_obs::palette::Red);
             const struct { const char* k; const char* v; ImU32 c; } rows[6] = {
                 {"Amp",   v1, ui_obs::palette::TextPrimary32},
                 {"V_LSR", v2, ui_obs::palette::TextPrimary32},
@@ -2341,9 +2383,9 @@ void UiAnalyzePanel::render_calibrated_spectrum_plot(const std::shared_ptr<const
     icfg.allow_y_zoom = true;
     icfg.x_unit = "km/s";
     icfg.y_unit = "K";
-    icfg.has_hi_focus = true;
     icfg.hi_xmin = std::max(v_lo_full, hi_center_v - 80.0);
     icfg.hi_xmax = std::min(v_hi_full, hi_center_v + 80.0);
+    icfg.has_hi_focus = (icfg.hi_xmax > icfg.hi_xmin + 1.0);
     icfg.show_full_btn = true;
     icfg.is_compact = compact;
 
@@ -2991,7 +3033,7 @@ void UiAnalyzePanel::render_waterfall_view(ID3D11DeviceContext* ctx, ImVec2 avai
                         ui_obs::palette::PlotBorder32, 1.0f);
             ui_obs::format_adaptive_tick(f0 + frac * (f1 - f0), fx_step, num_buf, sizeof(num_buf), false, 2);
             const ImVec2 ts = ImGui::CalcTextSize(num_buf);
-            const float lx = std::clamp(px - ts.x * 0.5f, img_min.x, img_max.x - ts.x);
+            const float lx = std::clamp(px - ts.x * 0.5f, img_min.x, std::max(img_min.x, img_max.x - ts.x));
             if (lx >= last_right + ui_obs::dp(6.0f)) {
                 dl->AddText(ImVec2(lx, img_max.y + ui_obs::dp(3.5f)), ui_obs::palette::TextMuted32, num_buf);
                 last_right = lx + ts.x;
@@ -3214,17 +3256,39 @@ void UiAnalyzePanel::render_tab_master_dashboard(ID3D11DeviceContext* ctx, const
     }
 
     if (open_tab >= 0) {
+        auto copy_zoom_view = [](ui_obs::PlotZoomState& dst, const ui_obs::PlotZoomState& src) {
+            dst.reset();
+            dst.x_active = src.x_active;
+            dst.x_min = src.x_min;
+            dst.x_max = src.x_max;
+            dst.y_manual = src.y_manual;
+            dst.y_min = src.y_min;
+            dst.y_max = src.y_max;
+            dst.sync_active();
+        };
         pending_tab_select_ = open_tab;
         if (open_from_quad == 1) {
-            zoom_raw_top_ = zoom_q1_raw_;
+            copy_zoom_view(zoom_raw_top_, zoom_q1_raw_);
+            zoom_raw_bot_.reset();
             zoom_raw_bot_.x_active = zoom_q1_raw_.x_active;
             zoom_raw_bot_.x_min = zoom_q1_raw_.x_min;
             zoom_raw_bot_.x_max = zoom_q1_raw_.x_max;
             zoom_raw_bot_.sync_active();
-        } else if (open_from_quad == 2 || open_from_quad == 3) {
-            zoom_cal_spec_ = zoom_q3_cal_;
+        } else if (open_from_quad == 2) {
+            // Convert Q2 MHz X-zoom to Tab 1 velocity (km/s); keep Y auto-fit since Q2 is dB and Tab 1 is Kelvin
+            zoom_cal_spec_.reset();
+            if (zoom_q2_db_.x_active) {
+                const double v_a = SPEED_OF_LIGHT_KMS * (1.0 - zoom_q2_db_.x_max / HYDROGEN_REST_FREQ_MHZ);
+                const double v_b = SPEED_OF_LIGHT_KMS * (1.0 - zoom_q2_db_.x_min / HYDROGEN_REST_FREQ_MHZ);
+                zoom_cal_spec_.x_active = true;
+                zoom_cal_spec_.x_min = std::min(v_a, v_b);
+                zoom_cal_spec_.x_max = std::max(v_a, v_b);
+                zoom_cal_spec_.sync_active();
+            }
+        } else if (open_from_quad == 3) {
+            copy_zoom_view(zoom_cal_spec_, zoom_q3_cal_);
         } else if (open_from_quad == 4) {
-            zoom_waterfall_ = zoom_q4_wf_;
+            copy_zoom_view(zoom_waterfall_, zoom_q4_wf_);
         }
     }
 }
@@ -3239,14 +3303,15 @@ void UiAnalyzePanel::update_waterfall_texture(ID3D11DeviceContext* ctx, const st
     const int w = sd.wf_tex_w;
     const int h = sd.wf_tex_h;
 
-    // Fast early-out: Stage-B live re-fits share the exact same CachedStreamData pointer -> ZERO GPU re-upload!
-    if (waterfall_texture_ && last_uploaded_stream_ == snap->stream_data.get() &&
+    // Fast early-out: Stage-B live re-fits share the exact same monotonic stream_id -> ZERO GPU re-upload!
+    if (waterfall_texture_ && waterfall_srv_ &&
+        last_uploaded_stream_id_ != 0 && last_uploaded_stream_id_ == sd.stream_id &&
         last_colormap_idx_ == ui_colormap_idx_ &&
         tex_width_ == w && tex_height_ == h) {
         return;
     }
 
-    if (!waterfall_texture_ || tex_width_ != w || tex_height_ != h) {
+    if (!waterfall_texture_ || !waterfall_srv_ || tex_width_ != w || tex_height_ != h) {
         release_d3d_resources();
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = static_cast<UINT>(w);
@@ -3264,13 +3329,17 @@ void UiAnalyzePanel::update_waterfall_texture(ID3D11DeviceContext* ctx, const st
             srv_desc.Format = desc.Format;
             srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srv_desc.Texture2D.MipLevels = 1;
-            d3d_device_->CreateShaderResourceView(waterfall_texture_, &srv_desc, &waterfall_srv_);
-            tex_width_ = w;
-            tex_height_ = h;
+            const HRESULT hr_srv = d3d_device_->CreateShaderResourceView(waterfall_texture_, &srv_desc, &waterfall_srv_);
+            if (SUCCEEDED(hr_srv) && waterfall_srv_) {
+                tex_width_ = w;
+                tex_height_ = h;
+            } else {
+                release_d3d_resources();
+            }
         }
     }
 
-    if (waterfall_texture_) {
+    if (waterfall_texture_ && waterfall_srv_) {
         const uint32_t* lut = active_lut256_.data();
         const uint8_t* src = sd.wf_norm_u8.data();
 
@@ -3285,10 +3354,9 @@ void UiAnalyzePanel::update_waterfall_texture(ID3D11DeviceContext* ctx, const st
                 }
             }
             ctx->Unmap(waterfall_texture_, 0);
+            last_uploaded_stream_id_ = sd.stream_id;
+            last_colormap_idx_ = ui_colormap_idx_;
         }
-
-        last_uploaded_stream_ = snap->stream_data.get();
-        last_colormap_idx_ = ui_colormap_idx_;
     }
 }
 

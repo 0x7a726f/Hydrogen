@@ -90,6 +90,11 @@ void UiRecordPanel::refresh_devices() {
 
     auto hw_names = RtlSdrDevice::scan_devices();
     for (size_t i = 0; i < hw_names.size(); ++i) {
+        // RtlSdrDevice::scan_devices() returns a placeholder string when no hardware is present;
+        // skip it so we don't show two Virtual SDR entries in the device combo.
+        if (hw_names[i].find("Virtual SDR") != std::string::npos) {
+            continue;
+        }
         DeviceEntry entry;
         entry.label = hw_names[i];
         entry.is_virtual = false;
@@ -482,8 +487,10 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
     const float control_h = std::max(ui_obs::dp(28.0f), height - ui_obs::dp(12.0f));
     const float row_top = ImGui::GetCursorScreenPos().y;
 
-    // 1. Start / Stop RX Stream Toggle
+    // 1. Start / Stop RX Stream Toggle (disabled while CS16 recording is active)
+    const bool rec_active = writer_.is_recording();
     const ImVec4 rx_col = streaming ? ui_obs::palette::Red : ui_obs::palette::Emerald;
+    ImGui::BeginDisabled(streaming && rec_active);
     ImGui::PushStyleColor(ImGuiCol_Button, ui_obs::palette::Tint(rx_col, 0.18f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui_obs::palette::Tint(rx_col, 0.30f));
     ImGui::PushStyleColor(ImGuiCol_Border, rx_col);
@@ -504,6 +511,7 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
         }
     }
     ImGui::PopStyleColor(3);
+    ImGui::EndDisabled();
 
     // 2. Segmented Clickable/Scrollable 10-Digit LO Display
     ImGui::SameLine(0.0f, ui_obs::dp(12.0f));
@@ -641,6 +649,7 @@ void UiRecordPanel::render_device_card() {
         ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - scan_w - ui_obs::dp(6.0f)));
         if (ImGui::BeginCombo("##SdrDeviceCombo", cur_label)) {
             for (int i = 0; i < static_cast<int>(device_entries_.size()); ++i) {
+                ImGui::PushID(i);
                 const bool is_sel = (selected_device_idx_ == i);
                 if (ImGui::Selectable(device_entries_[static_cast<size_t>(i)].label.c_str(), is_sel)) {
                     if (selected_device_idx_ != i) {
@@ -653,6 +662,7 @@ void UiRecordPanel::render_device_card() {
                     }
                 }
                 if (is_sel) ImGui::SetItemDefaultFocus();
+                ImGui::PopID();
             }
             ImGui::EndCombo();
         }
@@ -701,6 +711,7 @@ void UiRecordPanel::render_radio_card() {
         ImGui::SameLine(half_w + ui_obs::dp(8.0f));
         ImGui::TextColored(ui_obs::palette::TextMuted, "Calibration (PPM)");
 
+        ImGui::BeginDisabled(writer_.is_recording());
         ImGui::SetNextItemWidth(half_w);
         if (ImGui::BeginCombo("##SampleRate", cur_rate)) {
             for (int i = 0; i < static_cast<int>(rates.size()); ++i) {
@@ -714,6 +725,7 @@ void UiRecordPanel::render_radio_card() {
             }
             ImGui::EndCombo();
         }
+        ImGui::EndDisabled();
         ImGui::SameLine(0.0f, ui_obs::dp(6.0f));
         ImGui::SetNextItemWidth(half_w);
         if (ui_obs::widgets::SliderIntAccent("##PpmOffset", &ppm_correction_, -100, 100, "%d ppm", ui_obs::palette::AccentBlue)) {
@@ -1149,7 +1161,8 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
             const float mfs = ui_obs::font_dp(11.0f);
             const char* hi_lbl = "HI 1420.406";
             const ImVec2 hsz = mf->CalcTextSizeA(mfs, FLT_MAX, 0.0f, hi_lbl);
-            const float tx = std::floor(std::clamp(hx + ui_obs::dp(4.0f), vp.plot_min.x + ui_obs::dp(4.0f), vp.plot_max.x - hsz.x - ui_obs::dp(6.0f)));
+            const float hi_lo_x = vp.plot_min.x + ui_obs::dp(4.0f);
+            const float tx = std::floor(std::clamp(hx + ui_obs::dp(4.0f), hi_lo_x, std::max(hi_lo_x, vp.plot_max.x - hsz.x - ui_obs::dp(6.0f))));
             const float ty = std::floor(vp.plot_min.y + ui_obs::dp(4.0f));
             hi_box_min = ImVec2(tx - ui_obs::dp(3.0f), ty - ui_obs::dp(1.0f));
             hi_box_max = ImVec2(tx + hsz.x + ui_obs::dp(3.0f), ty + hsz.y + ui_obs::dp(1.0f));
@@ -1159,7 +1172,7 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
         }
 
         // Peak Diamond Marker + Collision-Free Flat Readout Tag
-        const double pk_mhz = static_cast<double>(peak_freq_hz_) * 1e-6;
+        const double pk_mhz = peak_freq_hz_ * 1e-6;
         if (!spectrum_data_.empty() && pk_mhz >= view_x_min && pk_mhz <= view_x_max && std::isfinite(peak_dbfs_)) {
             const float px = std::clamp(vp.map_x(pk_mhz), vp.plot_min.x, vp.plot_max.x);
             const float py = std::clamp(vp.map_y(peak_dbfs_), vp.plot_min.y, vp.plot_max.y);
@@ -1178,14 +1191,16 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
             if (tx + psz.x + ui_obs::dp(6.0f) > vp.plot_max.x) {
                 tx = px - psz.x - ui_obs::dp(7.0f);
             }
-            tx = std::floor(std::clamp(tx, vp.plot_min.x + ui_obs::dp(4.0f), vp.plot_max.x - psz.x - ui_obs::dp(4.0f)));
-            float ty = std::floor(std::clamp(py - psz.y * 0.5f, vp.plot_min.y + ui_obs::dp(4.0f), vp.plot_max.y - psz.y - ui_obs::dp(4.0f)));
+            const float pk_lo_x = vp.plot_min.x + ui_obs::dp(4.0f);
+            const float pk_lo_y = vp.plot_min.y + ui_obs::dp(4.0f);
+            tx = std::floor(std::clamp(tx, pk_lo_x, std::max(pk_lo_x, vp.plot_max.x - psz.x - ui_obs::dp(4.0f))));
+            float ty = std::floor(std::clamp(py - psz.y * 0.5f, pk_lo_y, std::max(pk_lo_y, vp.plot_max.y - psz.y - ui_obs::dp(4.0f))));
 
             if (has_hi_tag) {
                 const bool x_ov = tx < (hi_box_max.x + ui_obs::dp(6.0f)) && (tx + psz.x) > (hi_box_min.x - ui_obs::dp(6.0f));
                 const bool y_ov = ty < (hi_box_max.y + ui_obs::dp(4.0f)) && (ty + psz.y) > (hi_box_min.y - ui_obs::dp(4.0f));
                 if (x_ov && y_ov) {
-                    ty = std::floor(std::min(vp.plot_max.y - psz.y - ui_obs::dp(4.0f), hi_box_max.y + ui_obs::dp(5.0f)));
+                    ty = std::floor(std::min(std::max(pk_lo_y, vp.plot_max.y - psz.y - ui_obs::dp(4.0f)), hi_box_max.y + ui_obs::dp(5.0f)));
                 }
             }
             dl->AddRectFilled(ImVec2(tx - ui_obs::dp(3.0f), ty - ui_obs::dp(1.0f)),
@@ -1209,8 +1224,10 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
         icfg.def_xmax = full_x_max;
         icfg.bound_xmin = full_x_min;
         icfg.bound_xmax = full_x_max;
-        icfg.def_ymin = SdrConstants::DEFAULT_FFT_MIN_DB;
-        icfg.def_ymax = SdrConstants::DEFAULT_FFT_MAX_DB;
+        // Use current fft_min_db_/fft_max_db_ as def_ymin/ymax so Shift+Wheel/box-zoom
+        // always maps against the active display range rather than jumping to [-95, -15].
+        icfg.def_ymin = fft_min_db_;
+        icfg.def_ymax = fft_max_db_;
         icfg.bound_ymin = -140.0;
         icfg.bound_ymax = 10.0;
         icfg.clamp_x = true;
@@ -1230,7 +1247,8 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
         spec_interact_zoom_.y_max = fft_max_db_;
         spec_interact_zoom_.sync_active();
 
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && vp.contains(ImGui::GetMousePos())) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+            ImGui::IsMouseHoveringRect(origin, ImVec2(origin.x + avail.x, origin.y + avail.y), true)) {
             context_tune_freq_mhz_ = std::clamp(vp.unmap_x(ImGui::GetMousePos().x), full_x_min, full_x_max);
         }
 
@@ -1238,16 +1256,18 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
             "##SpecCanvas", origin, avail, vp.plot_min, vp.plot_max,
             icfg, spec_interact_zoom_, dl, fonts_.semibold, fonts_.mono,
             [&]() {
-                char tune_lbl[64];
-                std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune LO to %.4f MHz", context_tune_freq_mhz_);
-                if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
-                    apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
+                if (context_tune_freq_mhz_ > 0.0) {
+                    char tune_lbl[64];
+                    std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune LO to %.4f MHz", context_tune_freq_mhz_);
+                    if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
+                        apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
+                    }
                 }
-                if (peak_freq_hz_ > 0) {
+                if (peak_freq_hz_ > 0.0) {
                     char pk_lbl[64];
-                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", static_cast<double>(peak_freq_hz_) * 1e-6);
+                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", peak_freq_hz_ * 1e-6);
                     if (ImGui::MenuItem(pk_lbl)) {
-                        apply_tuned_frequency_hz(static_cast<double>(peak_freq_hz_));
+                        apply_tuned_frequency_hz(peak_freq_hz_);
                     }
                 }
                 if (ImGui::MenuItem("Tune LO for 21cm H I (1420.5000 MHz, +94 kHz LO)")) {
@@ -1286,9 +1306,12 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
             fft_min_db_ = SdrConstants::DEFAULT_FFT_MIN_DB;
             fft_max_db_ = SdrConstants::DEFAULT_FFT_MAX_DB;
             waterfall_.recolor(fft_min_db_, fft_max_db_);
-        } else if (ires.y_changed && spec_interact_zoom_.y_manual) {
-            fft_min_db_ = static_cast<float>(std::clamp(spec_interact_zoom_.y_min, -140.0, 5.0));
-            fft_max_db_ = static_cast<float>(std::clamp(spec_interact_zoom_.y_max, static_cast<double>(fft_min_db_ + 5.0f), 10.0));
+        } else if (ires.y_changed) {
+            // Apply Y change even when y_manual resets to false on full zoom-out
+            const double next_ymin = spec_interact_zoom_.y_manual ? spec_interact_zoom_.y_min : icfg.bound_ymin;
+            const double next_ymax = spec_interact_zoom_.y_manual ? spec_interact_zoom_.y_max : icfg.bound_ymax;
+            fft_min_db_ = static_cast<float>(std::clamp(next_ymin, -140.0, 5.0));
+            fft_max_db_ = static_cast<float>(std::clamp(next_ymax, static_cast<double>(fft_min_db_ + 5.0f), 10.0));
             waterfall_.recolor(fft_min_db_, fft_max_db_);
         }
 
@@ -1406,22 +1429,26 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (last_wf_update_time_.time_since_epoch().count() == 0) {
-            if (!spectrum_data_.empty()) {
-                waterfall_.add_line(spectrum_data_, fft_min_db_, fft_max_db_);
-                pending_wf_sample_ = false;
-            }
-            last_wf_update_time_ = now;
-        } else {
-            const float elapsed_s = std::chrono::duration<float>(now - last_wf_update_time_).count();
-            if (pending_wf_sample_ || elapsed_s >= 0.032f) {
+        if (sdr_.is_streaming() || pending_wf_sample_) {
+            if (last_wf_update_time_.time_since_epoch().count() == 0) {
                 if (!spectrum_data_.empty()) {
                     waterfall_.add_line(spectrum_data_, fft_min_db_, fft_max_db_);
                     pending_wf_sample_ = false;
                 }
-                wf_row_dt_s_ = 0.85f * wf_row_dt_s_ + 0.15f * std::clamp(elapsed_s, 0.015f, 0.25f);
                 last_wf_update_time_ = now;
+            } else {
+                const float elapsed_s = std::chrono::duration<float>(now - last_wf_update_time_).count();
+                if (pending_wf_sample_ || elapsed_s >= 0.032f) {
+                    if (!spectrum_data_.empty()) {
+                        waterfall_.add_line(spectrum_data_, fft_min_db_, fft_max_db_);
+                        pending_wf_sample_ = false;
+                    }
+                    wf_row_dt_s_ = 0.85f * wf_row_dt_s_ + 0.15f * std::clamp(elapsed_s, 0.015f, 0.25f);
+                    last_wf_update_time_ = now;
+                }
             }
+        } else {
+            last_wf_update_time_ = now;
         }
 
         update_waterfall_texture(context);
@@ -1456,8 +1483,9 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
             if (t == 0) std::snprintf(tbuf, sizeof(tbuf), "now");
             else        std::snprintf(tbuf, sizeof(tbuf), "-%.0fs", frac * hist_s);
             const ImVec2 tsz = mf->CalcTextSizeA(mfs, FLT_MAX, 0.0f, tbuf);
+            const float t_lo_y = wf_min.y - 2.0f;
             dl->AddText(mf, mfs, ImVec2(std::floor(wf_min.x - tsz.x - ui_obs::dp(6.0f)),
-                                        std::floor(std::clamp(ty - tsz.y * 0.5f, wf_min.y - 2.0f, wf_max.y - tsz.y))),
+                                        std::floor(std::clamp(ty - tsz.y * 0.5f, t_lo_y, std::max(t_lo_y, wf_max.y - tsz.y)))),
                         ui_obs::palette::TextMuted32, tbuf);
         }
 
@@ -1507,7 +1535,7 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
         wf_interact_zoom_.sync_active();
 
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
-            ImGui::IsMouseHoveringRect(wf_min, wf_max, true)) {
+            ImGui::IsMouseHoveringRect(origin, ImVec2(origin.x + avail.x, origin.y + avail.y), true)) {
             const double u_rc = std::clamp(static_cast<double>(ImGui::GetMousePos().x - wf_min.x) / static_cast<double>(wf_w), 0.0, 1.0);
             context_tune_freq_mhz_ = view_x_min + u_rc * view_bw_mhz;
         }
@@ -1516,16 +1544,18 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
             "##WfCanvas", origin, avail, wf_min, wf_max,
             wcfg, wf_interact_zoom_, dl, fonts_.semibold, fonts_.mono,
             [&]() {
-                char tune_lbl[64];
-                std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune LO to %.4f MHz", context_tune_freq_mhz_);
-                if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
-                    apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
+                if (context_tune_freq_mhz_ > 0.0) {
+                    char tune_lbl[64];
+                    std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune LO to %.4f MHz", context_tune_freq_mhz_);
+                    if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
+                        apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
+                    }
                 }
-                if (peak_freq_hz_ > 0) {
+                if (peak_freq_hz_ > 0.0) {
                     char pk_lbl[64];
-                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", static_cast<double>(peak_freq_hz_) * 1e-6);
+                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", peak_freq_hz_ * 1e-6);
                     if (ImGui::MenuItem(pk_lbl)) {
-                        apply_tuned_frequency_hz(static_cast<double>(peak_freq_hz_));
+                        apply_tuned_frequency_hz(peak_freq_hz_);
                     }
                 }
                 if (ImGui::MenuItem("Tune LO for 21cm H I (1420.5000 MHz, +94 kHz LO)")) {
@@ -1635,7 +1665,10 @@ void UiRecordPanel::update_waterfall_texture(ID3D11DeviceContext* context) {
             srv_desc.Format = desc.Format;
             srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srv_desc.Texture2D.MipLevels = 1;
-            d3d_device_->CreateShaderResourceView(waterfall_texture_, &srv_desc, &waterfall_srv_);
+            if (FAILED(d3d_device_->CreateShaderResourceView(waterfall_texture_, &srv_desc, &waterfall_srv_)) || !waterfall_srv_) {
+                release_d3d_resources();
+                return;
+            }
             tex_width_ = w;
             tex_height_ = h;
         }

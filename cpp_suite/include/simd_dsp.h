@@ -325,21 +325,31 @@ inline __m256 fast_10log10_avx2(__m256 x) {
     return dbfs;
 }
 
-// High-precision (~1e-14) double-precision AVX2+FMA log10(x) for positive normal doubles (Estrin form)
+// High-precision (~1e-14) double-precision AVX2+FMA log10(x) for positive normal & subnormal doubles (Estrin form)
 inline __m256d fast_log10_pd_avx2(__m256d x) {
-    const __m256d k_sqrt2    = _mm256_set1_pd(1.4142135623730950488);
-    const __m256d k_one      = _mm256_set1_pd(1.0);
-    const __m256d k_half     = _mm256_set1_pd(0.5);
-    const __m256d k_bias     = _mm256_set1_pd(4503599627371519.0); // 2^52 + 1023
-    const __m256d k_log10_2  = _mm256_set1_pd(0.30102999566398119521);
-    const __m256d k_2log10_e = _mm256_set1_pd(0.86858896380650365530); // 2 * log10(e)
-    const __m256i k_exp_zero = _mm256_set1_epi64x(0x3FF0000000000000ULL);
-    const __m256i k_mant_msk = _mm256_set1_epi64x(0x000FFFFFFFFFFFFFULL);
-    const __m256i k_p2_52    = _mm256_set1_epi64x(0x4330000000000000ULL);
+    const __m256d k_zero       = _mm256_setzero_pd();
+    const __m256d k_min_normal = _mm256_set1_pd(2.2250738585072014e-308); // DBL_MIN = 2^-1022
+    const __m256d k_pow2_54    = _mm256_set1_pd(18014398509481984.0);     // 2^54
+    const __m256d k_54         = _mm256_set1_pd(54.0);
+    const __m256d k_sqrt2      = _mm256_set1_pd(1.4142135623730950488);
+    const __m256d k_one        = _mm256_set1_pd(1.0);
+    const __m256d k_half       = _mm256_set1_pd(0.5);
+    const __m256d k_bias       = _mm256_set1_pd(4503599627371519.0);      // 2^52 + 1023
+    const __m256d k_log10_2    = _mm256_set1_pd(0.30102999566398119521);
+    const __m256d k_2log10_e   = _mm256_set1_pd(0.86858896380650365530);  // 2 * log10(e)
+    const __m256i k_exp_zero   = _mm256_set1_epi64x(0x3FF0000000000000ULL);
+    const __m256i k_mant_msk   = _mm256_set1_epi64x(0x000FFFFFFFFFFFFFULL);
+    const __m256i k_p2_52      = _mm256_set1_epi64x(0x4330000000000000ULL);
 
-    __m256i ix = _mm256_castpd_si256(x);
+    // Normalize positive subnormals (0 < x < DBL_MIN) by multiplying by 2^54 and subtracting 54 from k
+    __m256d is_sub = _mm256_and_pd(_mm256_cmp_pd(x, k_zero, _CMP_GT_OQ),
+                                   _mm256_cmp_pd(x, k_min_normal, _CMP_LT_OQ));
+    __m256d x_norm = _mm256_blendv_pd(x, _mm256_mul_pd(x, k_pow2_54), is_sub);
+
+    __m256i ix = _mm256_castpd_si256(x_norm);
     __m256i e_raw = _mm256_srli_epi64(ix, 52);
     __m256d k = _mm256_sub_pd(_mm256_castsi256_pd(_mm256_or_si256(e_raw, k_p2_52)), k_bias);
+    k = _mm256_sub_pd(k, _mm256_and_pd(k_54, is_sub));
     __m256d m = _mm256_castsi256_pd(_mm256_or_si256(_mm256_and_si256(ix, k_mant_msk), k_exp_zero));
 
     // Shift mantissa to [sqrt(2)/2, sqrt(2)) so |u| = |(m-1)/(m+1)| <= 0.171573
@@ -383,7 +393,6 @@ inline __m256d fast_log10_pd_avx2(__m256d x) {
 #endif
 
     // Match IEEE-754 / std::log10 special-value semantics: NaN->NaN, <0->NaN, 0->-Inf, +Inf->+Inf
-    const __m256d k_zero    = _mm256_setzero_pd();
     const __m256d k_pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
     const __m256d k_neg_inf = _mm256_set1_pd(-std::numeric_limits<double>::infinity());
     const __m256d k_qnan    = _mm256_set1_pd(std::numeric_limits<double>::quiet_NaN());
@@ -399,12 +408,14 @@ inline __m256d fast_log10_pd_avx2(__m256d x) {
     return res;
 }
 
-// Shared core: evaluates 2^z = 2^k * exp((z - k) * ln2) in double precision (Estrin deg-11)
-// Caller guarantees z is bounded so (k + 1023) is a valid positive normal IEEE-754 exponent.
+// Shared core: evaluates 2^z = 2^k1 * 2^k2 * exp((z - k) * ln2) in double precision (Estrin deg-11).
+// Splitting k = k1 + k2 keeps both (k1 + 1023) and (k2 + 1023) strictly inside valid normal
+// IEEE-754 exponents across the entire double range [-1075, +1024] (including subnormals & DBL_MAX).
 inline __m256d exp2_pd_core_avx2(__m256d z) {
     const __m256d k_ln2  = _mm256_set1_pd(0.69314718055994530942);
     const __m256d k_bias = _mm256_set1_pd(4503599627371519.0); // 2^52 + 1023
     const __m256d k_one  = _mm256_set1_pd(1.0);
+    const __m256d k_half = _mm256_set1_pd(0.5);
 
     __m256d k = _mm256_round_pd(z, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     __m256d f = _mm256_sub_pd(z, k);      // |f| <= 0.5
@@ -449,23 +460,26 @@ inline __m256d exp2_pd_core_avx2(__m256d z) {
     __m256d p  = _mm256_add_pd(_mm256_mul_pd(r2, t8), s0);
 #endif
 
-    __m256i pow2k_i = _mm256_slli_epi64(_mm256_castpd_si256(_mm256_add_pd(k, k_bias)), 52);
-    return _mm256_mul_pd(p, _mm256_castsi256_pd(pow2k_i));
+    __m256d k1 = _mm256_round_pd(_mm256_mul_pd(k, k_half), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256d k2 = _mm256_sub_pd(k, k1);
+    __m256i pow2_k1_i = _mm256_slli_epi64(_mm256_castpd_si256(_mm256_add_pd(k1, k_bias)), 52);
+    __m256i pow2_k2_i = _mm256_slli_epi64(_mm256_castpd_si256(_mm256_add_pd(k2, k_bias)), 52);
+    return _mm256_mul_pd(_mm256_mul_pd(p, _mm256_castsi256_pd(pow2_k1_i)),
+                         _mm256_castsi256_pd(pow2_k2_i));
 }
 
-// High-precision (~1e-14) double-precision AVX2+FMA exp(x); flushes underflow <= -708.0 safely to +0.0,
+// High-precision (~1e-14) double-precision AVX2+FMA exp(x); flushes underflow <= ln(DBL_TRUE_MIN) to +0.0,
 // preserves NaN and maps overflow / +Inf to +Inf
 inline __m256d fast_exp_pd_avx2(__m256d x) {
-    const __m256d k_min_x   = _mm256_set1_pd(-708.0);
-    const __m256d k_max_x   = _mm256_set1_pd(709.0);
-    const __m256d k_over_x  = _mm256_set1_pd(709.782712893384);
+    const __m256d k_min_x   = _mm256_set1_pd(-745.1332191019412); // ln(DBL_TRUE_MIN)
+    const __m256d k_over_x  = _mm256_set1_pd(709.78271289338397); // ln(DBL_MAX)
     const __m256d k_log2_e  = _mm256_set1_pd(1.44269504088896340736);
     const __m256d k_pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
 
     __m256d is_nan  = _mm256_cmp_pd(x, x, _CMP_UNORD_Q);
     __m256d is_over = _mm256_cmp_pd(x, k_over_x, _CMP_GT_OQ);
     __m256d mask_gt = _mm256_cmp_pd(x, k_min_x, _CMP_GT_OQ);
-    __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_max_x);
+    __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_over_x);
     __m256d res = _mm256_and_pd(exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_e)), mask_gt);
     res = _mm256_blendv_pd(res, k_pos_inf, is_over);
     res = _mm256_blendv_pd(res, x, is_nan);
@@ -473,12 +487,10 @@ inline __m256d fast_exp_pd_avx2(__m256d x) {
 }
 
 // High-precision (~1e-14) double-precision AVX2+FMA pow(10, x);
-// preserves NaN, flushes underflow <= -308.0 to +0.0, and maps overflow / +Inf to +Inf
+// preserves NaN, flushes underflow < log10(DBL_TRUE_MIN) to +0.0, and maps overflow / +Inf to +Inf
 inline __m256d fast_exp10_pd_avx2(__m256d x) {
-    const __m256d k_under   = _mm256_set1_pd(-308.0);
-    const __m256d k_min_x   = _mm256_set1_pd(-307.5);
-    const __m256d k_max_x   = _mm256_set1_pd(308.0);
-    const __m256d k_over    = _mm256_set1_pd(308.25471555991675);
+    const __m256d k_under   = _mm256_set1_pd(-323.60724533877976); // log10(DBL_TRUE_MIN)
+    const __m256d k_over    = _mm256_set1_pd(308.25471555991675);  // log10(DBL_MAX)
     const __m256d k_log2_10 = _mm256_set1_pd(3.32192809488736234787);
     const __m256d k_pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
     const __m256d k_zero    = _mm256_setzero_pd();
@@ -487,7 +499,7 @@ inline __m256d fast_exp10_pd_avx2(__m256d x) {
     __m256d is_over  = _mm256_cmp_pd(x, k_over, _CMP_GT_OQ);
     __m256d is_under = _mm256_cmp_pd(x, k_under, _CMP_LT_OQ);
 
-    __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_min_x), k_max_x);
+    __m256d safe_x = _mm256_min_pd(_mm256_max_pd(x, k_under), k_over);
     __m256d res = exp2_pd_core_avx2(_mm256_mul_pd(safe_x, k_log2_10));
     res = _mm256_blendv_pd(res, k_zero, is_under);
     res = _mm256_blendv_pd(res, k_pos_inf, is_over);

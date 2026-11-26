@@ -195,26 +195,36 @@ std::vector<double> smooth_gaussian_velocity(
     if (out_kernel_sum_w2) *out_kernel_sum_w2 = 1.0;
     if (out_kernel_w0) *out_kernel_w0 = 1.0;
     if (n == 0) return out;
-    if (n == 1 || sigma_v_kms <= 0.0) {
+    if (n == 1 || !std::isfinite(sigma_v_kms) || sigma_v_kms <= 0.0) {
         out.assign(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(n));
         return out;
     }
 
-    const double dv = std::max(1e-9, std::abs(v.back() - v.front()) / static_cast<double>(n - 1));
+    const double span_v = std::abs(v[n - 1] - v[0]);
+    if (!std::isfinite(span_v) || span_v <= 0.0) {
+        out.assign(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(n));
+        return out;
+    }
+    const double dv = std::max(1e-9, span_v / static_cast<double>(n - 1));
     const double sigma_bins = sigma_v_kms / dv;
-    if (sigma_bins < 0.25) {
+    if (!std::isfinite(sigma_bins) || sigma_bins < 0.25) {
         out.assign(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(n));
         return out;
     }
 
-    const int radius = std::min<int>(static_cast<int>(n) - 1, std::max(2, static_cast<int>(std::ceil(3.5 * sigma_bins))));
-    const size_t klen = static_cast<size_t>(2 * radius + 1);
+    const double raw_rad = std::ceil(3.5 * sigma_bins);
+    const double max_rad_d = static_cast<double>(n - 1);
+    const int radius = static_cast<int>(std::isfinite(raw_rad)
+        ? std::clamp(raw_rad, 2.0, std::max(2.0, max_rad_d))
+        : max_rad_d);
+    const int clamped_radius = std::min<int>(static_cast<int>(n) - 1, radius);
+    const size_t klen = static_cast<size_t>(2 * clamped_radius + 1);
     std::vector<double> kernel(klen);
     const double inv_2s2 = 0.5 / (sigma_bins * sigma_bins);
     double k_sum = 0.0;
-    for (int k = -radius; k <= radius; ++k) {
+    for (int k = -clamped_radius; k <= clamped_radius; ++k) {
         const double w = std::exp(-static_cast<double>(k * k) * inv_2s2);
-        kernel[static_cast<size_t>(k + radius)] = w;
+        kernel[static_cast<size_t>(k + clamped_radius)] = w;
         k_sum += w;
     }
     if (k_sum > 0.0) {
@@ -224,21 +234,23 @@ std::vector<double> smooth_gaussian_velocity(
             sum_w2 += w * w;
         }
         if (out_kernel_sum_w2) *out_kernel_sum_w2 = sum_w2;
-        if (out_kernel_w0) *out_kernel_w0 = kernel[static_cast<size_t>(radius)];
+        if (out_kernel_w0) *out_kernel_w0 = kernel[static_cast<size_t>(clamped_radius)];
     }
 
     for (size_t i = 0; i < n; ++i) {
         const int ii = static_cast<int>(i);
-        const int j_lo = std::max(0, ii - radius);
-        const int j_hi = std::min(static_cast<int>(n) - 1, ii + radius);
+        const int j_lo = std::max(0, ii - clamped_radius);
+        const int j_hi = std::min(static_cast<int>(n) - 1, ii + clamped_radius);
         double acc = 0.0;
         double wsum = 0.0;
         for (int j = j_lo; j <= j_hi; ++j) {
-            const double w = kernel[static_cast<size_t>(j - ii + radius)];
-            acc += w * y[static_cast<size_t>(j)];
+            const double yj = y[static_cast<size_t>(j)];
+            if (!std::isfinite(yj)) continue;
+            const double w = kernel[static_cast<size_t>(j - ii + clamped_radius)];
+            acc += w * yj;
             wsum += w;
         }
-        out[i] = (wsum > 0.0) ? (acc / wsum) : y[i];
+        out[i] = (wsum > 0.0) ? (acc / wsum) : (std::isfinite(y[i]) ? y[i] : 0.0);
     }
     return out;
 }
@@ -309,7 +321,8 @@ bool invert_3x3(const double A[3][3], double inv[3][3]) {
                + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
 
     double scale = std::max(1.0, std::max({std::abs(A[0][0]), std::abs(A[1][1]), std::abs(A[2][2])}));
-    if (std::abs(det) < 1e-18 * scale) return false;
+    const double scale3 = scale * scale * scale;
+    if (!std::isfinite(det) || !std::isfinite(scale3) || std::abs(det) < 1e-18 * scale3) return false;
     double inv_det = 1.0 / det;
 
     inv[0][0] = (A[1][1] * A[2][2] - A[1][2] * A[2][1]) * inv_det;
@@ -324,6 +337,11 @@ bool invert_3x3(const double A[3][3], double inv[3][3]) {
     inv[2][1] = (A[0][1] * A[2][0] - A[0][0] * A[2][1]) * inv_det;
     inv[2][2] = (A[0][0] * A[1][1] - A[0][1] * A[1][0]) * inv_det;
 
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(inv[r][c])) return false;
+        }
+    }
     return true;
 }
 
@@ -338,12 +356,13 @@ bool solve_linear_nxn(int n, const double A[9][9], const double b[9], double x[9
         int piv = col;
         double max_v = std::abs(M[col][col]);
         for (int r = col + 1; r < n; ++r) {
-            if (std::abs(M[r][col]) > max_v) {
-                max_v = std::abs(M[r][col]);
+            const double v = std::abs(M[r][col]);
+            if (v > max_v) {
+                max_v = v;
                 piv = r;
             }
         }
-        if (max_v < 1e-15) return false;
+        if (!std::isfinite(max_v) || max_v < 1e-15) return false;
         if (piv != col) {
             for (int c = col; c <= n; ++c) std::swap(M[col][c], M[piv][c]);
         }
@@ -358,7 +377,9 @@ bool solve_linear_nxn(int n, const double A[9][9], const double b[9], double x[9
     for (int i = n - 1; i >= 0; --i) {
         double sum = M[i][n];
         for (int j = i + 1; j < n; ++j) sum -= M[i][j] * x[j];
+        if (!std::isfinite(M[i][i]) || std::abs(M[i][i]) < 1e-15) return false;
         x[i] = sum / M[i][i];
+        if (!std::isfinite(x[i])) return false;
     }
     return true;
 }
@@ -1035,6 +1056,9 @@ GaussianFit fit_double_gaussian_from_base(
         res.amplitude_k = 0.0;
         res.sigma_kms = 0.0;
         res.fwhm_kms = 0.0;
+        res.fwhm_left_kms = 0.0;
+        res.fwhm_right_kms = 0.0;
+        res.fwhm_half_temp_k = 0.0;
         res.has_secondary = false;
         res.fitted_curve.assign(n_all, 0.0);
         res.component1_curve.clear();
@@ -1395,6 +1419,9 @@ GaussianFit fit_line_profile_impl(
             res.amplitude_k = 0.0;
             res.sigma_kms = 0.0;
             res.fwhm_kms = 0.0;
+            res.fwhm_left_kms = 0.0;
+            res.fwhm_right_kms = 0.0;
+            res.fwhm_half_temp_k = 0.0;
             res.has_secondary = false;
             res.has_tertiary = false;
             res.fitted_curve.assign(n_all, 0.0);
@@ -1553,6 +1580,9 @@ GaussianFit fit_line_profile_impl(
             res.amplitude_k = 0.0;
             res.sigma_kms = 0.0;
             res.fwhm_kms = 0.0;
+            res.fwhm_left_kms = 0.0;
+            res.fwhm_right_kms = 0.0;
+            res.fwhm_half_temp_k = 0.0;
             res.fitted_curve.assign(n_all, 0.0);
         }
         return res;
@@ -1769,6 +1799,9 @@ GaussianFit fit_line_profile_impl(
             res.amplitude_k = 0.0;
             res.sigma_kms = 0.0;
             res.fwhm_kms = 0.0;
+            res.fwhm_left_kms = 0.0;
+            res.fwhm_right_kms = 0.0;
+            res.fwhm_half_temp_k = 0.0;
             res.fitted_curve.assign(n_all, 0.0);
         }
         return res;
@@ -2006,6 +2039,9 @@ GaussianFit fit_line_profile_impl(
             res.amplitude_k = 0.0;
             res.sigma_kms = 0.0;
             res.fwhm_kms = 0.0;
+            res.fwhm_left_kms = 0.0;
+            res.fwhm_right_kms = 0.0;
+            res.fwhm_half_temp_k = 0.0;
             res.fitted_curve.assign(n_all, 0.0);
         }
         return res;
@@ -2086,8 +2122,10 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
     if (effective_passband_mask != nullptr && effective_passband_mask->size() == static_cast<size_t>(nfft)) {
         passband_mask = *effective_passband_mask;
     } else {
-        const int edge_bins = static_cast<int>(
-            static_cast<double>(nfft) * std::clamp(config.passband_edge_fraction, 0.0, 0.45));
+        const double safe_edge_frac = std::isfinite(config.passband_edge_fraction)
+            ? std::clamp(config.passband_edge_fraction, 0.0, 0.45)
+            : 0.08;
+        const int edge_bins = static_cast<int>(static_cast<double>(nfft) * safe_edge_frac);
         for (int i = edge_bins; i < nfft - edge_bins; ++i) {
             passband_mask[i] = 1;
         }
@@ -2159,7 +2197,7 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
     v_hi.reserve(nfft);
     t_hi.reserve(nfft);
     for (int i = 0; i < nfft; ++i) {
-        if (hi_window[i] && std::isfinite(calibrated_k[i])) {
+        if (hi_window[i] && std::isfinite(calibrated_k[i]) && std::isfinite(vel_kms[i])) {
             v_hi.push_back(vel_kms[i]);
             t_hi.push_back(calibrated_k[i]);
             if (calibrated_k[i] > max_k) {
@@ -2184,11 +2222,13 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
 
     m.snr_single_bin = m.peak_temp_k / std::max(1e-6, m.noise_std_k);
 
-    const double dv = (nfft > 1) ? std::max(1e-9, std::abs(vel_kms[1] - vel_kms[0])) : 1.0;
+    const double raw_dv = (nfft > 1) ? std::abs(vel_kms[1] - vel_kms[0]) : 1.0;
+    const double dv = (std::isfinite(raw_dv) && raw_dv > 0.0) ? std::max(1e-9, raw_dv) : 1.0;
     double hi_span_kms = 0.0;
     if (v_hi.size() >= 2) {
         auto mm_hi = std::minmax_element(v_hi.begin(), v_hi.end());
-        hi_span_kms = std::max(dv, *mm_hi.second - *mm_hi.first);
+        const double raw_span = *mm_hi.second - *mm_hi.first;
+        hi_span_kms = std::isfinite(raw_span) ? std::max(dv, raw_span) : dv;
     }
 
     // 3. Multi-Scale Matched-Filter SNR across physical H I widths {2, 4, 8, 15, 25} km/s
@@ -2222,7 +2262,11 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
 
         for (double s_kms : valid_scales) {
             const double sigma_bins = s_kms / dv;
-            const int radius = std::min<int>(static_cast<int>(m_hi) - 1, std::max(1, static_cast<int>(std::ceil(4.0 * sigma_bins))));
+            const double raw_rad = std::ceil(4.0 * sigma_bins);
+            const double max_rad_d = static_cast<double>(m_hi - 1);
+            const int radius = static_cast<int>(std::isfinite(raw_rad)
+                ? std::clamp(raw_rad, 1.0, std::max(1.0, max_rad_d))
+                : max_rad_d);
             std::vector<double> g_tab(static_cast<size_t>(radius + 1));
             std::vector<double> g2_tab(static_cast<size_t>(radius + 1));
             const double inv_2s2 = -0.5 / (sigma_bins * sigma_bins);
@@ -2365,7 +2409,7 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
         double flux_supp = 0.0;
         int n_supp = 0;
         for (int i = 0; i < nfft; ++i) {
-            if (hi_window[i] && m.gauss_fit.fitted_curve[i] >= supp_thresh) {
+            if (hi_window[i] && std::isfinite(calibrated_k[i]) && m.gauss_fit.fitted_curve[i] >= supp_thresh) {
                 flux_supp += calibrated_k[i] * dv;
                 ++n_supp;
             }
@@ -2476,7 +2520,7 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
                 while (li < search_hi && m.gauss_fit.fitted_curve[li] < thresh) ++li;
                 while (ri > search_lo && m.gauss_fit.fitted_curve[ri] < thresh) --ri;
             }
-            if (ri <= li) return fallback_w;
+            if (ri < li) return fallback_w;
 
             auto interp_cross = [&](int i0, int i1) {
                 const double y0 = m.gauss_fit.fitted_curve[i0];

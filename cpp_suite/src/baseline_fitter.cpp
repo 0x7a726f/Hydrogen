@@ -44,7 +44,7 @@ bool solve_3x3(const double A_in[3][3], const double b_in[3], double x_out[3]) {
                 piv = r;
             }
         }
-        if (max_abs < 1e-14) return false;
+        if (!std::isfinite(max_abs) || max_abs < 1e-14) return false;
         if (piv != col) {
             for (int c = col; c < 4; ++c) std::swap(M[col][c], M[piv][c]);
         }
@@ -61,8 +61,9 @@ bool solve_3x3(const double A_in[3][3], const double b_in[3], double x_out[3]) {
     for (int r = 2; r >= 0; --r) {
         double sum = M[r][3];
         for (int c = r + 1; c < 3; ++c) sum -= M[r][c] * x_out[c];
-        if (std::abs(M[r][r]) < 1e-14) return false;
+        if (!std::isfinite(M[r][r]) || std::abs(M[r][r]) < 1e-14) return false;
         x_out[r] = sum / M[r][r];
+        if (!std::isfinite(x_out[r])) return false;
     }
     return true;
 }
@@ -1374,8 +1375,12 @@ std::vector<double> BaselineFitter::fit_savgol(
     const double bin_res_hz = (config.sample_rate_hz > 0.0)
                                   ? (config.sample_rate_hz / static_cast<double>(n))
                                   : 1.0;
-    const double sigma_bins = std::max(3.0, (config.filter_smoothing_sigma_khz * 1e3) / std::max(1e-6, bin_res_hz));
-    const int H = std::clamp(static_cast<int>(std::round(2.4 * sigma_bins)), 5, std::max(5, n / 6));
+    const double safe_sig_khz = (std::isfinite(config.filter_smoothing_sigma_khz) && config.filter_smoothing_sigma_khz > 0.0)
+        ? config.filter_smoothing_sigma_khz : 30.0;
+    const double sigma_bins = std::max(3.0, (safe_sig_khz * 1e3) / std::max(1e-6, bin_res_hz));
+    const double h_max_d = static_cast<double>(std::max(5, n / 6));
+    const double raw_h = std::round(2.4 * sigma_bins);
+    const int H = static_cast<int>(std::isfinite(raw_h) ? std::clamp(raw_h, 5.0, h_max_d) : h_max_d);
 
     // Exact degree-4 Savitzky-Golay weights at k=0 over [-H..H] via 3x3 even-moment Vandermonde system
     // Normalized coordinate u_k = k / H in [-1, 1] avoids H^8 conditioning blowup for large H.
@@ -1616,7 +1621,8 @@ std::vector<double> BaselineFitter::fit_standing_wave(
         const double tau_min = 1.0 / P_max;
         const double tau_max = 1.0 / P_min;
         const double d_tau = 1.0 / (12.0 * std::max(1e-6, passband_span_mhz));
-        const int n_grid = std::clamp(static_cast<int>(std::ceil((tau_max - tau_min) / d_tau)) + 1, 16, 2000);
+        const double raw_grid = std::ceil((tau_max - tau_min) / d_tau) + 1.0;
+        const int n_grid = static_cast<int>(std::isfinite(raw_grid) ? std::clamp(raw_grid, 16.0, 2000.0) : 2000.0);
         const double step_tau = (n_grid > 1) ? ((tau_max - tau_min) / static_cast<double>(n_grid - 1)) : 0.0;
 
         std::vector<double> macro_res(static_cast<size_t>(m_clean));
@@ -2019,9 +2025,18 @@ BaselineResults BaselineFitter::fit(
     // 2. Vectorized conversion from raw power to dB
     std::vector<double> p_db(static_cast<size_t>(nfft));
     SimdDsp::power_to_db_f64(power.data(), p_db.data(), static_cast<size_t>(nfft), 1e-30);
+    // Clamp non-finite dB values (e.g. from +Inf power) so residuals & nth_element never see NaN
+    for (int i = 0; i < nfft; ++i) {
+        if (!std::isfinite(p_db[static_cast<size_t>(i)])) {
+            p_db[static_cast<size_t>(i)] = (p_db[static_cast<size_t>(i)] > 0.0) ? 3000.0 : -300.0;
+        }
+    }
 
     // 3. Automatic IF skirt trimming
-    const int min_edge = static_cast<int>(static_cast<double>(nfft) * std::clamp(config.passband_edge_fraction, 0.0, 0.40));
+    const double safe_edge_frac = std::isfinite(config.passband_edge_fraction)
+        ? std::clamp(config.passband_edge_fraction, 0.0, 0.40)
+        : 0.08;
+    const int min_edge = static_cast<int>(static_cast<double>(nfft) * safe_edge_frac);
     int edge_left = min_edge;
     int edge_right = min_edge;
 
@@ -2143,11 +2158,17 @@ BaselineResults BaselineFitter::fit(
     }
 
     // 5. Convert to linear power and eliminate Jensen log-median bias via 10%-trimmed linear ratio mean
+    for (int i = 0; i < nfft; ++i) {
+        if (!std::isfinite(res.baseline_db[static_cast<size_t>(i)])) {
+            res.baseline_db[static_cast<size_t>(i)] = p_db[static_cast<size_t>(i)];
+        }
+    }
     SimdDsp::db_to_power_f64(res.baseline_db.data(), res.baseline_power.data(), static_cast<size_t>(nfft));
     for (int i = 0; i < nfft; ++i) {
-        if (!std::isfinite(res.baseline_power[static_cast<size_t>(i)]) ||
-            res.baseline_power[static_cast<size_t>(i)] < 1e-30) {
-            res.baseline_power[static_cast<size_t>(i)] = 1e-30;
+        const size_t idx = static_cast<size_t>(i);
+        if (!std::isfinite(res.baseline_power[idx]) || res.baseline_power[idx] < 1e-30) {
+            res.baseline_power[idx] = 1e-30;
+            res.baseline_db[idx] = -300.0;
         }
     }
 

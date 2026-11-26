@@ -44,10 +44,11 @@ std::vector<double> DCExcision::excise(
     }
 
     const double bin_res_hz = config.sample_rate_hz / static_cast<double>(nfft);
-    const int half_width_bins = std::max(
-        1, static_cast<int>(std::ceil((config.dc_clear_hz * 0.5) / bin_res_hz))
-    );
-    const int guard_bins = std::max(2, half_width_bins * 2);
+    const double raw_half = std::ceil((config.dc_clear_hz * 0.5) / bin_res_hz);
+    const int half_width_bins = std::isfinite(raw_half)
+        ? static_cast<int>(std::clamp(raw_half, 1.0, static_cast<double>(nfft)))
+        : nfft;
+    const int guard_bins = std::min(nfft, std::max(2, half_width_bins * 2));
 
     const int start_dc = std::max(0, dc_bin - half_width_bins);
     const int end_dc = std::min(nfft - 1, dc_bin + half_width_bins);

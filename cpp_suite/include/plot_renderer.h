@@ -125,7 +125,8 @@ public:
         const AstrophysicalMetrics& metrics,
         const AstroConfig& config,
         const std::string& filepath,
-        const std::string& output_path
+        const std::string& output_path,
+        double duration_s_override = -1.0
     );
 };
 

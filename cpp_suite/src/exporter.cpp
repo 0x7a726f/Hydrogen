@@ -1,6 +1,7 @@
 #include "exporter.h"
 #include "plot_renderer.h"
 #include "simd_dsp.h"
+#include "utf8_path.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <locale>
 #include <sstream>
 
 namespace astro {
@@ -23,13 +25,14 @@ bool Exporter::export_csv(
     const std::vector<double>& calibrated_db,
     const std::string& output_path
 ) {
-    std::filesystem::path p(output_path);
+    if (output_path.empty()) return false;
+    std::filesystem::path p = astro_fs::utf8_path(output_path);
     if (!p.parent_path().empty()) {
         std::error_code ec;
         std::filesystem::create_directories(p.parent_path(), ec);
     }
 
-    std::ofstream f(output_path, std::ios::binary);
+    std::ofstream f(p, std::ios::binary);
     if (!f.is_open()) return false;
 
     const size_t n = std::min({freqs_hz.size(), freqs_mhz.size(), vel_kms.size(),
@@ -44,19 +47,31 @@ bool Exporter::export_csv(
     out_buf = "Frequency_Hz,Frequency_MHz,Doppler_Velocity_kms,Raw_Power_dB,Baseline_Power_dB,Calibrated_Power_dB,Antenna_Temperature_K\n";
 
     char line_buf[512];
+    // Reserve space for delim, guard ptr < end, and use scientific notation for huge magnitudes
     auto append_fixed = [](char*& ptr, char* end, double val, int prec, char delim) {
+        if (ptr >= end) return;
+        char* num_end = end - 1; // Reserve 1 byte for delim
         if (!std::isfinite(val)) val = 0.0;
-        auto r = std::to_chars(ptr, end, val, std::chars_format::fixed, prec);
-        if (r.ec == std::errc()) {
-            ptr = r.ptr;
-        } else if (ptr < end) {
-            *ptr++ = '0';
+        if (ptr < num_end) {
+            std::to_chars_result r{};
+            if (std::abs(val) > 1e18) {
+                r = std::to_chars(ptr, num_end, val, std::chars_format::scientific, prec);
+            } else {
+                r = std::to_chars(ptr, num_end, val, std::chars_format::fixed, prec);
+            }
+            if (r.ec == std::errc()) {
+                ptr = r.ptr;
+            } else {
+                *ptr++ = '0';
+            }
         }
-        *ptr++ = delim;
+        if (ptr < end) {
+            *ptr++ = delim;
+        }
     };
     for (size_t i = 0; i < n; ++i) {
         char* ptr = line_buf;
-        char* end = line_buf + sizeof(line_buf) - 16;
+        char* end = line_buf + sizeof(line_buf);
         append_fixed(ptr, end, freqs_hz[i], 3, ',');
         append_fixed(ptr, end, freqs_mhz[i], 6, ',');
         append_fixed(ptr, end, vel_kms[i], 3, ',');
@@ -74,7 +89,10 @@ bool Exporter::export_csv(
         f.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
     }
 
-    return f.good();
+    f.flush();
+    const bool ok = f.good();
+    f.close();
+    return ok && !f.fail();
 }
 
 static std::string escape_json_str(const std::string& input) {
@@ -113,14 +131,16 @@ bool Exporter::export_json(
     const FileMetadata& meta,
     const std::string& output_path
 ) {
-    std::filesystem::path p(output_path);
+    if (output_path.empty()) return false;
+    std::filesystem::path p = astro_fs::utf8_path(output_path);
     if (!p.parent_path().empty()) {
         std::error_code ec;
         std::filesystem::create_directories(p.parent_path(), ec);
     }
 
-    std::ofstream f(output_path);
+    std::ofstream f(p);
     if (!f.is_open()) return false;
+    f.imbue(std::locale::classic());
 
     // Normalize path separators to forward slash in JSON
     std::string clean_source = meta.filepath;
@@ -241,14 +261,16 @@ bool Exporter::export_summary_text(
     const FileMetadata& meta,
     const std::string& output_path
 ) {
-    std::filesystem::path p(output_path);
+    if (output_path.empty()) return false;
+    std::filesystem::path p = astro_fs::utf8_path(output_path);
     if (!p.parent_path().empty()) {
         std::error_code ec;
         std::filesystem::create_directories(p.parent_path(), ec);
     }
 
-    std::ofstream f(output_path);
+    std::ofstream f(p);
     if (!f.is_open()) return false;
+    f.imbue(std::locale::classic());
 
     const double dur_s = safe_num(meta.duration_s);
     const double dur_min = dur_s / 60.0;
@@ -270,6 +292,7 @@ bool Exporter::export_summary_text(
         dc_assessment = "WARNING: LO DC notch lies within +/-50 kHz of H I rest frequency; line profile may be affected.";
     } else {
         std::ostringstream dss;
+        dss.imbue(std::locale::classic());
         dss << "LO tuned " << std::fixed << std::setprecision(1) << std::abs(safe_num(metrics.lo_offset_khz))
             << " kHz from H I rest frequency (clear of DC excision notch).";
         dc_assessment = dss.str();
@@ -279,7 +302,7 @@ bool Exporter::export_summary_text(
       << "======================================================================\n\n"
       << "1. Observation Metadata\n"
       << "----------------------------------------------------------------------\n"
-      << "Source IQ File:             " << std::filesystem::path(meta.filepath).filename().string() << "\n"
+      << "Source IQ File:             " << astro_fs::path_to_utf8(astro_fs::utf8_path(meta.filepath).filename()) << "\n"
       << "File Location:              " << meta.filepath << "\n"
       << "File Size:                  " << std::fixed << std::setprecision(2)
       << safe_num(static_cast<double>(meta.filesize) / (1024.0 * 1024.0 * 1024.0))
@@ -382,15 +405,19 @@ bool Exporter::export_all_artifacts(
     const std::vector<double>& calibrated_db,
     const AstrophysicalMetrics& metrics
 ) {
+    if (output_dir.empty()) return false;
+    std::filesystem::path out = astro_fs::utf8_path(output_dir);
     std::error_code ec;
-    std::filesystem::create_directories(output_dir, ec);
+    std::filesystem::create_directories(out, ec);
+    if (ec || !std::filesystem::is_directory(out, ec)) {
+        return false;
+    }
 
-    std::filesystem::path out(output_dir);
-    std::string p1 = (out / "1_hi_spectrum_calibrated.png").string();
-    std::string p2 = (out / "2_hi_raw_and_baseline.png").string();
-    std::string p3 = (out / "3_hi_doppler_velocity.png").string();
-    std::string p4 = (out / "4_hi_waterfall_time_frequency.png").string();
-    std::string p5 = (out / "5_hi_master_dashboard.png").string();
+    std::string p1 = astro_fs::path_to_utf8(out / "1_hi_spectrum_calibrated.png");
+    std::string p2 = astro_fs::path_to_utf8(out / "2_hi_raw_and_baseline.png");
+    std::string p3 = astro_fs::path_to_utf8(out / "3_hi_doppler_velocity.png");
+    std::string p4 = astro_fs::path_to_utf8(out / "4_hi_waterfall_time_frequency.png");
+    std::string p5 = astro_fs::path_to_utf8(out / "5_hi_master_dashboard.png");
 
     std::vector<double> vel_kms = Astrophysics::compute_doppler_velocity(stream_res.freq_hz);
 
@@ -404,7 +431,7 @@ bool Exporter::export_all_artifacts(
         return PlotRenderer::render_master_dashboard(
             stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db,
             stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols,
-            stream_res.waterfall_times, metrics, config, source_file, p5);
+            stream_res.waterfall_times, metrics, config, source_file, p5, meta.duration_s);
     });
     auto f1 = std::async(std::launch::async, [&]() {
         return PlotRenderer::render_calibrated_spectrum(
@@ -427,9 +454,9 @@ bool Exporter::export_all_artifacts(
         });
     }
 
-    std::string csv_path = (out / "calibrated_spectrum.csv").string();
-    std::string txt_path = (out / "analysis_report.txt").string();
-    std::string json_path = (out / "analysis_report.json").string();
+    std::string csv_path = astro_fs::path_to_utf8(out / "calibrated_spectrum.csv");
+    std::string txt_path = astro_fs::path_to_utf8(out / "analysis_report.txt");
+    std::string json_path = astro_fs::path_to_utf8(out / "analysis_report.json");
 
     bool ok = true;
     ok &= export_csv(stream_res.freq_hz, stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db, csv_path);

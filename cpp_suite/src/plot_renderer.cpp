@@ -1,5 +1,7 @@
 #include "plot_renderer.h"
+#include "utf8_path.h"
 
+#define STBIW_WINDOWS_UTF8
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -209,6 +211,7 @@ static const uint8_t FONT_8X12[95][12] = {
 };
 
 PixelColor sample_colormap(ColormapType cmap, float t) {
+    if (!std::isfinite(t)) t = 0.0f;
     t = std::clamp(t, 0.0f, 1.0f);
 
     if (cmap == ColormapType::Classic) {
@@ -362,7 +365,13 @@ void SoftwareCanvas::draw_line(int x0_i, int y0_i, int x1_i, int y1_i, PixelColo
         plot(xpxl2, ypxl2, rfpart(yend) * xgap);
         plot(xpxl2, ypxl2 + 1, fpart(yend) * xgap);
 
-        for (int x = xpxl1 + 1; x < xpxl2; ++x) {
+        const int max_axis = steep ? height_ : width_;
+        const int loop_start = std::max(0, xpxl1 + 1);
+        const int loop_end = std::min(max_axis, xpxl2);
+        if (loop_start > xpxl1 + 1) {
+            intery += gradient * static_cast<float>(loop_start - (xpxl1 + 1));
+        }
+        for (int x = loop_start; x < loop_end; ++x) {
             plot(x, static_cast<int>(std::floor(intery)), rfpart(intery));
             plot(x, static_cast<int>(std::floor(intery)) + 1, fpart(intery));
             intery += gradient;
@@ -564,7 +573,7 @@ void SoftwareCanvas::render_waterfall(
         const int inv_py = dest_h - 1 - py;
         const int r0 = std::clamp(static_cast<int>((static_cast<double>(inv_py) * rows) / dest_h), 0, rows - 1);
         const int r1 = std::clamp(static_cast<int>((static_cast<double>(inv_py + 1) * rows) / dest_h), r0 + 1, rows);
-        uint32_t* dst_row = &canvas_px[static_cast<size_t>(dest_y + py) * static_cast<size_t>(width_) + static_cast<size_t>(dest_x)];
+        uint32_t* dst_row = &canvas_px[static_cast<size_t>(dest_y + py) * static_cast<size_t>(width_)];
 
         for (int px = px_start; px < px_end; ++px) {
             const int c0 = col_start[static_cast<size_t>(px)];
@@ -583,10 +592,10 @@ void SoftwareCanvas::render_waterfall(
             }
             const float val = any_finite ? peak : vmin;
             const float norm = (val - vmin) * inv_range_255;
-            int idx = std::isfinite(norm) ? static_cast<int>(norm) : 0;
-            if (idx < 0) idx = 0;
-            else if (idx > 255) idx = 255;
-            dst_row[px] = lut[idx];
+            const int idx = std::isfinite(norm)
+                ? static_cast<int>(std::clamp(norm, 0.0f, 255.0f))
+                : 0;
+            dst_row[static_cast<size_t>(dest_x + px)] = lut[idx];
         }
     }
 }
@@ -620,8 +629,8 @@ static void compute_waterfall_percentiles(std::vector<float>& vals, float& vmin,
 }
 
 bool SoftwareCanvas::save_png(const std::string& filepath) const {
-    if (width_ <= 0 || height_ <= 0 || pixels_.empty()) return false;
-    std::filesystem::path p(filepath);
+    if (width_ <= 0 || height_ <= 0 || pixels_.empty() || filepath.empty()) return false;
+    std::filesystem::path p = astro_fs::utf8_path(filepath);
     if (!p.parent_path().empty()) {
         std::error_code ec;
         std::filesystem::create_directories(p.parent_path(), ec);
@@ -653,8 +662,16 @@ static inline double safe_val(double v) {
 
 static inline int safe_px(double v) {
     if (!std::isfinite(v)) return 0;
-    const long long r = std::llround(v);
-    return static_cast<int>(std::clamp<long long>(r, -100000LL, 100000LL));
+    // Clamp in double space BEFORE llround to prevent UB/wrap-around on huge values
+    const double clamped = std::clamp(v, -100000.0, 100000.0);
+    return static_cast<int>(std::llround(clamped));
+}
+
+static inline void sanitize_axis_range(double& lo, double& hi, double def_lo, double def_hi) {
+    if (!std::isfinite(lo) || !std::isfinite(hi) || lo >= hi || !std::isfinite(hi - lo)) {
+        lo = def_lo;
+        hi = def_hi;
+    }
 }
 
 static void draw_text_right(SoftwareCanvas& canvas, int right_x, int y, const std::string& text, PixelColor color, int scale = 1) {
@@ -705,10 +722,11 @@ static void draw_clipped_line(
 ) {
     if (left >= right || top >= bottom) return;
     // Liang-Barsky parametric segment clipping against [left, right] x [top, bottom]
+    // Promote to double BEFORE subtracting to avoid signed 32-bit int overflow
     double t0 = 0.0;
     double t1 = 1.0;
-    const double dx = static_cast<double>(x1 - x0);
-    const double dy = static_cast<double>(y1 - y0);
+    const double dx = static_cast<double>(x1) - static_cast<double>(x0);
+    const double dy = static_cast<double>(y1) - static_cast<double>(y0);
     auto clip = [&](double p, double q) -> bool {
         if (std::abs(p) < 1e-12) return q >= 0.0;
         const double r = q / p;
@@ -721,10 +739,10 @@ static void draw_clipped_line(
         }
         return true;
     };
-    if (!clip(-dx, static_cast<double>(x0 - left))) return;
-    if (!clip(dx, static_cast<double>(right - x0))) return;
-    if (!clip(-dy, static_cast<double>(y0 - top))) return;
-    if (!clip(dy, static_cast<double>(bottom - y0))) return;
+    if (!clip(-dx, static_cast<double>(x0) - static_cast<double>(left))) return;
+    if (!clip(dx, static_cast<double>(right) - static_cast<double>(x0))) return;
+    if (!clip(-dy, static_cast<double>(y0) - static_cast<double>(top))) return;
+    if (!clip(dy, static_cast<double>(bottom) - static_cast<double>(y0))) return;
 
     const int cx0 = safe_px(x0 + t0 * dx);
     const int cy0 = safe_px(y0 + t0 * dy);
@@ -1046,6 +1064,7 @@ bool PlotRenderer::render_raw_and_baseline(
     const double y1_span = std::max(0.5, y1_max - y1_min);
     y1_min -= y1_span * 0.16;
     y1_max += y1_span * 0.18;
+    sanitize_axis_range(y1_min, y1_max, -100.0, 0.0);
 
     if (y2_pb_min > y2_pb_max) {
         y2_pb_min = -0.35;
@@ -1053,12 +1072,13 @@ bool PlotRenderer::render_raw_and_baseline(
     }
     const double y2_span = std::max(0.4, y2_pb_max - y2_pb_min);
     const double y2_pad = std::max(0.10, y2_span * 0.18);
-    const double y2_min = std::min(-0.20, y2_pb_min - y2_pad);
-    const double y2_max = std::max(0.20, y2_pb_max + y2_pad);
+    double y2_min = std::min(-0.20, y2_pb_min - y2_pad);
+    double y2_max = std::max(0.20, y2_pb_max + y2_pad);
+    sanitize_axis_range(y2_min, y2_max, -1.0, 1.0);
 
-    const double off_line_rms_db = (off_line_cnt > 0)
-        ? std::sqrt(off_line_sq / static_cast<double>(off_line_cnt))
-        : safe_val(metrics.noise_std_db);
+    const double off_line_rms_db = (std::isfinite(metrics.noise_std_db) && metrics.noise_std_db > 0.0)
+        ? metrics.noise_std_db
+        : ((off_line_cnt > 0) ? std::sqrt(off_line_sq / static_cast<double>(off_line_cnt)) : 0.0);
 
     auto map_x = [&](double f) {
         return safe_px(left + (f - f_min) / (f_max - f_min) * plot_w);
@@ -1565,7 +1585,8 @@ bool PlotRenderer::render_master_dashboard(
     const AstrophysicalMetrics& metrics,
     const AstroConfig& config,
     const std::string& filepath,
-    const std::string& output_path
+    const std::string& output_path,
+    double duration_s_override
 ) {
     // Guard all spectral vectors including calibrated_db (allow empty waterfall for graceful Q4 placeholder)
     const size_t n = std::min({freqs_mhz.size(), vel_kms.size(), raw_power.size(),
@@ -1582,11 +1603,13 @@ bool PlotRenderer::render_master_dashboard(
     SoftwareCanvas canvas(W, H, PixelColor(13, 17, 23));
 
     // Header banner (title scale=2, subtitle scale=1 to prevent horizontal overflow)
-    std::filesystem::path fp(filepath);
-    const double dur_s = waterfall_times.empty() ? 0.0 : safe_val(waterfall_times.back());
+    const std::string fname_utf8 = astro_fs::path_to_utf8(astro_fs::utf8_path(filepath).filename());
+    const double dur_s = (std::isfinite(duration_s_override) && duration_s_override >= 0.0)
+        ? duration_s_override
+        : (waterfall_times.empty() ? 0.0 : safe_val(waterfall_times.back()));
     const double snr_disp = safe_val(metrics.snr_matched > 0.0 ? metrics.snr_matched : metrics.snr);
     std::stringstream subtitle;
-    subtitle << "File: " << fp.filename().string()
+    subtitle << "File: " << fname_utf8
              << "  |  Duration: " << format_fixed(dur_s, 1) << "s (" << format_fixed(dur_s / 60.0, 2) << " min)"
              << "  |  LO: " << format_fixed(safe_val(config.center_freq_hz / 1e6), 4) << " MHz"
              << "  |  Rate: " << format_fixed(safe_val(config.sample_rate_hz / 1e6), 2) << " MSPS"
@@ -1983,8 +2006,12 @@ bool PlotRenderer::render_master_dashboard(
             }
             canvas.draw_rect(cb_x, pt, cb_w, ph, PixelColor(48, 54, 61), 1);
             canvas.draw_text(cb_x, pt - 14, "dB", PixelColor(164, 176, 190), 1);
-            canvas.draw_text(cb_x + cb_w + 4, pt - 2, format_signed(vmax, 1), PixelColor(180, 188, 196), 1);
-            canvas.draw_text(cb_x + cb_w + 4, pb - 10, format_signed(vmin, 1), PixelColor(180, 188, 196), 1);
+            const std::string lbl_max = format_signed(vmax, 1);
+            const std::string lbl_min = format_signed(vmin, 1);
+            const int lbl_x_max = std::min(cb_x + cb_w + 4, q4_x + pane_w - canvas.measure_text_width(lbl_max, 1) - 4);
+            const int lbl_x_min = std::min(cb_x + cb_w + 4, q4_x + pane_w - canvas.measure_text_width(lbl_min, 1) - 4);
+            canvas.draw_text(std::max(cb_x + cb_w + 2, lbl_x_max), pt - 2, lbl_max, PixelColor(180, 188, 196), 1);
+            canvas.draw_text(std::max(cb_x + cb_w + 2, lbl_x_min), pb - 10, lbl_min, PixelColor(180, 188, 196), 1);
 
             canvas.draw_text(q4_x + 8, pt - 14, "Time", PixelColor(164, 176, 190), 1);
             draw_text_center(canvas, pl + pw / 2, pb + 24, "Frequency (MHz)", PixelColor(164, 176, 190), 1);

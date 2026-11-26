@@ -1,5 +1,6 @@
 #include "cs16_writer.h"
 #include "simd_dsp.h"
+#include "utf8_path.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -11,22 +12,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <locale>
 #include <sstream>
 
 namespace fs = std::filesystem;
-
-#ifdef _WIN32
-static std::wstring to_wide(const std::string& str) {
-    if (str.empty() || str.size() > static_cast<size_t>(INT_MAX)) return std::wstring();
-    const int src_len = static_cast<int>(str.size());
-    const int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), src_len, nullptr, 0);
-    if (size <= 0) return std::wstring();
-    std::wstring result(static_cast<size_t>(size), L'\0');
-    const int written = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), src_len, &result[0], size);
-    if (written <= 0) return std::wstring();
-    return result;
-}
-#endif
 
 static void safe_localtime(std::time_t tt, std::tm& out) {
 #ifdef _WIN32
@@ -39,7 +28,7 @@ static void safe_localtime(std::time_t tt, std::tm& out) {
 Cs16Writer::Cs16Writer(const std::string& output_dir)
     : output_dir_(output_dir) {
     std::error_code ec;
-    fs::create_directories(output_dir_, ec);
+    fs::create_directories(astro_fs::utf8_path(output_dir_), ec);
 }
 
 Cs16Writer::~Cs16Writer() {
@@ -82,7 +71,8 @@ std::string Cs16Writer::start_recording(
 
     // Stop intake, join any finished auto-stopped worker thread, and drain all active feeders
     // before mutating shared state or resetting the ring buffer.
-    accepting_samples_.store(false, std::memory_order_release);
+    // seq_cst Dekker handshake prevents Store-Load reordering with feed_samples().
+    accepting_samples_.store(false, std::memory_order_seq_cst);
     if (writer_thread_.joinable()) {
         stop_worker_.store(true, std::memory_order_release);
         {
@@ -91,7 +81,7 @@ std::string Cs16Writer::start_recording(
         queue_cv_.notify_all();
         writer_thread_.join();
     }
-    while (active_feeders_.load(std::memory_order_acquire) > 0) {
+    while (active_feeders_.load(std::memory_order_seq_cst) > 0) {
         std::this_thread::yield();
     }
 
@@ -108,6 +98,7 @@ std::string Cs16Writer::start_recording(
         path_to_use = custom_filepath;
     } else {
         std::ostringstream ss;
+        ss.imbue(std::locale::classic());
         ss << output_dir_ << "/hi_capture_" << format_time_slug_now() << "_"
            << std::fixed << std::setprecision(3) << (static_cast<double>(center_freq_hz) / 1e6) << "MHz_"
            << std::setprecision(2) << (static_cast<double>(sample_rate_hz) / 1e6) << "MSPS.cs16";
@@ -115,14 +106,15 @@ std::string Cs16Writer::start_recording(
     }
 
     std::error_code ec;
-    fs::path parent_dir = fs::path(path_to_use).parent_path();
+    const fs::path target_fs_path = astro_fs::utf8_path(path_to_use);
+    fs::path parent_dir = target_fs_path.parent_path();
     if (!parent_dir.empty()) {
         fs::create_directories(parent_dir, ec);
     }
 
 #ifdef _WIN32
     file_handle_ = CreateFileW(
-        to_wide(path_to_use).c_str(),
+        astro_fs::utf8_to_wide(path_to_use).c_str(),
         GENERIC_WRITE,
         FILE_SHARE_READ,
         nullptr,
@@ -136,7 +128,7 @@ std::string Cs16Writer::start_recording(
     }
 #else
     {
-        std::ofstream probe(path_to_use, std::ios::binary | std::ios::trunc);
+        std::ofstream probe(target_fs_path, std::ios::binary | std::ios::trunc);
         if (!probe.is_open()) {
             io_error_.store(true, std::memory_order_release);
             return "";
@@ -157,16 +149,33 @@ std::string Cs16Writer::start_recording(
     sidecars_written_.store(false, std::memory_order_release);
     stop_worker_.store(false, std::memory_order_release);
 
-    if (!ring_buffer_) {
-        ring_buffer_ = std::make_unique<LockFreeSpscRingBuffer<uint8_t>>(8ULL * 1024ULL * 1024ULL);
-    } else {
-        ring_buffer_->reset();
+    try {
+        if (!ring_buffer_) {
+            ring_buffer_ = std::make_unique<LockFreeSpscRingBuffer<uint8_t>>(8ULL * 1024ULL * 1024ULL);
+        } else {
+            ring_buffer_->reset();
+        }
+
+        accepting_samples_.store(true, std::memory_order_seq_cst);
+        is_recording_.store(true, std::memory_order_release);
+
+        writer_thread_ = std::thread(&Cs16Writer::writer_worker, this);
+    } catch (...) {
+        accepting_samples_.store(false, std::memory_order_seq_cst);
+        while (active_feeders_.load(std::memory_order_seq_cst) > 0) {
+            std::this_thread::yield();
+        }
+        is_recording_.store(false, std::memory_order_release);
+        io_error_.store(true, std::memory_order_release);
+        sidecars_written_.store(true, std::memory_order_release);
+#ifdef _WIN32
+        if (file_handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+        }
+#endif
+        throw;
     }
-
-    accepting_samples_.store(true, std::memory_order_release);
-    is_recording_.store(true, std::memory_order_release);
-
-    writer_thread_ = std::thread(&Cs16Writer::writer_worker, this);
     return path_to_use;
 }
 
@@ -174,27 +183,35 @@ void Cs16Writer::finalize_sidecars(double duration_s) {
     if (sidecars_written_.exchange(true)) return;
     std::string cur_path = get_current_filepath();
     std::error_code ec;
-    if (!cur_path.empty() && fs::exists(cur_path, ec)) {
+    const fs::path p = astro_fs::utf8_path(cur_path);
+    if (!cur_path.empty() && fs::exists(p, ec)) {
         {
             std::lock_guard<std::mutex> lock(path_mutex_);
             last_recorded_filepath_ = cur_path;
         }
-        fs::path p(cur_path);
         fs::path base = p.parent_path() / p.stem();
-        write_accompanied_txt(base.string() + ".txt", duration_s);
-        write_sidecar_json(base.string() + ".json", duration_s);
+        const std::string base_utf8 = astro_fs::path_to_utf8(base);
+        write_accompanied_txt(base_utf8 + ".txt", duration_s);
+        write_sidecar_json(base_utf8 + ".json", duration_s);
     }
 }
 
 bool Cs16Writer::stop_recording() {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-    accepting_samples_.store(false, std::memory_order_release);
-    while (active_feeders_.load(std::memory_order_acquire) > 0) {
+    // seq_cst Dekker handshake prevents Store-Load reordering with feed_samples().
+    accepting_samples_.store(false, std::memory_order_seq_cst);
+    while (active_feeders_.load(std::memory_order_seq_cst) > 0) {
         std::this_thread::yield();
     }
     bool was_recording = is_recording_.load(std::memory_order_acquire);
     bool has_thread = writer_thread_.joinable();
     if (!was_recording && !has_thread) {
+#ifdef _WIN32
+        if (file_handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+        }
+#endif
         return false;
     }
 
@@ -207,6 +224,12 @@ bool Cs16Writer::stop_recording() {
     if (writer_thread_.joinable()) {
         writer_thread_.join();
     }
+#ifdef _WIN32
+    if (file_handle_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(file_handle_);
+        file_handle_ = INVALID_HANDLE_VALUE;
+    }
+#endif
     is_recording_.store(false, std::memory_order_release);
 
     std::chrono::steady_clock::time_point st;
@@ -238,18 +261,18 @@ void Cs16Writer::feed_samples(const uint8_t* data, size_t length) {
 
     struct FeederGuard {
         std::atomic<int>& cnt;
-        explicit FeederGuard(std::atomic<int>& c) : cnt(c) { cnt.fetch_add(1, std::memory_order_acq_rel); }
+        explicit FeederGuard(std::atomic<int>& c) : cnt(c) { cnt.fetch_add(1, std::memory_order_seq_cst); }
         ~FeederGuard() { cnt.fetch_sub(1, std::memory_order_release); }
     } guard(active_feeders_);
 
-    if (!accepting_samples_.load(std::memory_order_acquire)) return;
+    if (!accepting_samples_.load(std::memory_order_seq_cst)) return;
 
     if (max_duration_s_ > 0.0) {
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - start_time_).count();
         if (elapsed >= max_duration_s_) {
             // Stop intake and wake writer_worker so it flushes, closes file & writes sidecars before clearing is_recording_
-            accepting_samples_.store(false, std::memory_order_release);
+            accepting_samples_.store(false, std::memory_order_seq_cst);
             stop_worker_.store(true, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(queue_mutex_);
@@ -279,15 +302,21 @@ void Cs16Writer::writer_worker() {
 #endif
 
 #ifndef _WIN32
-    std::ofstream out(get_current_filepath(), std::ios::binary);
+    // Declare file_buf BEFORE out so out closes/flushes before file_buf is destroyed,
+    // and call pubsetbuf() BEFORE open() so libstdc++ honors the custom 2 MB buffer.
+    std::vector<char> file_buf(2097152);
+    std::ofstream out;
+    out.rdbuf()->pubsetbuf(file_buf.data(), static_cast<std::streamsize>(file_buf.size()));
+    out.open(astro_fs::utf8_path(get_current_filepath()), std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
+        // Prevent stop_recording() from writing sidecars / updating last_recorded_filepath_
+        // for the 0-byte probe file after open failure.
         io_error_.store(true, std::memory_order_release);
-        accepting_samples_.store(false, std::memory_order_release);
+        sidecars_written_.store(true, std::memory_order_release);
+        accepting_samples_.store(false, std::memory_order_seq_cst);
         is_recording_.store(false, std::memory_order_release);
         return;
     }
-    std::vector<char> file_buf(2097152);
-    out.rdbuf()->pubsetbuf(file_buf.data(), static_cast<std::streamsize>(file_buf.size()));
 #endif
 
     constexpr size_t kBatchCap = 2ULL * 1024ULL * 1024ULL; // 2 MB u8 -> 4 MB CS16 (even)
@@ -426,8 +455,9 @@ void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double durat
     double size_gb = static_cast<double>(total_bytes_w) / (1024.0 * 1024.0 * 1024.0);
     const std::string cur_file = get_current_filepath();
     std::error_code ec;
-    std::string cs16_filename = fs::path(cur_file).filename().string();
-    std::string full_path = fs::absolute(cur_file, ec).string();
+    const fs::path cur_fs = astro_fs::utf8_path(cur_file);
+    std::string cs16_filename = astro_fs::path_to_utf8(cur_fs.filename());
+    std::string full_path = astro_fs::path_to_utf8(fs::absolute(cur_fs, ec));
     if (full_path.empty()) full_path = cur_file;
 
     double passband_min_mhz = (fc_hz - fs_hz / 2.0) / 1e6;
@@ -436,18 +466,21 @@ void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double durat
     std::string offset_desc;
     if (std::abs(offset_khz) < 50.0) {
         std::ostringstream ss;
+        ss.imbue(std::locale::classic());
         ss << std::showpos << std::fixed << std::setprecision(2) << offset_khz
            << " kHz from HI rest (LO DC notch lies near the HI window)";
         offset_desc = ss.str();
     } else {
         std::ostringstream ss;
+        ss.imbue(std::locale::classic());
         ss << std::showpos << std::fixed << std::setprecision(2) << offset_khz
            << " kHz from HI rest (LO DC spike is clear of the HI rest window)";
         offset_desc = ss.str();
     }
 
-    std::ofstream f(txt_path);
+    std::ofstream f(astro_fs::utf8_path(txt_path));
     if (!f.is_open()) return;
+    f.imbue(std::locale::classic());
 
     f << "HYDROGEN LINE (21cm) OBSERVATION METADATA\n"
       << "======================================================================\n"
@@ -492,8 +525,9 @@ void Cs16Writer::write_accompanied_txt(const std::string& txt_path, double durat
 }
 
 void Cs16Writer::write_sidecar_json(const std::string& json_path, double duration_s) {
-    std::ofstream f(json_path);
+    std::ofstream f(astro_fs::utf8_path(json_path));
     if (!f.is_open()) return;
+    f.imbue(std::locale::classic());
 
     double offset_hz = static_cast<double>(center_freq_hz_) - SdrConstants::HI_REST_FREQ_HZ;
     double offset_khz = offset_hz / 1e3;
@@ -502,7 +536,7 @@ void Cs16Writer::write_sidecar_json(const std::string& json_path, double duratio
     {
         std::lock_guard<std::mutex> lock(path_mutex_);
         std::error_code ec;
-        clean_path = fs::absolute(current_filepath_, ec).generic_string();
+        clean_path = astro_fs::path_to_generic_utf8(fs::absolute(astro_fs::utf8_path(current_filepath_), ec));
         if (clean_path.empty()) clean_path = current_filepath_;
     }
 
@@ -545,7 +579,7 @@ RecordingStats Cs16Writer::get_stats() {
         st = start_time_;
     }
 
-    s.filename = cur_path.empty() ? "None" : fs::path(cur_path).filename().string();
+    s.filename = cur_path.empty() ? "None" : astro_fs::path_to_utf8(astro_fs::utf8_path(cur_path).filename());
     s.full_path = cur_path;
     s.bytes_written = bytes_written_.load();
     s.samples_written = samples_written_.load();
@@ -579,22 +613,22 @@ RecordingStats Cs16Writer::get_stats() {
     // Query free space on the actual target file's parent directory (fallback output_dir_ / ".")
     std::string space_dir = output_dir_.empty() ? "." : output_dir_;
     if (!cur_path.empty()) {
-        fs::path parent = fs::path(cur_path).parent_path();
-        space_dir = parent.empty() ? "." : parent.string();
+        fs::path parent = astro_fs::utf8_path(cur_path).parent_path();
+        space_dir = parent.empty() ? "." : astro_fs::path_to_utf8(parent);
     }
 
     uint64_t free_bytes = 0;
     bool have_free = false;
 #ifdef _WIN32
     ULARGE_INTEGER free_bytes_avail, total_bytes, total_free_bytes;
-    std::wstring dir_w = to_wide(space_dir);
+    std::wstring dir_w = astro_fs::utf8_to_wide(space_dir);
     if (!dir_w.empty() && GetDiskFreeSpaceExW(dir_w.c_str(), &free_bytes_avail, &total_bytes, &total_free_bytes)) {
         free_bytes = free_bytes_avail.QuadPart;
         have_free = true;
     }
 #else
     std::error_code space_ec;
-    auto si = fs::space(space_dir, space_ec);
+    auto si = fs::space(astro_fs::utf8_path(space_dir), space_ec);
     if (!space_ec) {
         free_bytes = static_cast<uint64_t>(si.available);
         have_free = true;
