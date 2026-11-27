@@ -150,9 +150,9 @@ void AppGui::render_top_navigation_bar(float width, float height) {
 
     const float mid_y = win_pos.y + height * 0.5f;
 
-    // 1. Left Brand & Concise Instrument Band Label (no neon capsule pills)
+    // 1. Left Brand & Frequency Reference
     ui_obs::icons::draw_dish(dl, ImVec2(win_pos.x + ui_obs::dp(22.0f), mid_y),
-                             ui_obs::dp(9.0f), ui_obs::palette::U32(ui_obs::palette::Cyan));
+                             ui_obs::dp(8.5f), ui_obs::palette::U32(ui_obs::palette::Cyan));
     {
         ui_obs::ScopedFont title_f(fonts_.semibold, 15.0f);
         ImGui::SetCursorPos(ImVec2(ui_obs::dp(38.0f), (height - ImGui::GetTextLineHeight()) * 0.5f));
@@ -164,7 +164,7 @@ void AppGui::render_top_navigation_bar(float width, float height) {
     {
         ui_obs::ScopedFont tag_f(fonts_.mono, 12.0f);
         ImGui::SetCursorPosY((height - ImGui::GetTextLineHeight()) * 0.5f);
-        ImGui::TextColored(ui_obs::palette::TextMuted, "21cm H I");
+        ImGui::TextColored(ui_obs::palette::TextMuted, "1420.4 MHz");
         brand_right_local = ImGui::GetItemRectMax().x - win_pos.x;
     }
 
@@ -172,30 +172,27 @@ void AppGui::render_top_navigation_bar(float width, float height) {
     dl->AddLineV(div_x, win_pos.y + ui_obs::dp(11.0f), win_pos.y + height - ui_obs::dp(11.0f),
                  ui_obs::palette::U32(ui_obs::palette::BorderSubtle), 1.0f);
 
-    // 2. Right Global Status Indicator (computed first & always drawn so it never disappears)
+    // 2. Right Global Status Indicator
     const bool is_rec = state_.is_recording_active();
     const bool is_ana = analyze_panel_.is_analyzing();
     const bool is_live = sdr_.is_streaming();
-    const bool compact_status = (width < ui_obs::dp(760.0f));
 
-    const char* status_label = "IDLE";
+    const char* status_label = "Idle";
     ImVec4 status_col = ui_obs::palette::TextMuted;
     if (is_rec) {
-        status_label = "REC ACTIVE";
+        status_label = "Recording";
         status_col = ui_obs::palette::Red;
     } else if (is_ana) {
-        status_label = "ANALYZING";
+        status_label = "Analyzing";
         status_col = ui_obs::palette::Cyan;
     } else if (is_live) {
-        status_label = sdr_.is_simulated()
-            ? (compact_status ? "SIM RX" : "SIMULATED RX")
-            : (compact_status ? "LIVE"   : "RTL-SDR LIVE");
+        status_label = sdr_.is_simulated() ? "Simulated" : "Live";
         status_col = sdr_.is_simulated() ? ui_obs::palette::Amber : ui_obs::palette::Emerald;
     }
 
     float right_limit = win_pos.x + width - ui_obs::dp(14.0f);
     {
-        ui_obs::ScopedFont st_f(fonts_.mono, 12.0f);
+        ui_obs::ScopedFont st_f(fonts_.regular, 13.0f);
         const ImVec2 tsz = ImGui::CalcTextSize(status_label);
         const float dot_r = ui_obs::dp(3.5f);
         const float right_x = win_pos.x + width - ui_obs::dp(14.0f);
@@ -207,77 +204,61 @@ void AppGui::render_top_navigation_bar(float width, float height) {
                     ui_obs::palette::U32(ui_obs::palette::TextPrimary), status_label);
     }
 
-    // 3. Center Animated Segmented Mode Switcher
+    // 3. Center Mode Switcher Tabs
     const AppSection active_sec = state_.get_section();
     const int active_tab = (active_sec == AppSection::Record) ? 0 : 1;
-    const bool compact_tabs = (width < ui_obs::dp(880.0f));
+    const bool compact_tabs = (width < ui_obs::dp(820.0f));
 
-    const float seg_h = ui_obs::dp(34.0f);
-    const float icon_slot = ui_obs::dp(22.0f);
-    const float pad_side = compact_tabs ? ui_obs::dp(10.0f) : ui_obs::dp(14.0f);
-    const char* label_rec = compact_tabs ? "1. Live SDR"     : "1. Live SDR & Record";
-    const char* label_ana = compact_tabs ? "2. H I Analysis" : "2. H I Scientific Analysis";
+    const float seg_h = ui_obs::dp(32.0f);
+    const float icon_slot = ui_obs::dp(20.0f);
+    const float pad_side = compact_tabs ? ui_obs::dp(12.0f) : ui_obs::dp(16.0f);
+    const char* label_rec = compact_tabs ? "Live" : "Live Receiver";
+    const char* label_ana = "Analyze";
     float w_rec = 0.0f, w_ana = 0.0f;
     {
-        ui_obs::ScopedFont seg_f(fonts_.semibold, 14.5f);
+        ui_obs::ScopedFont seg_f(fonts_.semibold, 14.0f);
         w_rec = icon_slot + ImGui::CalcTextSize(label_rec).x + pad_side * 2.0f;
         w_ana = icon_slot + ImGui::CalcTextSize(label_ana).x + pad_side * 2.0f;
     }
-    const float gap = ui_obs::dp(4.0f);
+    const float gap = ui_obs::dp(3.0f);
     const float inner_pad = ui_obs::dp(3.0f);
     const float trough_w = w_rec + w_ana + gap + inner_pad * 2.0f;
-    const float min_tabs_x = brand_right_local + ui_obs::dp(18.0f);
+    const float min_tabs_x = brand_right_local + ui_obs::dp(20.0f);
     const float max_tabs_x = std::max(min_tabs_x, (right_limit - win_pos.x) - trough_w);
     const float tabs_x = std::clamp((width - trough_w) * 0.5f, min_tabs_x, max_tabs_x);
 
     const ImVec2 tr_min(win_pos.x + tabs_x, win_pos.y + (height - seg_h) * 0.5f);
     const ImVec2 tr_max(tr_min.x + trough_w, tr_min.y + seg_h);
-    dl->AddRectFilled(tr_min, tr_max, ui_obs::palette::U32(ui_obs::palette::BgWell), ui_obs::dp(8.0f), ImDrawFlags_RoundAll);
-    dl->AddRect(tr_min, tr_max, ui_obs::palette::U32(ui_obs::palette::BorderSubtle), ui_obs::dp(8.0f), 1.0f, ImDrawFlags_RoundAll);
+    dl->AddRectFilled(tr_min, tr_max, ui_obs::palette::U32(ui_obs::palette::BgWell), ui_obs::dp(4.0f), ImDrawFlags_RoundAll);
+    dl->AddRect(tr_min, tr_max, ui_obs::palette::U32(ui_obs::palette::BorderSubtle), ui_obs::dp(4.0f), 1.0f, ImDrawFlags_RoundAll);
 
     const float slot0_x = tr_min.x + inner_pad;
     const float slot1_x = slot0_x + w_rec + gap;
-    const float target_x = (active_tab == 0) ? slot0_x : slot1_x;
-    const float target_w = (active_tab == 0) ? w_rec : w_ana;
-
-    ImGuiStorage* st = ImGui::GetStateStorage();
-    float* anim_x = st->GetFloatRef(ImGui::GetID("##SegAnimX"), target_x);
-    float* anim_w = st->GetFloatRef(ImGui::GetID("##SegAnimW"), target_w);
-    // Re-anchor smoothly if window resized dramatically
-    if (std::abs(*anim_x - target_x) > trough_w) {
-        *anim_x = target_x;
-        *anim_w = target_w;
-    } else {
-        const float k = std::clamp(1.0f - std::exp(-16.0f * ImGui::GetIO().DeltaTime), 0.0f, 1.0f);
-        *anim_x += (target_x - *anim_x) * k;
-        *anim_w += (target_w - *anim_w) * k;
-    }
-    *anim_x = std::clamp(*anim_x, slot0_x, slot1_x);
-
-    const ImVec2 pill_min(*anim_x, tr_min.y + inner_pad);
-    const ImVec2 pill_max(*anim_x + *anim_w, tr_max.y - inner_pad);
-    dl->AddRectFilled(pill_min, pill_max, ui_obs::palette::U32(ui_obs::palette::SurfaceAlt), ui_obs::dp(6.0f), ImDrawFlags_RoundAll);
-    dl->AddRect(pill_min, pill_max, ui_obs::palette::U32(ui_obs::palette::Border), ui_obs::dp(6.0f), 1.0f, ImDrawFlags_RoundAll);
-    dl->AddRectFilled(ImVec2(pill_min.x + ui_obs::dp(12.0f), pill_max.y - ui_obs::dp(2.5f)),
-                      ImVec2(pill_max.x - ui_obs::dp(12.0f), pill_max.y),
-                      ui_obs::palette::U32(ui_obs::palette::AccentBlue), ui_obs::dp(1.5f), ImDrawFlags_RoundAll);
 
     auto draw_seg_slot = [&](const char* btn_id, const char* label, float abs_x, float slot_w,
                              bool selected, bool is_rec_tab) -> bool {
         const float slot_h = seg_h - inner_pad * 2.0f;
-        ImGui::SetCursorScreenPos(ImVec2(abs_x, tr_min.y + inner_pad));
+        const ImVec2 s_min(abs_x, tr_min.y + inner_pad);
+        const ImVec2 s_max(abs_x + slot_w, tr_max.y - inner_pad);
+
+        ImGui::SetCursorScreenPos(s_min);
         const bool clicked = ImGui::InvisibleButton(btn_id, ImVec2(slot_w, slot_h));
         const bool hov = ImGui::IsItemHovered();
         if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
-        if (hov && !selected) {
-            dl->AddRectFilled(ImVec2(abs_x, tr_min.y + inner_pad),
-                              ImVec2(abs_x + slot_w, tr_max.y - inner_pad),
-                              ui_obs::palette::U32(ui_obs::palette::SurfaceHover, 0.45f),
-                              ui_obs::dp(6.0f), ImDrawFlags_RoundAll);
+        if (selected) {
+            dl->AddRectFilled(s_min, s_max, ui_obs::palette::U32(ui_obs::palette::SurfaceAlt),
+                              ui_obs::dp(3.0f), ImDrawFlags_RoundAll);
+            dl->AddRect(s_min, s_max, ui_obs::palette::U32(ui_obs::palette::Border),
+                        ui_obs::dp(3.0f), 1.0f, ImDrawFlags_RoundAll);
+            dl->AddLineH(s_min.x + ui_obs::dp(10.0f), s_max.x - ui_obs::dp(10.0f), s_max.y - 1.0f,
+                         ui_obs::palette::U32(ui_obs::palette::AccentBlue), ui_obs::dp(2.0f));
+        } else if (hov) {
+            dl->AddRectFilled(s_min, s_max, ui_obs::palette::U32(ui_obs::palette::SurfaceHover, 0.55f),
+                              ui_obs::dp(3.0f), ImDrawFlags_RoundAll);
         }
 
-        ui_obs::ScopedFont seg_f(fonts_.semibold, 14.5f);
+        ui_obs::ScopedFont seg_f(fonts_.semibold, 14.0f);
         const ImU32 fg = selected ? ui_obs::palette::U32(ui_obs::palette::TextPrimary)
                                   : ui_obs::palette::U32(hov ? ui_obs::palette::TextPrimary : ui_obs::palette::TextMuted);
         const ImVec2 ts = ImGui::CalcTextSize(label);
@@ -286,9 +267,9 @@ void AppGui::render_top_navigation_bar(float width, float height) {
         const float cy = tr_min.y + seg_h * 0.5f;
 
         if (is_rec_tab) {
-            ui_obs::icons::draw_dish(dl, ImVec2(cx + ui_obs::dp(8.0f), cy), ui_obs::dp(7.0f), fg);
+            ui_obs::icons::draw_dish(dl, ImVec2(cx + ui_obs::dp(7.0f), cy), ui_obs::dp(6.5f), fg);
         } else {
-            ui_obs::icons::draw_spectrum_peak(dl, ImVec2(cx + ui_obs::dp(8.0f), cy), ui_obs::dp(7.5f), fg);
+            ui_obs::icons::draw_spectrum_peak(dl, ImVec2(cx + ui_obs::dp(7.0f), cy), ui_obs::dp(7.0f), fg);
         }
         dl->AddText(ImVec2(cx + icon_slot, cy - ts.y * 0.5f - 0.5f), fg, label);
         return clicked;
@@ -351,18 +332,18 @@ void AppGui::render_status_bar(float width, float height) {
             if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
             const ImVec4 fg = active ? ui_obs::palette::TextPrimary
-                                     : (hov ? ui_obs::palette::Cyan : ui_obs::palette::TextDim);
+                                     : (hov ? ui_obs::palette::AccentBlue : ui_obs::palette::TextDim);
             dl->AddText(pos, ui_obs::palette::U32(fg), label);
             right_cursor -= ui_obs::dp(10.0f);
             return clicked;
         };
 
-        if (draw_shortcut("##KeyF2", "F2: Analysis", sec == AppSection::Analyze)) {
+        if (draw_shortcut("##KeyF2", "F2 Analyze", sec == AppSection::Analyze)) {
             state_.set_section(AppSection::Analyze);
         }
         draw_vdiv(right_cursor + ui_obs::dp(4.0f));
         right_cursor -= ui_obs::dp(4.0f);
-        if (draw_shortcut("##KeyF1", "F1: Live SDR", sec == AppSection::Record)) {
+        if (draw_shortcut("##KeyF1", "F1 Live", sec == AppSection::Record)) {
             state_.switch_to_record();
         }
 
@@ -381,7 +362,7 @@ void AppGui::render_status_bar(float width, float height) {
         }
     }
 
-    // Left cluster flat monospace readouts separated by crisp 1px hairlines
+    // Left cluster flat readouts separated by crisp 1px hairlines
     {
         ui_obs::ScopedFont lf(fonts_.mono, 11.5f);
         float cur_x = win_pos.x + ui_obs::dp(12.0f);
@@ -406,9 +387,12 @@ void AppGui::render_status_bar(float width, float height) {
         };
 
         if (sec == AppSection::Record) {
-            const char* mode_lbl = is_rec ? "RECORDING" : (sdr_.is_simulated() ? "SIMULATED" : "HARDWARE");
+            const bool is_live = sdr_.is_streaming();
+            const char* mode_lbl = is_rec ? "Recording"
+                                          : (!is_live ? "Idle" : (sdr_.is_simulated() ? "Simulated" : "Live"));
             const ImVec4 mode_col = is_rec ? ui_obs::palette::Red
-                                           : (sdr_.is_simulated() ? ui_obs::palette::Amber : ui_obs::palette::Emerald);
+                                           : (!is_live ? ui_obs::palette::TextMuted
+                                                       : (sdr_.is_simulated() ? ui_obs::palette::Amber : ui_obs::palette::Emerald));
             draw_seg_left(mode_lbl, ui_obs::palette::TextPrimary, true, mode_col);
 
             char dsp_buf[48];
@@ -418,18 +402,18 @@ void AppGui::render_status_bar(float width, float height) {
 
             char ring_buf[32];
             const float ring_pct = sdr_.get_ring_buffer_fill_pct();
-            std::snprintf(ring_buf, sizeof(ring_buf), "RING %.1f%%", ring_pct);
+            std::snprintf(ring_buf, sizeof(ring_buf), "Buffer %.1f%%", ring_pct);
             draw_seg_left(ring_buf, (ring_pct > 80.0f) ? ui_obs::palette::Amber : ui_obs::palette::TextMuted);
 
             const uint64_t drops = sdr_.get_dropped_samples_count();
             char drop_buf[32];
-            std::snprintf(drop_buf, sizeof(drop_buf), "DROPS %llu", static_cast<unsigned long long>(drops));
+            std::snprintf(drop_buf, sizeof(drop_buf), "Drops %llu", static_cast<unsigned long long>(drops));
             draw_seg_left(drop_buf, drops > 0 ? ui_obs::palette::Red : ui_obs::palette::TextMuted);
         } else {
-            const char* mode_lbl = is_ana ? "PROCESSING" : "READY";
+            const char* mode_lbl = is_ana ? "Analyzing" : "Ready";
             const ImVec4 mode_col = is_ana ? ui_obs::palette::Cyan : ui_obs::palette::Emerald;
             draw_seg_left(mode_lbl, ui_obs::palette::TextPrimary, true, mode_col);
-            draw_seg_left("Wheel: Zoom X | Shift+Wheel: Y | R-Drag: Box Zoom | L-Drag: Pan | Dbl-Click/R: Reset", ui_obs::palette::TextMuted);
+            draw_seg_left("Scroll to zoom X | Drag to pan | Right-drag to box zoom | Double-click to reset", ui_obs::palette::TextMuted);
         }
     }
 

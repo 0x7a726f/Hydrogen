@@ -44,9 +44,9 @@ void apply_win32_dark_chrome(HWND hwnd) {
         DwmSetWindowAttribute(hwnd, kDwmwaDarkModeLegacy19, &dark_mode, sizeof(dark_mode));
     }
     const DWORD corner_pref = 2; // DWMWCP_ROUND on Windows 11
-    const COLORREF caption  = RGB(15, 20, 27);   // #0F141B HeaderBg
-    const COLORREF border   = RGB(35, 45, 59);   // Subtle Slate border
-    const COLORREF text_col = RGB(230, 237, 243);
+    const COLORREF caption  = RGB(30, 32, 36);   // #1E2024 HeaderBg
+    const COLORREF border   = RGB(56, 60, 68);   // #383C44 subtle charcoal border
+    const COLORREF text_col = RGB(228, 230, 234); // #E4E6EA TextPrimary
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner_pref, sizeof(corner_pref));
     DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
     DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
@@ -175,7 +175,7 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplWin32_EnableDpiAwareness();
 
-    HBRUSH bg_brush = CreateSolidBrush(RGB(13, 17, 23)); // #0D1117 prevents white flash on startup/resize
+    HBRUSH bg_brush = CreateSolidBrush(RGB(26, 27, 30)); // #1A1B1E BgApp prevents color flash on startup/resize
     HICON app_icon = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
     WNDCLASSEXW wc = {
         sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, app_icon, nullptr, bg_brush, nullptr,
@@ -198,7 +198,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     HWND hwnd = CreateWindowW(
         wc.lpszClassName,
-        L"Hydrogen - 21cm H I SDR & Analysis",
+        L"Hydrogen \u2014 21cm H I Receiver & Analyzer",
         WS_OVERLAPPEDWINDOW, win_x, win_y, win_w, win_h, nullptr, nullptr, wc.hInstance, nullptr
     );
     apply_win32_dark_chrome(hwnd);
@@ -311,7 +311,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         ImGui::Render();
         const float clear_color[4] = {
-            astro::theme::BG_R, astro::theme::BG_G, astro::theme::BG_B, astro::theme::BG_A
+            ui_obs::palette::BgApp.x, ui_obs::palette::BgApp.y, ui_obs::palette::BgApp.z, 1.0f
         };
         if (g_mainRenderTargetView) {
             g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);

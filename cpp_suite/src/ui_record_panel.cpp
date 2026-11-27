@@ -47,6 +47,80 @@ static std::string build_timestamped_cs16_path(const std::string& output_dir,
     return (dir / stamp).string();
 }
 
+static void set_wrapped_tooltip(const char* text) {
+    if (!text || !text[0]) return;
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+static bool render_collapsible_section(const char* id, const char* label, bool& open, ImFont* semibold) {
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ui_obs::palette::Tint(ui_obs::palette::SurfaceHover, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ui_obs::palette::Tint(ui_obs::palette::SurfaceActive, 0.70f));
+    ImGui::PushStyleColor(ImGuiCol_Text, open ? ui_obs::palette::TextPrimary : ui_obs::palette::TextMuted);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui_obs::dp(4.0f), ui_obs::dp(3.0f)));
+    {
+        ui_obs::ScopedFont sf(semibold, 12.0f);
+        ImGui::SetNextItemOpen(open, ImGuiCond_Once);
+        open = ImGui::TreeNodeEx(
+            id,
+            ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed | ImGuiTreeNodeFlags_NoTreePushOnOpen,
+            "%s", label);
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(4);
+    return open;
+}
+
+static void draw_empty_state_overlay(ImDrawList* dl, ImVec2 plot_min, ImVec2 plot_max,
+                                     const char* title, const char* body,
+                                     ImFont* title_font, ImFont* body_font) {
+    const float plot_w = plot_max.x - plot_min.x;
+    const float plot_h = plot_max.y - plot_min.y;
+    if (plot_w < ui_obs::dp(180.0f) || plot_h < ui_obs::dp(76.0f)) return;
+
+    ImFont* tf = title_font ? title_font : ImGui::GetFont();
+    ImFont* bf = body_font ? body_font : ImGui::GetFont();
+    const float tfs = ui_obs::font_dp(15.0f);
+    const float bfs = ui_obs::font_dp(13.0f);
+
+    const float pad_x = ui_obs::dp(20.0f);
+    const float pad_y = ui_obs::dp(14.0f);
+    const float gap_y = (title && title[0] && body && body[0]) ? ui_obs::dp(6.0f) : 0.0f;
+    const float max_text_w = std::clamp(plot_w - ui_obs::dp(64.0f), ui_obs::dp(140.0f), ui_obs::dp(430.0f));
+
+    const ImVec2 tsz = (title && title[0]) ? tf->CalcTextSizeA(tfs, max_text_w, max_text_w, title) : ImVec2(0.0f, 0.0f);
+    const ImVec2 bsz = (body && body[0]) ? bf->CalcTextSizeA(bfs, max_text_w, max_text_w, body) : ImVec2(0.0f, 0.0f);
+
+    const float content_w = std::max(tsz.x, bsz.x);
+    const float card_w = std::min(plot_w - ui_obs::dp(24.0f), content_w + pad_x * 2.0f);
+    const float card_h = tsz.y + gap_y + bsz.y + pad_y * 2.0f;
+    if (card_h > plot_h - ui_obs::dp(12.0f)) return;
+
+    const float cx = std::floor(plot_min.x + (plot_w - card_w) * 0.5f);
+    const float cy = std::floor(plot_min.y + (plot_h - card_h) * 0.5f);
+    const ImVec2 cmin(cx, cy);
+    const ImVec2 cmax(cx + card_w, cy + card_h);
+
+    dl->AddRectFilled(cmin, cmax, ui_obs::palette::CardBg32, ui_obs::dp(8.0f), ImDrawFlags_RoundAll);
+    dl->AddRect(cmin, cmax, ui_obs::palette::BezelBorder32, ui_obs::dp(8.0f), 1.0f, ImDrawFlags_RoundAll);
+
+    float y = cmin.y + pad_y;
+    if (title && title[0]) {
+        const float tx = std::floor(cmin.x + (card_w - tsz.x) * 0.5f);
+        dl->AddText(tf, tfs, ImVec2(tx, y), ui_obs::palette::TextPrimary32, title, nullptr, max_text_w);
+        y += tsz.y + gap_y;
+    }
+    if (body && body[0]) {
+        const float bx = std::floor(cmin.x + (card_w - bsz.x) * 0.5f);
+        dl->AddText(bf, bfs, ImVec2(bx, y), ui_obs::palette::TextMuted32, body, nullptr, max_text_w);
+    }
+}
+
 } // namespace
 
 UiRecordPanel::UiRecordPanel(SdrController& controller, DspPipeline& dsp, Cs16Writer& writer,
@@ -103,7 +177,7 @@ void UiRecordPanel::refresh_devices() {
     }
 
     DeviceEntry sim;
-    sim.label = "Virtual 21cm H I Simulator (Internal)";
+    sim.label = "Virtual SDR (21 cm H I Simulator)";
     sim.is_virtual = true;
     sim.hw_index = 0;
     device_entries_.push_back(sim);
@@ -431,15 +505,15 @@ void UiRecordPanel::render_segmented_lo_tuner(float box_h) {
                 apply_tuned_frequency_hz(lo_hz + delta);
             }
 
-            char tip[80];
+            char tip[112];
             if (kStepWeightsHz[d] >= 1e6) {
-                std::snprintf(tip, sizeof(tip), "+/- %.0f MHz (Wheel / L-click +/- | Dbl-click edit)", kStepWeightsHz[d] * 1e-6);
+                std::snprintf(tip, sizeof(tip), "Scroll or click to adjust by %.0f MHz. Double-click to type a frequency.", kStepWeightsHz[d] * 1e-6);
             } else if (kStepWeightsHz[d] >= 1e3) {
-                std::snprintf(tip, sizeof(tip), "+/- %.0f kHz (Wheel / L-click +/- | Dbl-click edit)", kStepWeightsHz[d] * 1e-3);
+                std::snprintf(tip, sizeof(tip), "Scroll or click to adjust by %.0f kHz. Double-click to type a frequency.", kStepWeightsHz[d] * 1e-3);
             } else {
-                std::snprintf(tip, sizeof(tip), "+/- %.0f Hz (Wheel / L-click +/- | Dbl-click edit)", kStepWeightsHz[d]);
+                std::snprintf(tip, sizeof(tip), "Scroll or click to adjust by %.0f Hz. Double-click to type a frequency.", kStepWeightsHz[d]);
             }
-            ImGui::SetTooltip("%s", tip);
+            set_wrapped_tooltip(tip);
         }
 
         const char ch[2] = { static_cast<char>('0' + digits[d]), '\0' };
@@ -463,7 +537,7 @@ void UiRecordPanel::render_segmented_lo_tuner(float box_h) {
     const bool unit_hov = ImGui::IsItemHovered();
     if (unit_hov) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("Click to type LO frequency in MHz");
+        set_wrapped_tooltip("Click to type a center frequency in MHz.");
     }
     dl->AddText(ImGui::GetFont(), ufs,
                 ImVec2(std::floor(cx + ui_obs::dp(4.0f)), std::floor(bmin.y + (box_h - ufs) * 0.5f + ui_obs::dp(1.5f))),
@@ -487,7 +561,7 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
     const float control_h = std::max(ui_obs::dp(28.0f), height - ui_obs::dp(12.0f));
     const float row_top = ImGui::GetCursorScreenPos().y;
 
-    // 1. Start / Stop RX Stream Toggle (disabled while CS16 recording is active)
+    // 1. Start / Stop Receiver Toggle (disabled while CS16 recording is active)
     const bool rec_active = writer_.is_recording();
     const ImVec4 rx_col = streaming ? ui_obs::palette::Red : ui_obs::palette::Emerald;
     ImGui::BeginDisabled(streaming && rec_active);
@@ -495,15 +569,15 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui_obs::palette::Tint(rx_col, 0.30f));
     ImGui::PushStyleColor(ImGuiCol_Border, rx_col);
     {
-        ui_obs::ScopedFont btn_f(fonts_.semibold, 14.0f);
-        const char* rx_label = streaming ? "    Stop RX" : "    Start RX";
-        if (ImGui::Button(rx_label, ImVec2(ui_obs::dp(116.0f), control_h))) {
+        ui_obs::ScopedFont btn_f(fonts_.semibold, 13.5f);
+        const char* rx_label = streaming ? "    Stop Receiver" : "    Start Receiver";
+        if (ImGui::Button(rx_label, ImVec2(ui_obs::dp(142.0f), control_h))) {
             if (streaming) sdr_.stop_streaming();
             else sdr_.start_streaming();
         }
         const ImVec2 bmin = ImGui::GetItemRectMin();
         const ImVec2 bmax = ImGui::GetItemRectMax();
-        const ImVec2 ic(bmin.x + ui_obs::dp(16.0f), (bmin.y + bmax.y) * 0.5f);
+        const ImVec2 ic(bmin.x + ui_obs::dp(14.0f), (bmin.y + bmax.y) * 0.5f);
         if (streaming) {
             ui_obs::icons::draw_stop_square(dl, ic, ui_obs::dp(6.0f), ui_obs::palette::U32(ui_obs::palette::Red));
         } else {
@@ -512,8 +586,17 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
     }
     ImGui::PopStyleColor(3);
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (streaming && rec_active) {
+            set_wrapped_tooltip("Stop the active recording before stopping the receiver.");
+        } else {
+            set_wrapped_tooltip(streaming
+                ? "Stop the live receiver stream (Space)."
+                : "Start receiving live signal from the selected device (Space).");
+        }
+    }
 
-    // 2. Segmented Clickable/Scrollable 10-Digit LO Display
+    // 2. Segmented Clickable/Scrollable 10-Digit Center Frequency Display
     ImGui::SameLine(0.0f, ui_obs::dp(12.0f));
     render_segmented_lo_tuner(control_h);
 
@@ -524,13 +607,18 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
     {
         ui_obs::ScopedFont step_f(fonts_.mono, 12.5f);
         auto step_btn = [&](const char* lbl, int64_t delta) {
-            if (ImGui::Button(lbl, ImVec2(ui_obs::dp(48.0f), control_h))) {
+            if (ImGui::Button(lbl, ImVec2(ui_obs::dp(46.0f), control_h))) {
                 step_frequency(delta);
             }
-            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                char stip[64];
+                std::snprintf(stip, sizeof(stip), "Step center frequency by %s.", lbl);
+                set_wrapped_tooltip(stip);
+            }
             ImGui::SameLine();
         };
-        if (width > ui_obs::dp(1080.0f)) {
+        if (width > ui_obs::dp(1120.0f)) {
             step_btn("-1M", -1000000LL);
             step_btn("-100k", -100000LL);
             step_btn("-10k", -10000LL);
@@ -539,7 +627,7 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
             step_btn("+10k", 10000LL);
             step_btn("+100k", 100000LL);
             step_btn("+1M", 1000000LL);
-        } else if (width > ui_obs::dp(880.0f)) {
+        } else if (width > ui_obs::dp(920.0f)) {
             step_btn("-100k", -100000LL);
             step_btn("-10k", -10000LL);
             step_btn("+10k", 10000LL);
@@ -551,13 +639,13 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
     }
     ImGui::PopStyleVar(2);
 
-    // 4. Band Preset Selector + Interactive Bias-Tee Indicator Pill
-    const float bias_pill_w = ui_obs::dp(104.0f);
+    // 4. Band Preset Selector + Interactive Bias-T Indicator Pill
+    const float bias_pill_w = ui_obs::dp(110.0f);
     ImGui::SameLine(0.0f, ui_obs::dp(10.0f));
     const auto& presets = SdrConstants::GetPresets();
     const char* cur_preset_name = (selected_preset_idx_ >= 0 && selected_preset_idx_ < static_cast<int>(presets.size()))
         ? presets[static_cast<size_t>(selected_preset_idx_)].name
-        : "Custom LO";
+        : "Custom Frequency";
     const float avail_preset_w = ImGui::GetContentRegionAvail().x - bias_pill_w - ui_obs::dp(12.0f);
     ImGui::SetNextItemWidth(std::clamp(avail_preset_w, ui_obs::dp(80.0f), ui_obs::dp(220.0f)));
     if (ImGui::BeginCombo("##BandPresets", cur_preset_name)) {
@@ -570,8 +658,11 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
         }
         ImGui::EndCombo();
     }
+    if (ImGui::IsItemHovered()) {
+        set_wrapped_tooltip("Quick presets for 21 cm neutral hydrogen and common test bands.");
+    }
 
-    // Right-aligned live Bias-Tee pill
+    // Right-aligned live Bias-T pill
     const float right_x = wpos.x + width - bias_pill_w - ui_obs::dp(12.0f);
     if (right_x > ImGui::GetItemRectMax().x + ui_obs::dp(8.0f)) {
         ImGui::SetCursorScreenPos(ImVec2(right_x, row_top));
@@ -591,7 +682,7 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
             open_bias_modal_ = true;
         }
     }
-    const char* bias_txt = bias_tee_enabled_ ? "BIAS 4.5V" : "BIAS OFF";
+    const char* bias_txt = bias_tee_enabled_ ? "Bias-T 4.5V" : "Bias-T Off";
     const ImU32 bp_bg = bias_tee_enabled_
         ? ui_obs::palette::WithAlphaF(ui_obs::palette::U32(ui_obs::palette::Amber), bp_hov ? 0.24f : 0.16f)
         : (bp_hov ? IM_COL32(28, 36, 48, 255) : ui_obs::palette::PillBg32);
@@ -600,18 +691,18 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
     const ImU32 bp_dot = bias_tee_enabled_ ? ui_obs::palette::U32(ui_obs::palette::Amber) : IM_COL32(82, 92, 108, 255);
     dl->AddRectFilled(bp_min, bp_max, bp_bg, ui_obs::dp(4.0f), ImDrawFlags_RoundAll);
     dl->AddRect(bp_min, bp_max, bp_bd, ui_obs::dp(4.0f), 1.0f, ImDrawFlags_RoundAll);
-    ui_obs::icons::draw_bolt(dl, ImVec2(bp_min.x + ui_obs::dp(15.0f), (bp_min.y + bp_max.y) * 0.5f),
+    ui_obs::icons::draw_bolt(dl, ImVec2(bp_min.x + ui_obs::dp(14.0f), (bp_min.y + bp_max.y) * 0.5f),
                              ui_obs::dp(6.0f), bp_dot);
     {
         ui_obs::ScopedFont bf(fonts_.semibold, 12.0f);
         const ImVec2 bts = ImGui::CalcTextSize(bias_txt);
-        dl->AddText(ImVec2(bp_min.x + ui_obs::dp(25.0f), bp_min.y + (control_h - bts.y) * 0.5f - 0.5f),
+        dl->AddText(ImVec2(bp_min.x + ui_obs::dp(24.0f), bp_min.y + (control_h - bts.y) * 0.5f - 0.5f),
                     bp_tx, bias_txt);
     }
     if (bp_hov) {
-        ImGui::SetTooltip(bias_tee_enabled_
-            ? "4.5V Bias-Tee ACTIVE (Click to power OFF)"
-            : "Bias-Tee OFF (Click to enable with confirmation)");
+        set_wrapped_tooltip(bias_tee_enabled_
+            ? "Bias-T 4.5V is ON. Powers an inline 4.5V LNA through the coax cable. Click to turn off."
+            : "Powers an inline 4.5V LNA through the coax cable. Only enable if your antenna has a bias-tee LNA.");
     }
 
     ImGui::EndChild();
@@ -620,13 +711,13 @@ void UiRecordPanel::render_top_ribbon(float width, float height) {
 }
 
 void UiRecordPanel::render_sidebar(float width, float height) {
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui_obs::dp(6.0f), ui_obs::dp(5.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui_obs::dp(6.0f), ui_obs::dp(6.0f)));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_obs::dp(8.0f), ui_obs::dp(6.0f)));
     ImGui::BeginChild("##RecSidebar", ImVec2(width, height), false);
     render_device_card();
     render_radio_card();
-    render_dsp_card();
     render_recording_card();
+    render_dsp_card();
     ImGui::EndChild();
     ImGui::PopStyleVar(2);
 }
@@ -634,19 +725,19 @@ void UiRecordPanel::render_sidebar(float width, float height) {
 void UiRecordPanel::render_device_card() {
     const bool sim = sdr_.is_simulated();
     if (ui_obs::widgets::BeginCard(
-            "##CardSource", fonts_.semibold, "SOURCE HARDWARE",
+            "##CardSource", fonts_.semibold, "Receiver",
             ui_obs::palette::Cyan,
-            sim ? "Simulated" : "RTL-SDR",
+            sim ? "Virtual SDR" : "RTL-SDR",
             sim ? ui_obs::palette::Amber : ui_obs::palette::Emerald)) {
         const char* cur_label = (!device_entries_.empty() && selected_device_idx_ >= 0 &&
                                  selected_device_idx_ < static_cast<int>(device_entries_.size()))
             ? device_entries_[static_cast<size_t>(selected_device_idx_)].label.c_str()
-            : "No Source";
+            : "No Device";
 
-        const float scan_w = ui_obs::dp(52.0f);
+        const float refresh_w = ui_obs::dp(64.0f);
         const bool is_rec_busy = writer_.is_recording();
         ImGui::BeginDisabled(is_rec_busy);
-        ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - scan_w - ui_obs::dp(6.0f)));
+        ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - refresh_w - ui_obs::dp(6.0f)));
         if (ImGui::BeginCombo("##SdrDeviceCombo", cur_label)) {
             for (int i = 0; i < static_cast<int>(device_entries_.size()); ++i) {
                 ImGui::PushID(i);
@@ -667,18 +758,27 @@ void UiRecordPanel::render_device_card() {
             ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        if (is_rec_busy && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Stop active CS16 recording before switching SDR source.");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (is_rec_busy) {
+                set_wrapped_tooltip("Stop the active recording before switching receivers.");
+            } else {
+                set_wrapped_tooltip("Choose a connected RTL-SDR receiver, or select Virtual SDR to simulate a 21 cm neutral hydrogen (H I) signal without hardware.");
+            }
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(is_rec_busy);
-        if (ImGui::Button("Scan", ImVec2(scan_w, 0.0f))) {
+        if (ImGui::Button("Refresh", ImVec2(refresh_w, 0.0f))) {
             refresh_devices();
         }
         ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            set_wrapped_tooltip("Scan for connected RTL-SDR USB receivers.");
+        }
 
         const ImVec4 st_col = sim ? ui_obs::palette::TextMuted : ui_obs::palette::Emerald;
-        ImGui::TextColored(st_col, "%s", device_status_text_.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, st_col);
+        ImGui::TextWrapped("%s", device_status_text_.c_str());
+        ImGui::PopStyleColor();
 
         const auto now = std::chrono::steady_clock::now();
         if (last_blocker_check_.time_since_epoch().count() == 0 ||
@@ -688,7 +788,7 @@ void UiRecordPanel::render_device_card() {
         }
         if (!cached_blockers_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui_obs::palette::Red);
-            ImGui::TextWrapped("USB busy: %s", cached_blockers_[0].c_str());
+            ImGui::TextWrapped("Device in use by: %s", cached_blockers_[0].c_str());
             ImGui::PopStyleColor();
         }
     }
@@ -697,22 +797,43 @@ void UiRecordPanel::render_device_card() {
 
 void UiRecordPanel::render_radio_card() {
     if (ui_obs::widgets::BeginCard(
-            "##CardRadio", fonts_.semibold, "RADIO & GAIN",
+            "##CardRadio", fonts_.semibold, "Tuning & Gain",
             ui_obs::palette::Cyan,
-            agc_enabled_ ? "AGC" : "Manual",
+            agc_enabled_ ? "Auto Gain" : "Manual Gain",
             agc_enabled_ ? ui_obs::palette::Emerald : ui_obs::palette::TextMuted)) {
+        // Primary Gain & AGC controls
+        ImGui::BeginDisabled(agc_enabled_);
+        ImGui::SetNextItemWidth(-1.0f);
+        const float g_min = valid_gains_.empty() ? 0.0f : valid_gains_.front();
+        const float g_max = valid_gains_.empty() ? 49.6f : valid_gains_.back();
+        if (ui_obs::widgets::SliderFloatAccent("##LnaGain", &lna_gain_db_, g_min, g_max, "RF Gain: %.1f dB", ui_obs::palette::Cyan)) {
+            lna_gain_db_ = snap_gain_to_valid(lna_gain_db_);
+            sdr_.request_gain(lna_gain_db_, false);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            set_wrapped_tooltip(agc_enabled_
+                ? "Turn off Auto Gain (AGC) to adjust RF gain manually."
+                : "Manual RF front-end gain in dB. Higher gain boosts weak signals, but too much can overload strong nearby transmitters.");
+        }
+
+        if (ui_obs::widgets::ToggleSwitch("Auto Gain (AGC)", &agc_enabled_, ui_obs::palette::Emerald)) {
+            sdr_.request_gain(lna_gain_db_, agc_enabled_);
+        }
+        if (ImGui::IsItemHovered()) {
+            set_wrapped_tooltip("Automatic Gain Control adjusts receiver gain automatically. Turn off for manual gain when observing weak radio astronomy signals.");
+        }
+
+        // Primary Sample Rate selector (disabled while recording)
         const auto& rates = SdrConstants::GetSampleRates();
         const char* cur_rate = (selected_sample_rate_idx_ >= 0 && selected_sample_rate_idx_ < static_cast<int>(rates.size()))
             ? rates[static_cast<size_t>(selected_sample_rate_idx_)].label
             : "2.4 Msps";
-        const float half_w = std::max(70.0f, (ImGui::GetContentRegionAvail().x - ui_obs::dp(6.0f)) * 0.5f);
+        const bool rec_busy = writer_.is_recording();
 
         ImGui::TextColored(ui_obs::palette::TextMuted, "Sample Rate");
-        ImGui::SameLine(half_w + ui_obs::dp(8.0f));
-        ImGui::TextColored(ui_obs::palette::TextMuted, "Calibration (PPM)");
-
-        ImGui::BeginDisabled(writer_.is_recording());
-        ImGui::SetNextItemWidth(half_w);
+        ImGui::BeginDisabled(rec_busy);
+        ImGui::SetNextItemWidth(-1.0f);
         if (ImGui::BeginCombo("##SampleRate", cur_rate)) {
             for (int i = 0; i < static_cast<int>(rates.size()); ++i) {
                 const bool is_sel = (selected_sample_rate_idx_ == i);
@@ -726,33 +847,36 @@ void UiRecordPanel::render_radio_card() {
             ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        ImGui::SameLine(0.0f, ui_obs::dp(6.0f));
-        ImGui::SetNextItemWidth(half_w);
-        if (ui_obs::widgets::SliderIntAccent("##PpmOffset", &ppm_correction_, -100, 100, "%d ppm", ui_obs::palette::AccentBlue)) {
-            sdr_.request_ppm(ppm_correction_);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (rec_busy) {
+                set_wrapped_tooltip("Stop the active recording before changing the sample rate.");
+            } else {
+                set_wrapped_tooltip("Receiver bandwidth in million samples per second (Msps). Higher rates show a wider frequency span and create larger recordings.");
+            }
         }
 
-        ImGui::BeginDisabled(agc_enabled_);
-        ImGui::SetNextItemWidth(-1.0f);
-        const float g_min = valid_gains_.empty() ? 0.0f : valid_gains_.front();
-        const float g_max = valid_gains_.empty() ? 49.6f : valid_gains_.back();
-        if (ui_obs::widgets::SliderFloatAccent("##LnaGain", &lna_gain_db_, g_min, g_max, "LNA Gain: %.1f dB", ui_obs::palette::Cyan)) {
-            lna_gain_db_ = snap_gain_to_valid(lna_gain_db_);
-            sdr_.request_gain(lna_gain_db_, false);
-        }
-        ImGui::EndDisabled();
+        // Progressive disclosure: secondary hardware tuning options
+        if (render_collapsible_section("##HwOptions", "Hardware Options", show_hw_options_, fonts_.semibold)) {
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Frequency Calibration (PPM)");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ui_obs::widgets::SliderIntAccent("##PpmOffset", &ppm_correction_, -100, 100, "%d ppm", ui_obs::palette::AccentBlue)) {
+                sdr_.request_ppm(ppm_correction_);
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Fine-tunes the receiver oscillator in parts per million (ppm) to correct frequency drift.");
+            }
 
-        if (ui_obs::widgets::ToggleSwitch("AGC", &agc_enabled_, ui_obs::palette::Emerald)) {
-            sdr_.request_gain(lna_gain_db_, agc_enabled_);
-        }
-        ImGui::SameLine(0.0f, ui_obs::dp(12.0f));
-        bool bias_ui = bias_tee_enabled_;
-        if (ui_obs::widgets::ToggleSwitch("Bias-Tee 4.5V", &bias_ui, ui_obs::palette::Amber)) {
-            if (bias_ui && !bias_tee_enabled_) {
-                open_bias_modal_ = true;
-            } else if (!bias_ui) {
-                bias_tee_enabled_ = false;
-                sdr_.request_bias_tee(false);
+            bool bias_ui = bias_tee_enabled_;
+            if (ui_obs::widgets::ToggleSwitch("Bias-T Power (4.5V)", &bias_ui, ui_obs::palette::Amber)) {
+                if (bias_ui && !bias_tee_enabled_) {
+                    open_bias_modal_ = true;
+                } else if (!bias_ui) {
+                    bias_tee_enabled_ = false;
+                    sdr_.request_bias_tee(false);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Powers an inline 4.5V LNA through the coax cable. Only enable if your antenna has a bias-tee LNA.");
             }
         }
     }
@@ -765,85 +889,118 @@ void UiRecordPanel::render_dsp_card() {
     std::snprintf(fft_info, sizeof(fft_info), "%d bins", ffts[static_cast<size_t>(selected_fft_size_idx_)]);
 
     if (ui_obs::widgets::BeginCard(
-            "##CardDsp", fonts_.semibold, "SPECTRUM & DISPLAY",
+            "##CardDsp", fonts_.semibold, "Display",
             ui_obs::palette::Cyan, fft_info, ui_obs::palette::TextMuted)) {
-        const float half_w = std::max(70.0f, (ImGui::GetContentRegionAvail().x - ui_obs::dp(6.0f)) * 0.5f);
-
-        ImGui::TextColored(ui_obs::palette::TextMuted, "FFT Size");
-        ImGui::SameLine(half_w + ui_obs::dp(8.0f));
-        ImGui::TextColored(ui_obs::palette::TextMuted, "Waterfall Palette");
-
-        char fft_lbl[24];
-        std::snprintf(fft_lbl, sizeof(fft_lbl), "%d", ffts[static_cast<size_t>(selected_fft_size_idx_)]);
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::BeginCombo("##FftBins", fft_lbl)) {
-            for (int i = 0; i < static_cast<int>(ffts.size()); ++i) {
-                char opt[24];
-                std::snprintf(opt, sizeof(opt), "%d bins", ffts[static_cast<size_t>(i)]);
-                const bool is_sel = (selected_fft_size_idx_ == i);
-                if (ImGui::Selectable(opt, is_sel)) {
-                    selected_fft_size_idx_ = i;
-                    dsp_.set_fft_size(ffts[static_cast<size_t>(i)]);
-                }
-                if (is_sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        // Quick everyday display controls
+        ui_obs::widgets::ToggleSwitch("Show Waterfall", &show_waterfall_, ui_obs::palette::AccentBlue);
+        if (ImGui::IsItemHovered()) {
+            set_wrapped_tooltip("Show or hide the scrolling waterfall history below the spectrum (W).");
         }
-        ImGui::SameLine(0.0f, ui_obs::dp(6.0f));
-
-        const auto& palettes = Waterfall::get_palette_names();
-        const char* cur_pal = (selected_palette_idx_ >= 0 && selected_palette_idx_ < static_cast<int>(palettes.size()))
-            ? palettes[static_cast<size_t>(selected_palette_idx_)].c_str()
-            : "Viridis";
-        ImGui::SetNextItemWidth(half_w);
-        if (ImGui::BeginCombo("##WfPalette", cur_pal)) {
-            for (int i = 0; i < static_cast<int>(palettes.size()); ++i) {
-                const bool is_sel = (selected_palette_idx_ == i);
-                if (ImGui::Selectable(palettes[static_cast<size_t>(i)].c_str(), is_sel)) {
-                    selected_palette_idx_ = i;
-                    waterfall_.set_palette(static_cast<WaterfallPalette>(i));
-                }
-                if (is_sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        const float fit_w = ui_obs::dp(72.0f);
+        ImGui::SameLine();
+        const float rem_w = ImGui::GetContentRegionAvail().x;
+        if (rem_w > fit_w + ui_obs::dp(4.0f)) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + rem_w - fit_w);
         }
-
-        // Full-width PSD Exponential Averaging (0.00 = Instantaneous FFT -> 0.95 = Deep Integration)
-        ImGui::SetNextItemWidth(-1.0f);
-        if (ui_obs::widgets::SliderFloatAccent("##AvgFactor", &avg_factor_, 0.0f, 0.95f, "PSD Smoothing: %.2f", ui_obs::palette::Cyan)) {
-            dsp_.set_averaging(avg_factor_);
-        }
-
-        // Dynamic range header + Auto Fit button
-        ImGui::TextColored(ui_obs::palette::TextMuted, "Range (dBFS)");
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_obs::dp(58.0f));
-        if (ImGui::SmallButton("Auto Fit")) {
+        if (ImGui::Button("Auto Fit", ImVec2(fit_w, 0.0f))) {
             auto_fit_db_range();
         }
-
-        // Side-by-side Min / Max sliders (eliminates clipped right-hand labels)
-        ImGui::SetNextItemWidth(half_w);
-        if (ui_obs::widgets::SliderFloatAccent("##MinDb", &fft_min_db_, -140.0f, -15.0f, "Min %.0f dB", ui_obs::palette::AccentBlue)) {
-            if (fft_min_db_ > fft_max_db_ - 5.0f) fft_min_db_ = fft_max_db_ - 5.0f;
-            waterfall_.recolor(fft_min_db_, fft_max_db_);
-        }
-        ImGui::SameLine(0.0f, ui_obs::dp(6.0f));
-        ImGui::SetNextItemWidth(half_w);
-        if (ui_obs::widgets::SliderFloatAccent("##MaxDb", &fft_max_db_, -130.0f, 10.0f, "Max %.0f dB", ui_obs::palette::AccentBlue)) {
-            if (fft_max_db_ < fft_min_db_ + 5.0f) fft_max_db_ = fft_min_db_ + 5.0f;
-            waterfall_.recolor(fft_min_db_, fft_max_db_);
+        if (ImGui::IsItemHovered()) {
+            set_wrapped_tooltip("Automatically adjust the vertical dBFS scale to match the current noise floor and peak signal.");
         }
 
-        if (ImGui::BeginTable("##DspToggles", 2, ImGuiTableFlags_SizingStretchSame)) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ui_obs::widgets::ToggleSwitch("Fill", &fill_spectrum_, ui_obs::palette::Cyan);
-            ImGui::TableSetColumnIndex(1);
-            ui_obs::widgets::ToggleSwitch("Waterfall", &show_waterfall_, ui_obs::palette::AccentBlue);
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ui_obs::widgets::ToggleSwitch("Pk Hold", &show_peak_hold_, ui_obs::palette::Amber);
-            ImGui::EndTable();
+        // Progressive disclosure: expert spectrum & waterfall controls
+        if (render_collapsible_section("##DisplayOptions", "Display & Waterfall Options", show_display_options_, fonts_.semibold)) {
+            const float half_w = std::max(70.0f, (ImGui::GetContentRegionAvail().x - ui_obs::dp(6.0f)) * 0.5f);
+
+            ImGui::TextColored(ui_obs::palette::TextMuted, "FFT Resolution");
+            ImGui::SameLine(half_w + ui_obs::dp(8.0f));
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Color Palette");
+
+            char fft_lbl[24];
+            std::snprintf(fft_lbl, sizeof(fft_lbl), "%d", ffts[static_cast<size_t>(selected_fft_size_idx_)]);
+            ImGui::SetNextItemWidth(half_w);
+            if (ImGui::BeginCombo("##FftBins", fft_lbl)) {
+                for (int i = 0; i < static_cast<int>(ffts.size()); ++i) {
+                    char opt[24];
+                    std::snprintf(opt, sizeof(opt), "%d bins", ffts[static_cast<size_t>(i)]);
+                    const bool is_sel = (selected_fft_size_idx_ == i);
+                    if (ImGui::Selectable(opt, is_sel)) {
+                        selected_fft_size_idx_ = i;
+                        dsp_.set_fft_size(ffts[static_cast<size_t>(i)]);
+                    }
+                    if (is_sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Number of frequency bins per spectrum frame. Higher values show finer detail with a slightly slower update rate.");
+            }
+            ImGui::SameLine(0.0f, ui_obs::dp(6.0f));
+
+            const auto& palettes = Waterfall::get_palette_names();
+            const char* cur_pal = (selected_palette_idx_ >= 0 && selected_palette_idx_ < static_cast<int>(palettes.size()))
+                ? palettes[static_cast<size_t>(selected_palette_idx_)].c_str()
+                : "Viridis";
+            ImGui::SetNextItemWidth(half_w);
+            if (ImGui::BeginCombo("##WfPalette", cur_pal)) {
+                for (int i = 0; i < static_cast<int>(palettes.size()); ++i) {
+                    const bool is_sel = (selected_palette_idx_ == i);
+                    if (ImGui::Selectable(palettes[static_cast<size_t>(i)].c_str(), is_sel)) {
+                        selected_palette_idx_ = i;
+                        waterfall_.set_palette(static_cast<WaterfallPalette>(i));
+                    }
+                    if (is_sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Color map used to draw signal strength in the waterfall history.");
+            }
+
+            // Full-width spectrum smoothing
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ui_obs::widgets::SliderFloatAccent("##AvgFactor", &avg_factor_, 0.0f, 0.95f, "Smoothing: %.2f", ui_obs::palette::Cyan)) {
+                dsp_.set_averaging(avg_factor_);
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Averages successive spectrum frames together. Higher values smooth out noise but respond more slowly to signal changes.");
+            }
+
+            // Dynamic range Min / Max sliders
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Level Range (dBFS)");
+            ImGui::SetNextItemWidth(half_w);
+            if (ui_obs::widgets::SliderFloatAccent("##MinDb", &fft_min_db_, -140.0f, -15.0f, "Min %.0f dB", ui_obs::palette::AccentBlue)) {
+                if (fft_min_db_ > fft_max_db_ - 5.0f) fft_min_db_ = fft_max_db_ - 5.0f;
+                waterfall_.recolor(fft_min_db_, fft_max_db_);
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Lowest power level shown at the bottom of the spectrum and mapped to the darkest waterfall color.");
+            }
+            ImGui::SameLine(0.0f, ui_obs::dp(6.0f));
+            ImGui::SetNextItemWidth(half_w);
+            if (ui_obs::widgets::SliderFloatAccent("##MaxDb", &fft_max_db_, -130.0f, 10.0f, "Max %.0f dB", ui_obs::palette::AccentBlue)) {
+                if (fft_max_db_ < fft_min_db_ + 5.0f) fft_max_db_ = fft_min_db_ + 5.0f;
+                waterfall_.recolor(fft_min_db_, fft_max_db_);
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Highest power level shown at the top of the spectrum and mapped to the brightest waterfall color.");
+            }
+
+            if (ImGui::BeginTable("##DspToggles", 2, ImGuiTableFlags_SizingStretchSame)) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ui_obs::widgets::ToggleSwitch("Fill Trace", &fill_spectrum_, ui_obs::palette::Cyan);
+                if (ImGui::IsItemHovered()) {
+                    set_wrapped_tooltip("Shade the area underneath the live spectrum trace.");
+                }
+                ImGui::TableSetColumnIndex(1);
+                ui_obs::widgets::ToggleSwitch("Peak Hold", &show_peak_hold_, ui_obs::palette::Amber);
+                if (ImGui::IsItemHovered()) {
+                    set_wrapped_tooltip("Keep an amber envelope showing the strongest signal seen at each frequency (P).");
+                }
+                ImGui::EndTable();
+            }
         }
     }
     ui_obs::widgets::EndCard();
@@ -860,31 +1017,34 @@ void UiRecordPanel::render_recording_card() {
     const bool is_rec = writer_.is_recording();
 
     if (ui_obs::widgets::BeginCard(
-            "##CardRecord", fonts_.semibold, "IQ CAPTURE",
+            "##CardRecord", fonts_.semibold, "Recording",
             is_rec ? ui_obs::palette::Red : ui_obs::palette::Emerald,
-            is_rec ? "Recording" : "CS16",
+            is_rec ? "Recording" : "CS16 I/Q",
             is_rec ? ui_obs::palette::Red : ui_obs::palette::TextMuted)) {
         const float w_avail = ImGui::GetContentRegionAvail().x;
         const float dur_w = std::clamp(w_avail * 0.36f, ui_obs::dp(76.0f), ui_obs::dp(102.0f));
         const float pref_w = std::max(80.0f, w_avail - dur_w - ui_obs::dp(6.0f));
 
         ImGui::BeginDisabled(is_rec);
-        ImGui::TextColored(ui_obs::palette::TextMuted, "Prefix");
+        ImGui::TextColored(ui_obs::palette::TextMuted, "File Prefix");
         ImGui::SameLine(pref_w + ui_obs::dp(6.0f));
-        ImGui::TextColored(ui_obs::palette::TextMuted, "Duration (0=Man)");
+        ImGui::TextColored(ui_obs::palette::TextMuted, "Duration (s)");
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Auto-stop timer in seconds (0 s = manual stop)");
+            set_wrapped_tooltip("Optional auto-stop timer in seconds. Leave at 0 to stop recording manually.");
         }
 
         ImGui::SetNextItemWidth(pref_w);
         ImGui::InputText("##RecPrefix", record_prefix_buf_, sizeof(record_prefix_buf_));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            set_wrapped_tooltip("Name prefix added to the timestamped .cs16 recording file.");
+        }
         ImGui::SameLine(0.0f, ui_obs::dp(6.0f));
         ImGui::SetNextItemWidth(dur_w);
         if (ImGui::InputFloat("##RecDur", &record_duration_s_, 0.0f, 0.0f, "%.0f s")) {
             if (record_duration_s_ < 0.0f) record_duration_s_ = 0.0f;
         }
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Auto-stop timer in seconds (0 s = manual stop)");
+            set_wrapped_tooltip("Optional auto-stop timer in seconds. Leave at 0 to stop recording manually.");
         }
         ImGui::EndDisabled();
 
@@ -894,7 +1054,7 @@ void UiRecordPanel::render_recording_card() {
         ImGui::PushStyleColor(ImGuiCol_Border, cap_col);
         {
             ui_obs::ScopedFont bf(fonts_.semibold, 13.5f);
-            const char* rec_btn_lbl = is_rec ? "Stop Recording CS16" : "Start Recording CS16";
+            const char* rec_btn_lbl = is_rec ? "Stop Recording" : "Start Recording";
             if (ImGui::Button(rec_btn_lbl, ImVec2(-1.0f, ui_obs::dp(30.0f)))) {
                 if (!is_rec) {
                     if (!sdr_.is_streaming()) sdr_.start_streaming();
@@ -923,6 +1083,11 @@ void UiRecordPanel::render_recording_card() {
             }
         }
         ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) {
+            set_wrapped_tooltip(is_rec
+                ? "Stop the active recording and finalize the .cs16 file."
+                : "Records raw 16-bit signed I/Q samples (.cs16) with metadata for offline analysis. Starts the receiver automatically if stopped.");
+        }
 
         if (is_rec && record_duration_s_ > 0.0f) {
             const float target_s = std::max(0.1f, record_duration_s_);
@@ -941,16 +1106,16 @@ void UiRecordPanel::render_recording_card() {
         if (ImGui::BeginTable("##RecStatsTbl", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame)) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(is_rec ? ui_obs::palette::Red : ui_obs::palette::TextMuted, "State: %s", last_stats_.status.c_str());
+            ImGui::TextColored(is_rec ? ui_obs::palette::Red : ui_obs::palette::TextMuted, "Status: %s", last_stats_.status.c_str());
             ImGui::TableSetColumnIndex(1);
             ImGui::TextColored(ui_obs::palette::TextMuted, "Size: %s", last_stats_.size_str.c_str());
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(ui_obs::palette::TextMuted, "Time: %s", last_stats_.elapsed_str.c_str());
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Elapsed: %s", last_stats_.elapsed_str.c_str());
             ImGui::TableSetColumnIndex(1);
             ImGui::TextColored(last_stats_.dropped_blocks > 0 ? ui_obs::palette::Red : ui_obs::palette::TextMuted,
-                               "Drops: %llu", static_cast<unsigned long long>(last_stats_.dropped_blocks));
+                               "Dropped: %llu", static_cast<unsigned long long>(last_stats_.dropped_blocks));
             ImGui::EndTable();
         }
 
@@ -958,20 +1123,28 @@ void UiRecordPanel::render_recording_card() {
         if (last_file.empty()) last_file = writer_.get_last_recorded_filepath();
         const bool can_bridge = (!is_rec && !last_file.empty());
 
-        const float folder_w = ui_obs::dp(78.0f);
+        const float folder_w = ui_obs::dp(88.0f);
         ImGui::BeginDisabled(!can_bridge);
         ImGui::PushStyleColor(ImGuiCol_Button, ui_obs::palette::Tint(ui_obs::palette::AccentBlue, 0.22f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui_obs::palette::Tint(ui_obs::palette::AccentBlue, 0.40f));
         ImGui::PushStyleColor(ImGuiCol_Border, ui_obs::palette::AccentBlue);
-        if (ImGui::Button("Analyze Capture ->", ImVec2(std::max(80.0f, ImGui::GetContentRegionAvail().x - folder_w - ui_obs::dp(6.0f)), ui_obs::dp(28.0f)))) {
+        if (ImGui::Button("Open in Analyzer", ImVec2(std::max(80.0f, ImGui::GetContentRegionAvail().x - folder_w - ui_obs::dp(6.0f)), ui_obs::dp(28.0f)))) {
             app_state_.switch_to_analyze(last_file, true);
         }
         ImGui::PopStyleColor(3);
         ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            set_wrapped_tooltip(can_bridge
+                ? "Load the latest .cs16 recording into the Analyzer tab."
+                : "Record a signal first to open it in the Analyzer.");
+        }
 
         ImGui::SameLine();
-        if (ImGui::Button("Folder...", ImVec2(folder_w, ui_obs::dp(28.0f)))) {
+        if (ImGui::Button("Open Folder", ImVec2(folder_w, ui_obs::dp(28.0f)))) {
             ui_obs::win_fs::open_folder_in_explorer(writer_.get_output_dir());
+        }
+        if (ImGui::IsItemHovered()) {
+            set_wrapped_tooltip("Open the recordings output folder in Explorer.");
         }
     }
     ui_obs::widgets::EndCard();
@@ -979,19 +1152,19 @@ void UiRecordPanel::render_recording_card() {
 
 void UiRecordPanel::render_bias_tee_modal() {
     if (open_bias_modal_) {
-        ImGui::OpenPopup("Confirm +4.5V Bias-Tee");
+        ImGui::OpenPopup("Enable 4.5V Bias-T Power?");
         open_bias_modal_ = false;
     }
     const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("Confirm +4.5V Bias-Tee", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextColored(ui_obs::palette::Amber, "WARNING: DC Power Injection (+4.5V)");
+    if (ImGui::BeginPopupModal("Enable 4.5V Bias-T Power?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(ui_obs::palette::Amber, "Caution: +4.5V DC Power on Antenna Port");
         ImGui::Spacing();
-        ImGui::TextWrapped("Enabling the RTL-SDR Bias-Tee sends +4.5V DC directly onto the RF SMA center pin.");
-        ImGui::TextWrapped("Only enable if your antenna feed has an active LNA or DC block. Shorting DC to ground can damage the tuner.");
+        ImGui::TextWrapped("Enabling Bias-T powers an inline 4.5V LNA through the coax cable via the receiver's antenna connector.");
+        ImGui::TextWrapped("Only enable this if your antenna feed has a bias-tee LNA or DC block. Connecting a DC-shorted antenna can damage the receiver.");
         ImGui::Separator();
 
-        if (ImGui::Button("Enable +4.5V Bias-Tee", ImVec2(ui_obs::dp(175.0f), ui_obs::dp(30.0f)))) {
+        if (ImGui::Button("Enable 4.5V Bias-T", ImVec2(ui_obs::dp(165.0f), ui_obs::dp(30.0f)))) {
             bias_tee_enabled_ = true;
             sdr_.request_bias_tee(true);
             ImGui::CloseCurrentPopup();
@@ -1045,21 +1218,27 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
     const ImVec2 wpos = ImGui::GetWindowPos();
 
     // Inline Header Strip + Right Quick Peak-Hold Controls
+    const bool streaming = sdr_.is_streaming();
+    const bool has_trace = !spectrum_data_.empty();
     {
         ui_obs::ScopedFont hf(fonts_.semibold, 13.0f);
-        ImGui::TextColored(ui_obs::palette::TextPrimary, "POWER SPECTRUM (PSD)");
+        ImGui::TextColored(ui_obs::palette::TextPrimary, "Live Spectrum");
     }
     ImGui::SameLine(0.0f, ui_obs::dp(12.0f));
     {
         ui_obs::ScopedFont mf(fonts_.mono, 12.0f);
-        ImGui::TextColored(ui_obs::palette::Cyan, "Peak: %.4f MHz (%.1f dBFS)", peak_freq_hz_ / 1e6, peak_dbfs_);
-        ImGui::SameLine(0.0f, ui_obs::dp(10.0f));
-        ImGui::TextColored(ui_obs::palette::TextMuted, "Floor: %.1f dBFS | SNR: %.1f dB",
-                           dsp_.get_noise_floor_db(), dsp_.get_snr_db());
+        if (has_trace) {
+            ImGui::TextColored(ui_obs::palette::Cyan, "Peak: %.4f MHz (%.1f dBFS)", peak_freq_hz_ / 1e6, peak_dbfs_);
+            ImGui::SameLine(0.0f, ui_obs::dp(10.0f));
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Noise Floor: %.1f dBFS  |  SNR: %.1f dB%s",
+                               dsp_.get_noise_floor_db(), dsp_.get_snr_db(), streaming ? "" : "  |  Stopped");
+        } else {
+            ImGui::TextColored(ui_obs::palette::TextMuted, streaming ? "Waiting for samples..." : "Stopped");
+        }
     }
 
-    const float pk_w = ui_obs::dp(68.0f);
-    const float clr_w = show_peak_hold_ ? ui_obs::dp(40.0f) : 0.0f;
+    const float pk_w = ui_obs::dp(76.0f);
+    const float clr_w = show_peak_hold_ ? ui_obs::dp(48.0f) : 0.0f;
     const float total_ctrl_w = pk_w + (clr_w > 0.0f ? clr_w + ui_obs::dp(4.0f) : 0.0f);
     const float right_ctrl_x = wpos.x + width - total_ctrl_w - ui_obs::dp(10.0f);
     if (right_ctrl_x > ImGui::GetItemRectMax().x + ui_obs::dp(8.0f)) {
@@ -1075,14 +1254,20 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
             ? ui_obs::palette::Tint(ui_obs::palette::Amber, 0.65f)
             : ui_obs::palette::BorderSubtle);
         ImGui::PushStyleColor(ImGuiCol_Text, show_peak_hold_ ? ui_obs::palette::Amber : ui_obs::palette::TextMuted);
-        if (ImGui::Button("PK HOLD", ImVec2(pk_w, 0.0f))) {
+        if (ImGui::Button("Peak Hold", ImVec2(pk_w, 0.0f))) {
             show_peak_hold_ = !show_peak_hold_;
+        }
+        if (ImGui::IsItemHovered()) {
+            set_wrapped_tooltip("Show or hide the amber peak-hold envelope (P).");
         }
         ImGui::PopStyleColor(3);
         if (show_peak_hold_) {
             ImGui::SameLine(0.0f, ui_obs::dp(4.0f));
-            if (ImGui::Button("CLR", ImVec2(clr_w, 0.0f))) {
+            if (ImGui::Button("Clear", ImVec2(clr_w, 0.0f))) {
                 peak_hold_data_.clear();
+            }
+            if (ImGui::IsItemHovered()) {
+                set_wrapped_tooltip("Reset the peak-hold trace.");
             }
         }
         ImGui::PopStyleVar(2);
@@ -1159,7 +1344,7 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
                                                ui_obs::palette::WithAlphaF(hi_col, 0.65f), 1.15f, 5.0f, 4.0f);
             ImFont* mf = fonts_.mono ? fonts_.mono : ImGui::GetFont();
             const float mfs = ui_obs::font_dp(11.0f);
-            const char* hi_lbl = "HI 1420.406";
+            const char* hi_lbl = "H I 1420.406 MHz";
             const ImVec2 hsz = mf->CalcTextSizeA(mfs, FLT_MAX, 0.0f, hi_lbl);
             const float hi_lo_x = vp.plot_min.x + ui_obs::dp(4.0f);
             const float tx = std::floor(std::clamp(hx + ui_obs::dp(4.0f), hi_lo_x, std::max(hi_lo_x, vp.plot_max.x - hsz.x - ui_obs::dp(6.0f))));
@@ -1182,8 +1367,8 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
             dl->AddQuadFilled(ImVec2(px, py - r), ImVec2(px + r, py),
                               ImVec2(px, py + r), ImVec2(px - r, py), pk_col);
 
-            char pk_buf[40];
-            std::snprintf(pk_buf, sizeof(pk_buf), "PK %.1f dB | %.3f", peak_dbfs_, pk_mhz);
+            char pk_buf[48];
+            std::snprintf(pk_buf, sizeof(pk_buf), "Peak %.1f dB | %.3f MHz", peak_dbfs_, pk_mhz);
             ImFont* mf = fonts_.mono ? fonts_.mono : ImGui::GetFont();
             const float mfs = ui_obs::font_dp(11.0f);
             const ImVec2 psz = mf->CalcTextSizeA(mfs, FLT_MAX, 0.0f, pk_buf);
@@ -1207,6 +1392,16 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
                               ImVec2(tx + psz.x + ui_obs::dp(3.0f), ty + psz.y + ui_obs::dp(1.0f)),
                               IM_COL32(10, 14, 20, 215), ui_obs::dp(2.0f));
             dl->AddText(mf, mfs, ImVec2(tx, ty), pk_col, pk_buf);
+        }
+
+        // Welcoming empty state when receiver is stopped and no signal has been captured yet
+        if (!streaming && !has_trace) {
+            draw_empty_state_overlay(
+                dl, vp.plot_min, vp.plot_max,
+                "Receiver is stopped",
+                "Pick a device on the left and click Start Receiver to view live signal, or use Virtual SDR to test without hardware.",
+                fonts_.semibold, fonts_.regular
+            );
         }
 
         // Right-gutter live dBFS Signal Level Meter (directly aligned above Waterfall colorbar)
@@ -1258,22 +1453,22 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
             [&]() {
                 if (context_tune_freq_mhz_ > 0.0) {
                     char tune_lbl[64];
-                    std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune LO to %.4f MHz", context_tune_freq_mhz_);
+                    std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune to %.4f MHz", context_tune_freq_mhz_);
                     if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
                         apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
                     }
                 }
                 if (peak_freq_hz_ > 0.0) {
                     char pk_lbl[64];
-                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", peak_freq_hz_ * 1e-6);
+                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune to Peak (%.4f MHz)", peak_freq_hz_ * 1e-6);
                     if (ImGui::MenuItem(pk_lbl)) {
                         apply_tuned_frequency_hz(peak_freq_hz_);
                     }
                 }
-                if (ImGui::MenuItem("Tune LO for 21cm H I (1420.5000 MHz, +94 kHz LO)")) {
+                if (ImGui::MenuItem("Tune to 21 cm H I Band (1420.500 MHz)")) {
                     apply_tuned_frequency_hz(1420.5e6);
                 }
-                if (ImGui::MenuItem(show_peak_hold_ ? "Disable Peak Hold" : "Enable Peak Hold", "P")) {
+                if (ImGui::MenuItem(show_peak_hold_ ? "Hide Peak Hold" : "Show Peak Hold", "P")) {
                     show_peak_hold_ = !show_peak_hold_;
                 }
             },
@@ -1354,11 +1549,11 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
                 std::snprintf(b_hold, sizeof(b_hold), "%.2f dBFS", hold_db);
 
                 ui_obs::widgets::TelemetryRow rows[5] = {
-                    {"FREQ",  b_freq, ui_obs::palette::TextPrimary32},
-                    {"dFC",   b_off,  ui_obs::palette::TextMuted32},
-                    {"PSD",   b_pwr,  ui_obs::palette::U32(ui_obs::palette::Cyan)},
-                    {"HOLD",  b_hold, ui_obs::palette::U32(ui_obs::palette::Amber)},
-                    {"V_HI",  b_vrad, IM_COL32(142, 236, 158, 255)},
+                    {"Frequency",    b_freq, ui_obs::palette::TextPrimary32},
+                    {"Offset",       b_off,  ui_obs::palette::TextMuted32},
+                    {"Level",        b_pwr,  ui_obs::palette::U32(ui_obs::palette::Cyan)},
+                    {"Peak Hold",    b_hold, ui_obs::palette::U32(ui_obs::palette::Amber)},
+                    {"H I Velocity", b_vrad, IM_COL32(142, 236, 158, 255)},
                 };
                 int row_cnt = 4;
                 if (show_peak_hold_ && !peak_hold_data_.empty()) {
@@ -1368,7 +1563,7 @@ void UiRecordPanel::render_spectrum_card(float width, float height) {
                 }
                 ui_obs::widgets::draw_crosshair_card(
                     dl, mp, vp.plot_min, vp.plot_max,
-                    "SPECTRUM CURSOR", ui_obs::palette::U32(ui_obs::palette::Cyan),
+                    "Spectrum", ui_obs::palette::U32(ui_obs::palette::Cyan),
                     rows, row_cnt, fonts_.semibold, fonts_.mono
                 );
             }
@@ -1392,20 +1587,25 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
+    const bool streaming = sdr_.is_streaming();
+    const bool has_trace = !spectrum_data_.empty();
     {
         ui_obs::ScopedFont hf(fonts_.semibold, 13.0f);
-        ImGui::TextColored(ui_obs::palette::TextPrimary, "LIVE WATERFALL HISTORY");
+        ImGui::TextColored(ui_obs::palette::TextPrimary, "Waterfall");
     }
     ImGui::SameLine(0.0f, ui_obs::dp(12.0f));
     {
         ui_obs::ScopedFont mf(fonts_.mono, 12.0f);
-        const auto& p_names = Waterfall::get_palette_names();
-        const char* p_lbl = (selected_palette_idx_ >= 0 && selected_palette_idx_ < static_cast<int>(p_names.size()))
-            ? p_names[static_cast<size_t>(selected_palette_idx_)].c_str()
-            : "Viridis";
-        const float hist_s = static_cast<float>(waterfall_.get_height()) * wf_row_dt_s_;
-        ImGui::TextColored(ui_obs::palette::TextMuted, "%s | %dx%d px | %.1fs span",
-                           p_lbl, waterfall_.get_width(), waterfall_.get_height(), hist_s);
+        if (streaming || has_trace) {
+            const auto& p_names = Waterfall::get_palette_names();
+            const char* p_lbl = (selected_palette_idx_ >= 0 && selected_palette_idx_ < static_cast<int>(p_names.size()))
+                ? p_names[static_cast<size_t>(selected_palette_idx_)].c_str()
+                : "Viridis";
+            const float hist_s = static_cast<float>(waterfall_.get_height()) * wf_row_dt_s_;
+            ImGui::TextColored(ui_obs::palette::TextMuted, "%s  |  %.0f s history", p_lbl, hist_s);
+        } else {
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Waiting for signal");
+        }
     }
 
     const ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -1499,6 +1699,15 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
 
         dl->AddRect(wf_min, wf_max, ui_obs::palette::PlotBorder32, 0.0f, 1.0f, ImDrawFlags_None);
 
+        if (!streaming && !has_trace) {
+            draw_empty_state_overlay(
+                dl, wf_min, wf_max,
+                nullptr,
+                "Waterfall history will appear here once the receiver is running.",
+                fonts_.semibold, fonts_.regular
+            );
+        }
+
         // Shared 1:1 right-gutter colorbar aligned with spectrum level meter above
         ui_obs::draw_vertical_colorbar(
             dl,
@@ -1546,19 +1755,19 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
             [&]() {
                 if (context_tune_freq_mhz_ > 0.0) {
                     char tune_lbl[64];
-                    std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune LO to %.4f MHz", context_tune_freq_mhz_);
+                    std::snprintf(tune_lbl, sizeof(tune_lbl), "Tune to %.4f MHz", context_tune_freq_mhz_);
                     if (ImGui::MenuItem(tune_lbl, "Ctrl+Click")) {
                         apply_tuned_frequency_hz(context_tune_freq_mhz_ * 1.0e6);
                     }
                 }
                 if (peak_freq_hz_ > 0.0) {
                     char pk_lbl[64];
-                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune LO to Live Peak (%.4f MHz)", peak_freq_hz_ * 1e-6);
+                    std::snprintf(pk_lbl, sizeof(pk_lbl), "Tune to Peak (%.4f MHz)", peak_freq_hz_ * 1e-6);
                     if (ImGui::MenuItem(pk_lbl)) {
                         apply_tuned_frequency_hz(peak_freq_hz_);
                     }
                 }
-                if (ImGui::MenuItem("Tune LO for 21cm H I (1420.5000 MHz, +94 kHz LO)")) {
+                if (ImGui::MenuItem("Tune to 21 cm H I Band (1420.500 MHz)")) {
                     apply_tuned_frequency_hz(1420.5e6);
                 }
             },
@@ -1611,14 +1820,14 @@ void UiRecordPanel::render_waterfall_card(ID3D11DeviceContext* context, float wi
                 std::snprintf(w_age,  sizeof(w_age),  "-%.1f s", age_s);
                 std::snprintf(w_vrad, sizeof(w_vrad), "%+.1f km/s", SdrConstants::CalculateDopplerVelocityKmS(freq * 1.0e6));
                 ui_obs::widgets::TelemetryRow rows[4] = {
-                    {"FREQ", w_freq, ui_obs::palette::TextPrimary32},
-                    {"dFC",  w_off,  ui_obs::palette::TextMuted32},
-                    {"AGE",  w_age,  ui_obs::palette::U32(ui_obs::palette::Cyan)},
-                    {"V_HI", w_vrad, IM_COL32(142, 236, 158, 255)},
+                    {"Frequency",    w_freq, ui_obs::palette::TextPrimary32},
+                    {"Offset",       w_off,  ui_obs::palette::TextMuted32},
+                    {"Time",         w_age,  ui_obs::palette::U32(ui_obs::palette::Cyan)},
+                    {"H I Velocity", w_vrad, IM_COL32(142, 236, 158, 255)},
                 };
                 ui_obs::widgets::draw_crosshair_card(
                     dl, mp, wf_min, wf_max,
-                    "WATERFALL CURSOR", ui_obs::palette::U32(ui_obs::palette::Cyan),
+                    "Waterfall", ui_obs::palette::U32(ui_obs::palette::Cyan),
                     rows, 4, fonts_.semibold, fonts_.mono
                 );
             }

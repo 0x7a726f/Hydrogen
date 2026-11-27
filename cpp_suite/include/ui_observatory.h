@@ -29,7 +29,7 @@
 namespace ui_obs {
 
 // ======================================================================
-// Observatory Slate Palette, DPI Helpers & Font Registry (ImGui 1.93.1+)
+// Dark Instrument Theme Palette, DPI Helpers & Font Registry (ImGui 1.93.1+)
 // ======================================================================
 struct UiFonts {
     ImFont* regular  = nullptr;
@@ -72,32 +72,37 @@ struct ScopedFont {
 };
 
 namespace palette {
-    // 4-tier luminance hierarchy
-    constexpr ImVec4 BgWell        = ImVec4(0.035f, 0.047f, 0.067f, 1.0f);                                              // #090C11 (plot wells, troughs, inputs)
-    constexpr ImVec4 BgDeep        = ImVec4(astro::theme::BG_R, astro::theme::BG_G, astro::theme::BG_B, 1.0f);          // #0D1117 (workspace gutter)
-    constexpr ImVec4 HeaderBg      = ImVec4(0.059f, 0.078f, 0.106f, 1.0f);                                              // #0F141B (nav + status chrome)
-    constexpr ImVec4 Surface       = ImVec4(astro::theme::FRAME_R, astro::theme::FRAME_G, astro::theme::FRAME_B, 1.0f); // #141A23 (elevated card surfaces)
-    constexpr ImVec4 SurfaceAlt    = ImVec4(0.106f, 0.137f, 0.184f, 1.0f);                                              // #1B232F (buttons, active pills)
-    constexpr ImVec4 SurfaceHover  = ImVec4(0.141f, 0.184f, 0.247f, 1.0f);                                              // #242F3F
-    constexpr ImVec4 SurfaceActive = ImVec4(0.173f, 0.227f, 0.306f, 1.0f);                                              // #2C3A4E
+    // Warm-neutral dark charcoal luminance hierarchy
+    constexpr ImVec4 BgWell        = ImVec4(0.078f, 0.082f, 0.094f, 1.0f); // #141518 (plot wells, troughs, inputs)
+    constexpr ImVec4 PlotBg        = BgWell;                               // #141518 (plot canvas)
+    constexpr ImVec4 BgDeep        = ImVec4(0.102f, 0.106f, 0.118f, 1.0f); // #1A1B1E (workspace canvas)
+    constexpr ImVec4 BgApp         = BgDeep;                               // #1A1B1E (root window background)
+    constexpr ImVec4 HeaderBg      = ImVec4(0.118f, 0.125f, 0.141f, 1.0f); // #1E2024 (nav + status chrome)
+    constexpr ImVec4 BgPanel       = HeaderBg;                             // #1E2024 (chrome & panel headers)
+    constexpr ImVec4 Surface       = ImVec4(0.133f, 0.141f, 0.157f, 1.0f); // #222428 (elevated card surfaces)
+    constexpr ImVec4 BgCard        = Surface;                              // #222428 (card container)
+    constexpr ImVec4 SurfaceAlt    = ImVec4(0.165f, 0.176f, 0.200f, 1.0f); // #2A2D33 (buttons, active tabs)
+    constexpr ImVec4 SurfaceHover  = ImVec4(0.200f, 0.216f, 0.247f, 1.0f); // #33373F
+    constexpr ImVec4 SurfaceActive = ImVec4(0.235f, 0.255f, 0.294f, 1.0f); // #3C414B
 
-    // Soft structural borders & inner specular highlight
-    constexpr ImVec4 BorderSubtle  = ImVec4(0.55f, 0.64f, 0.78f, 0.14f);
-    constexpr ImVec4 Border        = ImVec4(0.55f, 0.64f, 0.78f, 0.26f);
-    constexpr ImVec4 HairlineLight = ImVec4(1.00f, 1.00f, 1.00f, 0.05f);
+    // Crisp, restrained structural borders
+    constexpr ImVec4 BorderSubtle  = ImVec4(1.00f, 1.00f, 1.00f, 0.08f);
+    constexpr ImVec4 Border        = ImVec4(1.00f, 1.00f, 1.00f, 0.15f);
+    constexpr ImVec4 HairlineLight = ImVec4(1.00f, 1.00f, 1.00f, 0.04f);
 
-    constexpr ImVec4 TextPrimary   = ImVec4(0.902f, 0.929f, 0.953f, 1.0f); // #E6EDF3
-    constexpr ImVec4 TextMuted     = ImVec4(astro::theme::MUTED_R, astro::theme::MUTED_G, astro::theme::MUTED_B, 1.0f); // #8B949E
-    constexpr ImVec4 TextDim       = ImVec4(0.388f, 0.439f, 0.510f, 1.0f); // #637082
+    constexpr ImVec4 TextPrimary   = ImVec4(0.894f, 0.902f, 0.918f, 1.0f); // #E4E6EA
+    constexpr ImVec4 TextMuted     = ImVec4(0.596f, 0.616f, 0.651f, 1.0f); // #989DA6
+    constexpr ImVec4 TextDim       = ImVec4(0.408f, 0.431f, 0.471f, 1.0f); // #686E78
 
-    constexpr ImVec4 AccentBlue    = ImVec4(astro::theme::ACCENT_R, astro::theme::ACCENT_G, astro::theme::ACCENT_B, 1.0f); // #2F81F7
-    constexpr ImVec4 Cyan          = ImVec4(astro::theme::CYAN_R, astro::theme::CYAN_G, astro::theme::CYAN_B, 1.0f);       // #38BDF8
-    constexpr ImVec4 Emerald       = ImVec4(astro::theme::GREEN_R, astro::theme::GREEN_G, astro::theme::GREEN_B, 1.0f);    // #10B981
-    constexpr ImVec4 Red           = ImVec4(astro::theme::RED_R, astro::theme::RED_G, astro::theme::RED_B, 1.0f);          // #EF4444
-    constexpr ImVec4 Amber         = ImVec4(astro::theme::AMBER_R, astro::theme::AMBER_G, astro::theme::AMBER_B, 1.0f);    // #F59E0B
-    constexpr ImVec4 Orange        = ImVec4(astro::theme::ORANGE_R, astro::theme::ORANGE_G, astro::theme::ORANGE_B, 1.0f); // #FB923C
-    constexpr ImVec4 Pink          = ImVec4(astro::theme::PINK_R, astro::theme::PINK_G, astro::theme::PINK_B, 1.0f);       // #F472B6
-    constexpr ImVec4 Purple        = ImVec4(0.655f, 0.545f, 0.980f, 1.0f);                                                 // #A78BFA
+    // Balanced, desaturated accents suitable for long observing sessions
+    constexpr ImVec4 AccentBlue    = ImVec4(0.290f, 0.565f, 0.851f, 1.0f); // #4A90D9
+    constexpr ImVec4 Cyan          = ImVec4(0.337f, 0.714f, 0.761f, 1.0f); // #56B6C2
+    constexpr ImVec4 Emerald       = ImVec4(0.298f, 0.686f, 0.490f, 1.0f); // #4CAF7D
+    constexpr ImVec4 Red           = ImVec4(0.851f, 0.357f, 0.357f, 1.0f); // #D95B5B
+    constexpr ImVec4 Amber         = ImVec4(0.851f, 0.608f, 0.263f, 1.0f); // #D99B43
+    constexpr ImVec4 Orange        = ImVec4(0.851f, 0.494f, 0.290f, 1.0f); // #D97E4A
+    constexpr ImVec4 Pink          = ImVec4(0.788f, 0.451f, 0.608f, 1.0f); // #C9739B
+    constexpr ImVec4 Purple        = ImVec4(0.608f, 0.518f, 0.831f, 1.0f); // #9B84D4
 
     inline ImVec4 Tint(const ImVec4& c, float alpha) {
         return ImVec4(c.x, c.y, c.z, alpha);
@@ -132,16 +137,16 @@ namespace palette {
         );
     }
 
-    constexpr ImU32 PlotBg32       = IM_COL32(9, 12, 17, 255);
-    constexpr ImU32 PlotGrid32     = IM_COL32(28, 37, 50, 255);
-    constexpr ImU32 PlotBorder32   = IM_COL32(43, 55, 73, 255);
-    constexpr ImU32 PlotCrosshair  = IM_COL32(139, 148, 158, 145);
-    constexpr ImU32 CardBg32       = IM_COL32(15, 20, 28, 238);
-    constexpr ImU32 PillBg32       = IM_COL32(13, 18, 26, 230);
-    constexpr ImU32 BezelBg32      = IM_COL32(9, 13, 19, 255);
-    constexpr ImU32 BezelBorder32  = IM_COL32(48, 60, 78, 255);
-    constexpr ImU32 TextPrimary32  = IM_COL32(230, 237, 243, 255);
-    constexpr ImU32 TextMuted32    = IM_COL32(139, 148, 158, 255);
+    constexpr ImU32 PlotBg32       = IM_COL32(20, 21, 24, 255);
+    constexpr ImU32 PlotGrid32     = IM_COL32(40, 43, 49, 255);
+    constexpr ImU32 PlotBorder32   = IM_COL32(56, 60, 68, 255);
+    constexpr ImU32 PlotCrosshair  = IM_COL32(152, 157, 166, 135);
+    constexpr ImU32 CardBg32       = IM_COL32(28, 30, 35, 242);
+    constexpr ImU32 PillBg32       = IM_COL32(26, 28, 32, 232);
+    constexpr ImU32 BezelBg32      = IM_COL32(20, 21, 24, 255);
+    constexpr ImU32 BezelBorder32  = IM_COL32(58, 62, 70, 255);
+    constexpr ImU32 TextPrimary32  = IM_COL32(228, 230, 234, 255);
+    constexpr ImU32 TextMuted32    = IM_COL32(152, 157, 166, 255);
 } // namespace palette
 
 inline void apply_observatory_slate_style(float dpi_scale = 0.0f) {
@@ -153,12 +158,12 @@ inline void apply_observatory_slate_style(float dpi_scale = 0.0f) {
     style.FontSizeBase        = 15.0f;
     style.FontScaleDpi        = target_dpi;
 
-    style.WindowPadding       = ImVec2(9.0f, 7.0f);
-    style.FramePadding        = ImVec2(8.0f, 4.0f);
-    style.CellPadding         = ImVec2(5.0f, 3.0f);
-    style.ItemSpacing         = ImVec2(6.0f, 5.0f);
-    style.ItemInnerSpacing    = ImVec2(5.0f, 4.0f);
-    style.ScrollbarSize       = 9.0f;
+    style.WindowPadding       = ImVec2(10.0f, 8.0f);
+    style.FramePadding        = ImVec2(8.0f, 5.0f);
+    style.CellPadding         = ImVec2(6.0f, 4.0f);
+    style.ItemSpacing         = ImVec2(8.0f, 6.0f);
+    style.ItemInnerSpacing    = ImVec2(6.0f, 4.0f);
+    style.ScrollbarSize       = 10.0f;
     style.ScrollbarPadding    = 2.0f;
     style.GrabMinSize         = 10.0f;
 
@@ -172,14 +177,14 @@ inline void apply_observatory_slate_style(float dpi_scale = 0.0f) {
     style.SeparatorSize       = 1.0f;
 
     style.WindowRounding      = 0.0f;
-    style.ChildRounding       = 8.0f;
-    style.FrameRounding       = 5.0f;
-    style.PopupRounding       = 7.0f;
-    style.ScrollbarRounding   = 6.0f;
-    style.GrabRounding        = 5.0f;
-    style.TabRounding         = 6.0f;
-    style.SelectableRounding  = 5.0f;
-    style.MenuItemRounding    = 5.0f;
+    style.ChildRounding       = 4.0f;
+    style.FrameRounding       = 4.0f;
+    style.PopupRounding       = 4.0f;
+    style.ScrollbarRounding   = 4.0f;
+    style.GrabRounding        = 3.0f;
+    style.TabRounding         = 4.0f;
+    style.SelectableRounding  = 4.0f;
+    style.MenuItemRounding    = 3.0f;
     style.HoverDelayShort     = 0.25f;
 
     ImVec4* c = style.Colors;
@@ -202,9 +207,9 @@ inline void apply_observatory_slate_style(float dpi_scale = 0.0f) {
     c[ImGuiCol_ScrollbarBg]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     c[ImGuiCol_ScrollbarGrab]        = palette::SurfaceAlt;
     c[ImGuiCol_ScrollbarGrabHovered] = palette::SurfaceHover;
-    c[ImGuiCol_ScrollbarGrabActive]  = palette::Border;
+    c[ImGuiCol_ScrollbarGrabActive]  = palette::SurfaceActive;
 
-    c[ImGuiCol_CheckMark]            = palette::Cyan;
+    c[ImGuiCol_CheckMark]            = palette::AccentBlue;
     c[ImGuiCol_CheckboxSelectedBg]   = palette::SurfaceActive;
     c[ImGuiCol_SliderGrab]           = palette::AccentBlue;
     c[ImGuiCol_SliderGrabActive]     = palette::Cyan;
@@ -213,9 +218,9 @@ inline void apply_observatory_slate_style(float dpi_scale = 0.0f) {
     c[ImGuiCol_ButtonHovered]        = palette::SurfaceHover;
     c[ImGuiCol_ButtonActive]         = palette::SurfaceActive;
 
-    c[ImGuiCol_Header]               = palette::Tint(palette::AccentBlue, 0.22f);
-    c[ImGuiCol_HeaderHovered]        = palette::Tint(palette::AccentBlue, 0.34f);
-    c[ImGuiCol_HeaderActive]         = palette::Tint(palette::AccentBlue, 0.48f);
+    c[ImGuiCol_Header]               = palette::Tint(palette::AccentBlue, 0.20f);
+    c[ImGuiCol_HeaderHovered]        = palette::Tint(palette::AccentBlue, 0.30f);
+    c[ImGuiCol_HeaderActive]         = palette::Tint(palette::AccentBlue, 0.42f);
 
     c[ImGuiCol_Separator]            = palette::BorderSubtle;
     c[ImGuiCol_SeparatorHovered]     = palette::AccentBlue;
@@ -232,9 +237,9 @@ inline void apply_observatory_slate_style(float dpi_scale = 0.0f) {
     c[ImGuiCol_TableBorderStrong]    = palette::Border;
     c[ImGuiCol_TableBorderLight]     = palette::BorderSubtle;
     c[ImGuiCol_TableRowBg]           = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
-    c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.0f, 1.0f, 1.0f, 0.025f);
-    c[ImGuiCol_NavCursor]            = palette::Cyan;
-    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.02f, 0.03f, 0.05f, 0.72f);
+    c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.0f, 1.0f, 1.0f, 0.02f);
+    c[ImGuiCol_NavCursor]            = palette::AccentBlue;
+    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.05f, 0.055f, 0.065f, 0.68f);
 
     if (target_dpi != 1.0f) {
         style.ScaleAllSizes(target_dpi);
@@ -347,7 +352,7 @@ inline bool ToggleSwitch(const char* label, bool* v, const ImVec4& accent = pale
 
     dl->AddRectFilled(t_min, t_max, palette::U32(tr_col), radius, ImDrawFlags_RoundAll);
     dl->AddRect(t_min, t_max,
-                palette::U32(focused ? palette::Cyan : lerp_v4(palette::Border, accent, t * 0.6f)),
+                palette::U32(focused ? palette::AccentBlue : lerp_v4(palette::Border, accent, t * 0.55f)),
                 radius, focused ? 1.5f : 1.0f, ImDrawFlags_RoundAll);
 
     const float pad = dp(2.5f);
@@ -1081,34 +1086,34 @@ inline bool draw_plot_zoom_toolbar(
     };
 
     if (cfg.is_compact) {
-        push_item("##tb_zi", "+", "Zoom In (+)", 0, false, true, 20.0f);
-        push_item("##tb_zo", "-", "Zoom Out (-)", 1, false, true, 20.0f);
+        push_item("##tb_zi", "+", "Zoom in (+)", 0, false, true, 20.0f);
+        push_item("##tb_zo", "-", "Zoom out (-)", 1, false, true, 20.0f);
         if (zoom.y_manual && cfg.allow_y_zoom) {
-            push_item("##tb_ay", "Auto Y", "Auto-Fit Y (A)", 2, true, false, 38.0f);
+            push_item("##tb_ay", "Auto Y", "Fit vertical scale (A)", 2, true, false, 38.0f);
         }
         if (show_mag) {
-            push_item("##tb_mg", mag_buf, "Current X zoom factor", 6, true, true, 28.0f);
+            push_item("##tb_mg", mag_buf, "Current horizontal zoom level", 6, true, true, 28.0f);
         }
         if (zoom.is_zoomed()) {
-            push_item("##tb_rs", "Reset", "Reset View (R / Dbl-Click)", 5, false, false, 34.0f);
+            push_item("##tb_rs", "Reset", "Reset view (R)", 5, false, false, 34.0f);
         }
     } else {
-        push_item("##tb_zi", "+", "Zoom In (+)", 0, false, true, 22.0f);
-        push_item("##tb_zo", "-", "Zoom Out (-)", 1, false, true, 22.0f);
+        push_item("##tb_zi", "+", "Zoom in (+)", 0, false, true, 22.0f);
+        push_item("##tb_zo", "-", "Zoom out (-)", 1, false, true, 22.0f);
         if (cfg.allow_y_zoom) {
             const char* ay_lbl = (cfg.auto_y_label && cfg.auto_y_label[0]) ? cfg.auto_y_label : "Auto Y";
-            push_item("##tb_ay", ay_lbl, "Auto-Fit Y Axis (A)", 2, zoom.y_manual, false, 44.0f);
+            push_item("##tb_ay", ay_lbl, "Fit vertical scale (A)", 2, zoom.y_manual, false, 44.0f);
         }
         if (cfg.has_hi_focus && avail_w > dp(260.0f)) {
-            push_item("##tb_hi", "H I", "Focus 21-cm H I Line (H)", 3, false, false, 28.0f);
+            push_item("##tb_hi", "H I", "Center on 1420.4 MHz H I line (H)", 3, false, false, 28.0f);
         }
         if (cfg.show_full_btn && avail_w > dp(310.0f)) {
-            push_item("##tb_fl", "Full", "Full Passband Span (F)", 4, false, false, 32.0f);
+            push_item("##tb_fl", "Full", "Show full span (F)", 4, false, false, 32.0f);
         }
         if (show_mag) {
-            push_item("##tb_mg", mag_buf, "Current X magnification", 6, true, true, 30.0f);
+            push_item("##tb_mg", mag_buf, "Current horizontal zoom level", 6, true, true, 30.0f);
         }
-        push_item("##tb_rs", "Reset", "Reset View (R / 0 / Dbl-Click)", 5, zoom.is_zoomed(), false, 38.0f);
+        push_item("##tb_rs", "Reset", "Reset view (R)", 5, zoom.is_zoomed(), false, 38.0f);
     }
 
     float total_w = 0.0f;
@@ -1125,7 +1130,7 @@ inline bool draw_plot_zoom_toolbar(
         return false;
     }
 
-    // Background bezel pill
+    // Background toolbar container
     dl->AddRectFilled(tb_min, tb_max, palette::PillBg32, dp(4.0f), ImDrawFlags_RoundAll);
     dl->AddRect(tb_min, tb_max, palette::PlotBorder32, dp(4.0f), 1.0f, ImDrawFlags_RoundAll);
 
@@ -1161,19 +1166,19 @@ inline bool draw_plot_zoom_toolbar(
         if (hov) {
             dl->AddRectFilled(ImVec2(bmin.x + 1.0f, bmin.y + 1.0f),
                               ImVec2(bmax.x - 1.0f, bmax.y - 1.0f),
-                              palette::U32(palette::SurfaceHover, 0.85f), dp(3.0f), ImDrawFlags_RoundAll);
+                              palette::U32(palette::SurfaceHover, 0.90f), dp(3.0f), ImDrawFlags_RoundAll);
         } else if (it.highlight && it.action != 6) {
             dl->AddRectFilled(ImVec2(bmin.x + 1.0f, bmin.y + 1.0f),
                               ImVec2(bmax.x - 1.0f, bmax.y - 1.0f),
-                              palette::U32(palette::Cyan, 0.14f), dp(3.0f), ImDrawFlags_RoundAll);
+                              palette::U32(palette::AccentBlue, 0.16f), dp(3.0f), ImDrawFlags_RoundAll);
         }
 
         ImFont* f = it.is_mono ? mf : uf;
         const float fs = it.is_mono ? mfs : ufs;
         const ImVec2 tsz = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, it.label);
         const ImU32 fg = (it.highlight || hov)
-            ? palette::U32(palette::Cyan)
-            : (it.action == 5 && !zoom.is_zoomed() ? palette::U32(palette::TextDim) : palette::TextPrimary32);
+            ? palette::U32(palette::TextPrimary)
+            : (it.action == 5 && !zoom.is_zoomed() ? palette::U32(palette::TextDim) : palette::TextMuted32);
         dl->AddText(f, fs,
                     ImVec2(std::floor(bmin.x + (it.w - tsz.x) * 0.5f),
                            std::floor(bmin.y + (bar_h - tsz.y) * 0.5f)),
@@ -1539,14 +1544,14 @@ inline PlotInteractResult handle_plot_interaction(
         dl->PushClipRect(plot_min, plot_max, true);
         if (is_1d_xband) {
             dl->AddRectFilled(ImVec2(bx0, plot_min.y), ImVec2(bx1, plot_max.y),
-                              palette::U32(palette::Cyan, 0.14f));
-            dl->AddLineV(bx0, plot_min.y, plot_max.y, palette::U32(palette::Cyan, 0.90f), 1.5f);
-            dl->AddLineV(bx1, plot_min.y, plot_max.y, palette::U32(palette::Cyan, 0.90f), 1.5f);
+                              palette::U32(palette::AccentBlue, 0.14f));
+            dl->AddLineV(bx0, plot_min.y, plot_max.y, palette::U32(palette::AccentBlue, 0.85f), 1.5f);
+            dl->AddLineV(bx1, plot_min.y, plot_max.y, palette::U32(palette::AccentBlue, 0.85f), 1.5f);
         } else {
             dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
-                              palette::U32(palette::Cyan, 0.14f));
+                              palette::U32(palette::AccentBlue, 0.14f));
             dl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1),
-                        palette::U32(palette::Cyan, 0.92f), 0.0f, 1.5f, ImDrawFlags_None);
+                        palette::U32(palette::AccentBlue, 0.85f), 0.0f, 1.5f, ImDrawFlags_None);
         }
 
         if (bw >= dp(8.0f)) {
@@ -1571,8 +1576,8 @@ inline PlotInteractResult handle_plot_interaction(
                 pill_buf, mono_font ? mono_font : ui_font, 11.0f,
                 anchor_x, anchor_y, plot_min, plot_max);
             widgets::draw_pill_badge(dl, pr, pill_buf, mono_font ? mono_font : ui_font, 11.0f,
-                                     palette::CardBg32, palette::U32(palette::Cyan, 0.80f),
-                                     palette::U32(palette::Cyan));
+                                     palette::CardBg32, palette::U32(palette::AccentBlue, 0.75f),
+                                     palette::U32(palette::TextPrimary));
         }
         dl->PopClipRect();
     }
@@ -1615,40 +1620,45 @@ inline PlotInteractResult handle_plot_interaction(
     // 11. Right-Click Context Menu
     if (ImGui::BeginPopup(popup_name)) {
         if (cfg.has_hi_focus) {
-            if (ImGui::MenuItem("Focus H I Line", "H")) {
+            if (ImGui::MenuItem("Center on 1420.4 MHz H I line", "H")) {
                 detail::plot_apply_hi_focus(zoom, cfg);
                 res.requested_hi_focus = true; res.x_changed = true; res.changed = true;
             }
         }
         if (cfg.allow_y_zoom) {
-            const char* ay_lbl = (cfg.auto_y_label && cfg.auto_y_label[0]) ? cfg.auto_y_label : "Auto-Fit Y";
+            const char* ay_lbl = (cfg.auto_y_label && cfg.auto_y_label[0]) ? cfg.auto_y_label : "Fit vertical scale";
             if (ImGui::MenuItem(ay_lbl, "A")) {
                 zoom.auto_y();
                 res.requested_auto_y = true; res.y_changed = true; res.changed = true;
             }
         }
         if (cfg.show_full_btn) {
-            if (ImGui::MenuItem("Full Passband", "F")) {
+            if (ImGui::MenuItem("Show full span", "F")) {
                 detail::plot_apply_full_view(zoom, cfg);
                 res.requested_full = true; res.x_changed = true; res.changed = true;
             }
         }
-        if (ImGui::MenuItem("Reset View", "R")) {
+        if (ImGui::MenuItem("Reset view", "R")) {
             zoom.reset();
             res.requested_reset = true; res.x_changed = true; res.y_changed = true; res.changed = true;
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Zoom In", "+")) {
+        if (ImGui::MenuItem("Zoom in", "+")) {
             detail::plot_apply_zoom_x(zoom, cfg, 0.72, 0.5);
             res.x_changed = true; res.changed = true;
         }
-        if (ImGui::MenuItem("Zoom Out", "-")) {
+        if (ImGui::MenuItem("Zoom out", "-")) {
             detail::plot_apply_zoom_x(zoom, cfg, 1.0 / 0.72, 0.5);
             res.x_changed = true; res.changed = true;
         }
         if (extra_context_menu) {
             ImGui::Separator();
             extra_context_menu();
+        }
+        ImGui::Separator();
+        {
+            ScopedFont hf(ui_font, 11.5f);
+            ImGui::TextDisabled("Scroll to zoom X  |  Drag to pan  |  Right-drag to box zoom");
         }
         ImGui::EndPopup();
     }

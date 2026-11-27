@@ -96,6 +96,8 @@ private:
     int selected_palette_idx_ = 1; // Viridis
     bool show_waterfall_ = true;
     bool fill_spectrum_ = true;
+    bool show_hw_options_ = false;
+    bool show_display_options_ = false;
 
     // Recording settings & live telemetry
     char record_prefix_buf_[64] = "hi_21cm";

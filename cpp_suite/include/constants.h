@@ -44,7 +44,7 @@ inline const std::vector<BandPreset>& GetPresets() {
     static const std::vector<BandPreset> presets = {
         {"H I 1420.5M (LO +94k)", 1420500000ULL},
         {"H I 1420.406M (Rest Line)", 1420405752ULL},
-        {"H I 1420.2M (SatDump)", 1420206000ULL},
+        {"H I 1420.2M (LO -200k)", 1420206000ULL},
         {"FM 89.2 MHz (Broadcast)", 89200000ULL},
         {"FM 100.0 MHz (Broadcast)", 100000000ULL},
         {"Airband 121.5 MHz (ATIS)", 121500000ULL},

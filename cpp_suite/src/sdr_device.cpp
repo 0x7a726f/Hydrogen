@@ -180,7 +180,7 @@ std::vector<std::string> RtlSdrDevice::detect_blocking_processes() {
     }
 
     static const wchar_t* const known_sdr_w[] = {
-        L"satdump", L"sdrpp", L"sdrangel", L"tv_app", L"rtl_tcp", L"dump1090", L"welle"
+        L"sdrpp", L"sdrangel", L"tv_app", L"rtl_tcp", L"dump1090", L"welle"
     };
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);

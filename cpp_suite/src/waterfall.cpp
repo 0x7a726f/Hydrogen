@@ -201,7 +201,7 @@ void Waterfall::set_palette(WaterfallPalette palette) {
 
 const std::vector<std::string>& Waterfall::get_palette_names() {
     static const std::vector<std::string> names = {
-        "Classic SatDump",
+        "Classic",
         "Viridis",
         "Turbo",
         "Inferno",
